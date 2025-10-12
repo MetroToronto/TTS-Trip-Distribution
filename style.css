@@ -250,6 +250,13 @@ button.ghost { background: var(--btn-bg-ghost); }
 .pd-header strong,
 .routing-header strong {
   font-size: 16px;
+
+  /* Collapse behavior for Planning Districts */
+.pd-control.collapsed .pd-list,
+.pd-control.collapsed #pd-list {
+  display: none !important;
+}
+
   line-height: 1.2;
   margin: 0 0 6px 0;
   font-weight: 700;
