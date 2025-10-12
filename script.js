@@ -242,10 +242,25 @@ fetch(PD_URL)
       clearPDSelection();
     });
 
+    // --- FIXED Expand / Collapse logic ---
     btnTgl.addEventListener('click', () => {
       const collapsed = controlRoot.classList.toggle('collapsed');
+    
+      // Inline style ensures visibility works regardless of CSS overrides
+      listEl.style.display = collapsed ? 'none' : '';
+    
       btnTgl.textContent = collapsed ? 'Expand ▾' : 'Collapse ▴';
+      btnTgl.setAttribute('aria-expanded', String(!collapsed));
     });
+    
+    // Ensure initial visibility matches class on load
+    if (controlRoot.classList.contains('collapsed')) {
+      listEl.style.display = 'none';
+      btnTgl.textContent = 'Expand ▾';
+    } else {
+      listEl.style.display = '';
+      btnTgl.textContent = 'Collapse ▴';
+    }
 
     const PD_LABEL_HIDE_ZOOM = 14;
     map.on('zoomend', () => {
