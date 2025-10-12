@@ -162,3 +162,60 @@ button.ghost { background: var(--btn-bg-ghost); }
 /* ---------- Top geocoder (match 250px) ---------- */
 .leaflet-control-geocoder { width: 250px; max-width: 250px; }
 .leaflet-control-geocoder-form input { font-size: 16px; padding: 8px 10px; height: 38px; }
+
+/* ====== compact headers ====== */
+.pd-header strong,
+.routing-header strong {
+  font-size: 16px;     /* down from 20–24 */
+  line-height: 1.2;
+  margin: 0 0 6px 0;
+  font-weight: 700;
+}
+
+/* ====== put actions on ONE row ====== */
+.pd-actions,
+.routing-actions {
+  display: flex;
+  gap: 6px;            /* tighter gap so 3 items fit */
+  flex-wrap: nowrap;   /* no wrapping */
+  align-items: center;
+}
+
+/* Compact buttons to prevent wrapping */
+.pd-control button,
+.routing-control button,
+.report-control button {
+  font-size: 13px;
+  padding: 5px 9px;
+  white-space: nowrap; /* keep labels on one line */
+}
+
+/* In the PD header you have 3 items: Select all / Clear all / Expand.
+   Make them share the row cleanly inside 250px. */
+.pd-header .pd-actions > button {
+  flex: 1 1 0;         /* 3 equal buttons */
+  min-width: 0;        /* allow shrinking */
+}
+
+/* Zones row: Engage / Disengage / Zone # in one line at 250px */
+.pd-header .pd-actions #pz-engage,
+.pd-header .pd-actions #pz-disengage {
+  flex: 0 0 auto;      /* keep natural width */
+}
+.pd-header .pd-actions #pz-inline-search {
+  flex: 1 1 auto;      /* let the input take remaining space */
+  min-width: 80px;     /* still small enough to fit */
+  max-width: 100%;
+  margin-left: 4px;
+  font-size: 13px;
+  padding: 6px 8px;
+}
+
+/* Keep card + geocoder widths at 250px */
+.leaflet-control-geocoder { width: 250px; max-width: 250px; }
+.leaflet-control-geocoder-form input { height: 36px; font-size: 15px; }
+
+.pd-control, .routing-control, .report-control {
+  width: 250px !important;
+  max-width: 250px !important;
+}
