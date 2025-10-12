@@ -222,3 +222,23 @@ button.ghost {
   padding: 8px 10px;
   height: 38px;
 }
+
+/* === width overrides (250px) === */
+.leaflet-control-geocoder { width: 250px; max-width: 250px; }
+.leaflet-control-geocoder-form input { font-size: 16px; height: 38px; padding: 8px 10px; }
+
+.pd-control,
+.routing-control,
+.report-control {
+  width: 250px !important;
+  max-width: 250px !important;
+}
+
+/* keep the big title style from earlier, but scale slightly for 250px column */
+.pd-header strong,
+.routing-header strong {
+  display: block;
+  font-weight: 800;
+  font-size: 20px;
+  margin: 0 0 8px 0;
+}
