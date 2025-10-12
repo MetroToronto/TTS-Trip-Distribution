@@ -37,8 +37,8 @@ html, body {
   box-shadow: var(--ui-shadow);
   border-radius: var(--ui-radius);
   font: 14px/1.3 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-  width: 150px;               /* unified width */
-  max-width: 150px;
+  width: 400px;               /* unified width */
+  max-width: 400px;
 }
 
 .pd-header,
@@ -69,7 +69,7 @@ html, body {
   background: var(--btn-bg);
   border: 1px solid var(--btn-border);
   border-radius: 12px;
-  padding: 6px 10px;
+  padding: 7px 12px;
   cursor: pointer;
   font: inherit;
 }
@@ -212,13 +212,13 @@ button.ghost {
 .leaflet-popup-content { margin: 8px 10px; }
 .leaflet-popup-content-wrapper { border-radius: 10px; }
 
-/* Top geocoder — make it a bit bigger but fixed to 150px width to match cards */
+/* Top geocoder — match 400px width to cards */
 .leaflet-control-geocoder {
-  width: 150px;
-  max-width: 150px;
+  width: 400px;
+  max-width: 400px;
 }
 .leaflet-control-geocoder-form input {
-  font-size: 14px;
-  padding: 7px 9px;
-  height: 34px;
+  font-size: 15px;
+  padding: 8px 10px;
+  height: 38px;
 }
