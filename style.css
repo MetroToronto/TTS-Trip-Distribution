@@ -219,3 +219,38 @@ button.ghost { background: var(--btn-bg-ghost); }
   width: 250px !important;
   max-width: 250px !important;
 }
+/* --- FIX: Planning Districts toolbar --- */
+
+/* Don't stretch PD buttons; keep natural width so click/handlers work */
+.pd-header .pd-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: nowrap;          /* stay on one line */
+  justify-content: flex-start;
+  align-items: center;
+}
+
+/* Critical: stop equal-width stretching that could break interactions */
+.pd-header .pd-actions > button {
+  flex: 0 0 auto;             /* natural width */
+  min-width: 0;               /* allow compact layout */
+}
+
+/* If the PD Expand uses a dropdown/overlay, don't clip it */
+.pd-control { overflow: visible; }
+
+/* Compact button sizing so all PD actions fit on one row at 250px */
+.pd-control .pd-actions > button {
+  font-size: 13px;
+  padding: 5px 9px;
+  white-space: nowrap;
+}
+
+/* Keep titles compact (in case they were still large) */
+.pd-header strong,
+.routing-header strong {
+  font-size: 16px;
+  line-height: 1.2;
+  margin: 0 0 6px 0;
+  font-weight: 700;
+}
