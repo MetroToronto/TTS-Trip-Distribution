@@ -9,7 +9,17 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
 
 // Geocoder (non-fatal if missing)
 try {
-  L.Control.geocoder({ collapsed: false, defaultMarkGeocode: true }).addTo(map);
+  const geocoderCtl = L.Control.geocoder({ collapsed: false, defaultMarkGeocode: true }).addTo(map);
+
+  // >>> NEW: remember the last picked address for routing.js to use
+  geocoderCtl.on('markgeocode', (e) => {
+    const c = e.geocode.center;
+    window.ROUTING_ORIGIN = {
+      lat: c.lat,
+      lon: c.lng,
+      label: e.geocode.name || e.geocode.html || `${c.lat.toFixed(5)}, ${c.lng.toFixed(5)}`
+    };
+  });
 } catch (e) {
   console.warn('Geocoder not loaded:', e);
 }
