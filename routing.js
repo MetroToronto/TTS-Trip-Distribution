@@ -1,9 +1,8 @@
-/* routing.js — Directions-only, titles above buttons, stacked under PD & Zones
- * Uses origin from the top geocoder (window.ROUTING_ORIGIN set in script.js).
+/* routing.js — Directions-only; cards under PD & Zones; titles above buttons
+ * Uses origin from top geocoder (window.ROUTING_ORIGIN is set in script.js).
  * Inline fallback key (override via ?orsKey=K1,K2 or save in UI):
  * eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6Ijk5NWI5MTE5OTM2YTRmYjNhNDRiZTZjNDRjODhhNTRhIiwiaCI6Im11cm11cjY0In0=
  */
-
 (function (global) {
   // ===== Config =====
   const INLINE_DEFAULT_KEY =
@@ -11,7 +10,7 @@
 
   const PROFILE = 'driving-car';
   const PREFERENCE = 'fastest';
-  const THROTTLE_MS = 1500; // keep < 40 req/min
+  const THROTTLE_MS = 1500; // < 40 req/min
 
   const COLOR_FIRST  = '#0b3aa5';
   const COLOR_OTHERS = '#2166f3';
@@ -34,14 +33,13 @@
 
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-  // ===== Key helpers =====
+  // ===== Keys =====
   const parseUrlKeys = () => {
     const raw = new URLSearchParams(location.search).get('orsKey');
     return raw ? raw.split(',').map(s => s.trim()).filter(Boolean) : [];
   };
   const loadKeys = () => {
-    const u = parseUrlKeys();
-    if (u.length) return u;
+    const u = parseUrlKeys(); if (u.length) return u;
     try {
       const ls = JSON.parse(localStorage.getItem(LS_KEYS) || '[]');
       if (Array.isArray(ls) && ls.length) return ls;
@@ -52,7 +50,7 @@
   const setIndex = (i) => { S.keyIndex = Math.max(0, Math.min(i, S.keys.length - 1)); localStorage.setItem(LS_ACTIVE_INDEX, String(S.keyIndex)); };
   const getIndex = () => Number(localStorage.getItem(LS_ACTIVE_INDEX) || 0);
   const currentKey = () => S.keys[S.keyIndex];
-  const rotateKey = () => (S.keys.length > 1 ? (setIndex((S.keyIndex + 1) % S.keys.length), true) : false);
+  const rotateKey   = () => (S.keys.length > 1 ? (setIndex((S.keyIndex + 1) % S.keys.length), true) : false);
 
   // ===== Map helpers =====
   const ensureGroup = () => { if (!S.group) S.group = L.layerGroup().addTo(S.map); };
@@ -63,22 +61,6 @@
     else alert(html.replace(/<[^>]+>/g, ''));
   };
 
-  // ===== DOM placement: keep Trip + Report under PD & Zones in same column =====
-  function placeBelowPdAndZones() {
-    // Column that holds the geocoder & your PD/Zones (usually .leaflet-top.leaflet-left)
-    const geocoder = document.querySelector('.leaflet-control-geocoder');
-    const column =
-      geocoder?.closest('.leaflet-top.leaflet-left, .leaflet-top.leaflet-right') ||
-      document.querySelector('.leaflet-top.leaflet-left');
-
-    const trip   = document.querySelector('.routing-control.trip-card');
-    const report = document.querySelector('.routing-control.report-card');
-
-    if (!column) return;
-    if (trip)   column.appendChild(trip);
-    if (report) column.appendChild(report);
-  }
-
   // ===== ORS fetch =====
   async function orsFetch(path, { method = 'GET', body } = {}) {
     const url = new URL(ORS_BASE + path);
@@ -87,7 +69,7 @@
       headers: { Authorization: currentKey(), ...(method !== 'GET' && { 'Content-Type': 'application/json' }) },
       body: method === 'GET' ? undefined : JSON.stringify(body)
     });
-    if ([401, 403, 429].includes(res.status)) {
+    if ([401,403,429].includes(res.status)) {
       if (rotateKey()) return orsFetch(path, { method, body });
     }
     if (!res.ok) throw new Error(`ORS ${res.status}: ${await res.text().catch(() => res.statusText)}`);
@@ -122,7 +104,7 @@
     return m;
   }
 
-  // ===== Controls (titles above buttons; same column; added to topleft) =====
+  // ===== Controls (titles above buttons) =====
   const TripControl = L.Control.extend({
     options: { position: 'topleft' },
     onAdd() {
@@ -173,17 +155,50 @@
     if (b) b.disabled = !enabled;
   }
 
+  // ===== Placement: ensure Trip + Report are **after** PD & Zones in same column =====
+  function placeBelowPdAndZonesWithRetry() {
+    const start = performance.now();
+    const maxWaitMs = 2000;   // wait up to ~2s for PD/Zones to mount
+    (function tick(){
+      const geocoder = document.querySelector('.leaflet-control-geocoder');
+      const column =
+        geocoder?.closest('.leaflet-top.leaflet-left, .leaflet-top.leaflet-right') ||
+        document.querySelector('.leaflet-top.leaflet-left');
+
+      const trip   = document.querySelector('.routing-control.trip-card');
+      const report = document.querySelector('.routing-control.report-card');
+
+      // We consider PD+Zones present once we see at least 2 elements with class .pd-control
+      const pdZones = Array.from(document.querySelectorAll('.pd-control'));
+      const ready = column && trip && report && pdZones.length >= 2;
+
+      if (ready) {
+        // Append our cards to the *end* of the same column so they render under PD & Zones
+        column.appendChild(trip);
+        column.appendChild(report);
+        return;
+      }
+      if (performance.now() - start < maxWaitMs) {
+        return setTimeout(tick, 80);
+      }
+      // Fallback: append to column even if we didn't detect PD/Zones (prevents "missing UI")
+      if (column) {
+        if (trip) column.appendChild(trip);
+        if (report) column.appendChild(report);
+      }
+    })();
+  }
+
   // ===== Init =====
   function init(map) {
     S.map = map;
     S.keys = loadKeys();
     setIndex(getIndex());
 
-    // Add Trip + Report controls in the same corner as your PD/Zones,
-    // then move them beneath those boxes in the column.
+    // Add Trip + Report in same corner; then place after PD & Zones once they’re present.
     S.map.addControl(new TripControl());
     S.map.addControl(new ReportControl());
-    setTimeout(placeBelowPdAndZones, 50);
+    placeBelowPdAndZonesWithRetry();
 
     S.els = {
       gen: document.getElementById('rt-gen'),
@@ -222,9 +237,7 @@
       addMarker(origin.lat, origin.lon, `<b>Origin</b><br>${origin.label}`, 6);
 
       let targets = [];
-      if (typeof global.getSelectedPDTargets === 'function') {
-        targets = global.getSelectedPDTargets(); // [lon, lat, label]
-      }
+      if (typeof global.getSelectedPDTargets === 'function') targets = global.getSelectedPDTargets(); // [lon,lat,label]
       if (!targets.length) return popup('<b>Routing</b><br>No PDs selected.');
 
       try {
@@ -267,7 +280,7 @@
     }
   }
 
-  // ===== Print Report (cached; no API calls) =====
+  // ===== Print Report (cached; no new API calls) =====
   function printReport() {
     if (!S.results.length) return popup('<b>Routing</b><br>Generate trips first.');
     const w = window.open('', '_blank');
@@ -291,12 +304,8 @@
   }
 
   // ===== Public API =====
-  const Routing = {
-    init(map) { init(map); },
-    clear() { clearAll(); },
-    setApiKeys(arr) { S.keys = [...arr]; saveKeys(S.keys); setIndex(0); }
-  };
+  const Routing = { init(map){ init(map); }, clear(){ clearAll(); }, setApiKeys(arr){ S.keys=[...arr]; saveKeys(S.keys); setIndex(0); } };
   global.Routing = Routing;
 
-  document.addEventListener('DOMContentLoaded', () => { if (global.map) Routing.init(global.map); });
+  document.addEventListener('DOMContentLoaded', ()=>{ if (global.map) Routing.init(global.map); });
 })(window);
