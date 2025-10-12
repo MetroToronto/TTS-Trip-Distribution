@@ -1,14 +1,8 @@
 /* ---------- Layout ---------- */
-html, body {
-  height: 100%;
-  margin: 0;
-}
-#map {
-  height: 100%;
-  width: 100%;
-}
+html, body { height: 100%; margin: 0; }
+#map { height: 100%; width: 100%; }
 
-/* ---------- Shared UI primitives ---------- */
+/* ---------- Design tokens ---------- */
 :root {
   --ui-bg: #fff;
   --ui-border: #ddd;
@@ -29,27 +23,34 @@ html, body {
   --btn-hover: #f0f0f0;
 }
 
-/* ---------- Control panel shell (PD, Zones, Routing) ---------- */
+/* ---------- Unified card shell (PD, Zones, Trip, Report) ---------- */
 .pd-control,
-.routing-control {
+.routing-control,
+.report-control {
   background: var(--ui-bg);
   padding: var(--ui-pad);
   box-shadow: var(--ui-shadow);
   border-radius: var(--ui-radius);
   font: 14px/1.3 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-  width: 400px;               /* unified width */
-  max-width: 400px;
+  width: 250px;
+  max-width: 250px;
 }
 
+/* Titles on top (like your “old format”) */
 .pd-header,
 .routing-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--ui-gap);
+  display: block;
   margin-bottom: 6px;
 }
+.pd-header strong,
+.routing-header strong {
+  display: block;
+  font-weight: 800;
+  font-size: 20px;
+  margin: 0 0 8px 0;
+}
 
+/* Action rows under the title */
 .pd-actions,
 .routing-actions {
   display: flex;
@@ -58,13 +59,10 @@ html, body {
   flex-wrap: wrap;
 }
 
-.pd-control.collapsed .pd-list {
-  display: none;
-}
-
 /* ---------- Buttons & inputs ---------- */
 .pd-control button,
-.routing-control button {
+.routing-control button,
+.report-control button {
   appearance: none;
   background: var(--btn-bg);
   border: 1px solid var(--btn-border);
@@ -74,17 +72,11 @@ html, body {
   font: inherit;
 }
 .pd-control button:hover,
-.routing-control button:hover {
-  background: var(--btn-hover);
-}
+.routing-control button:hover,
+.report-control button:hover { background: var(--btn-hover); }
 .pd-control button.active,
-.routing-control button.active {
-  border-color: #888;
-  box-shadow: inset 0 0 0 1px #888;
-}
-button.ghost {
-  background: var(--btn-bg-ghost);
-}
+.routing-control button.active { border-color: #888; box-shadow: inset 0 0 0 1px #888; }
+button.ghost { background: var(--btn-bg-ghost); }
 
 .pd-control input[type="text"],
 .routing-control input[type="text"] {
@@ -107,35 +99,11 @@ button.ghost {
   border-top: 1px dashed var(--ui-border);
   margin-top: 6px;
 }
-
-.pd-item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 2px;
-  border-radius: 4px;
-}
-.pd-item:hover {
-  background: rgba(0,0,0,.03);
-}
-
-.pd-cbx {
-  flex: 0 0 auto;
-  margin: 0 2px 0 0;
-  width: 14px;
-  height: 14px;
-}
-.pd-name {
-  cursor: pointer;
-  flex: 1;
-  user-select: none;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.pd-item.selected .pd-name {
-  font-weight: 600;
-}
+.pd-item { display: flex; align-items: center; gap: 8px; padding: 4px 2px; border-radius: 4px; }
+.pd-item:hover { background: rgba(0,0,0,.03); }
+.pd-cbx { flex: 0 0 auto; margin: 0 2px 0 0; width: 14px; height: 14px; }
+.pd-name { cursor: pointer; flex: 1; user-select: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pd-item.selected .pd-name { font-weight: 600; }
 
 /* ---------- PD selected label (center pin) ---------- */
 .pd-label .leaflet-tooltip {
@@ -162,9 +130,7 @@ button.ghost {
   box-shadow: var(--ui-shadow);
   user-select: none;
 }
-.zone-popup .leaflet-popup-content {
-  font: 14px/1.3 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-}
+.zone-popup .leaflet-popup-content { font: 14px/1.3 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
 
 /* ---------- Zones control inline search ---------- */
 .pz-inline-search {
@@ -182,63 +148,17 @@ button.ghost {
   margin-top: 10px;
   padding-top: 10px;
 }
-
-.routing-row {
-  display: flex;
-  gap: var(--ui-gap);
-  align-items: center;
-  flex-wrap: wrap;
-  margin-top: 8px;
-}
-
-.routing-hint {
-  color: #666;
-  font-size: 12.5px;
-  margin-top: 4px;
-  display: block;
-}
+.routing-row { display: flex; gap: var(--ui-gap); align-items: center; flex-wrap: wrap; margin-top: 8px; }
+.routing-hint { color: #666; font-size: 12.5px; margin-top: 4px; display: block; }
 
 /* Key manager sub-section */
-.key-row {
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: 8px;
-}
-#txt-ors-keys {
-  font-family: ui-monospace, Menlo, Consolas, "Liberation Mono", monospace;
-}
+.key-row { display: grid; grid-template-columns: 1fr; gap: 8px; }
+#txt-ors-keys { font-family: ui-monospace, Menlo, Consolas, "Liberation Mono", monospace; }
 
 /* ---------- Leaflet tweaks ---------- */
 .leaflet-popup-content { margin: 8px 10px; }
 .leaflet-popup-content-wrapper { border-radius: 10px; }
 
-/* Top geocoder — match 400px width to cards */
-.leaflet-control-geocoder {
-  width: 400px;
-  max-width: 400px;
-}
-.leaflet-control-geocoder-form input {
-  font-size: 15px;
-  padding: 8px 10px;
-  height: 38px;
-}
-
-/* === width overrides (250px) === */
+/* ---------- Top geocoder (match 250px) ---------- */
 .leaflet-control-geocoder { width: 250px; max-width: 250px; }
-.leaflet-control-geocoder-form input { font-size: 16px; height: 38px; padding: 8px 10px; }
-
-.pd-control,
-.routing-control,
-.report-control {
-  width: 250px !important;
-  max-width: 250px !important;
-}
-
-/* keep the big title style from earlier, but scale slightly for 250px column */
-.pd-header strong,
-.routing-header strong {
-  display: block;
-  font-weight: 800;
-  font-size: 20px;
-  margin: 0 0 8px 0;
-}
+.leaflet-control-geocoder-form input { font-size: 16px; padding: 8px 10px; height: 38px; }
