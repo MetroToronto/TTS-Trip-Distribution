@@ -1,4 +1,4 @@
-/* routing.js — Directions-only; titles above buttons; stacked under PD & Zones
+/* routing.js — Directions-only; cards under PD & Zones; titles above buttons
  * Uses origin from the top geocoder (window.ROUTING_ORIGIN set in script.js).
  * Inline fallback key (override via ?orsKey=K1,K2 or save in UI):
  * eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6Ijk5NWI5MTE5OTM2YTRmYjNhNDRiZTZjNDRjODhhNTRhIiwiaCI6Im11cm11cjY0In0=
@@ -75,22 +75,13 @@
       const trip   = document.querySelector('.routing-control.trip-card');
       const report = document.querySelector('.routing-control.report-card');
 
-      // We consider PD+Zones present once we see at least 2 elements with class .pd-control
       const pdZones = Array.from(document.querySelectorAll('.pd-control'));
       const ready = column && trip && report && pdZones.length >= 2;
 
-      if (ready) {
-        column.appendChild(trip);
-        column.appendChild(report);
-        return;
-      }
+      if (ready) { column.appendChild(trip); column.appendChild(report); return; }
       if (performance.now() - start < maxWaitMs) return setTimeout(tick, 80);
 
-      // Fallback
-      if (column) {
-        if (trip) column.appendChild(trip);
-        if (report) column.appendChild(report);
-      }
+      if (column) { if (trip) column.appendChild(trip); if (report) column.appendChild(report); }
     })();
   }
 
@@ -123,21 +114,25 @@
     });
   }
 
-  // ===== Drawing =====
-  function drawRoute(geojson, color) {
-    ensureGroup();
-    const line = L.geoJSON(geojson, { style: { color, weight: 5, opacity: 0.9 } });
-    S.group.addLayer(line);
-    return line;
+  // ===== Geometry / headings / names =====
+  function haversineKm(lat1, lon1, lat2, lon2) {
+    const R = 6371;
+    const toRad = x => x * Math.PI / 180;
+    const dLat = toRad(lat2 - lat1);
+    const dLon = toRad(lon2 - lon1);
+    const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon/2)**2;
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    return R * c;
   }
-  function addMarker(lat, lon, html, radius = 6) {
-    ensureGroup();
-    const m = L.circleMarker([lat, lon], { radius }).bindPopup(html);
-    S.group.addLayer(m);
-    return m;
+  function lengthFromCoordsKm(coords) {
+    let km = 0;
+    for (let i=0;i<coords.length-1;i++){
+      const [lon1,lat1] = coords[i];
+      const [lon2,lat2] = coords[i+1];
+      km += haversineKm(lat1,lon1,lat2,lon2);
+    }
+    return km;
   }
-
-  // ===== Street Assignment Helpers =====
   function toCardinal4(deg) {
     const a = (deg + 360) % 360;
     if (a >= 45 && a < 135) return 'EB';
@@ -154,13 +149,28 @@
       const k = Math.cos(((lat1 + lat2) / 2) * Math.PI / 180);
       const dx = (lon2 - lon1) * k;
       const dy = (lat2 - lat1);
-      vx += dx;
-      vy += dy;
+      vx += dx; vy += dy;
     }
     if (vx === 0 && vy === 0) return null;
-    const bearing = (Math.atan2(vx, vy) * 180 / Math.PI + 360) % 360; // 0 = N
-    return bearing;
+    return (Math.atan2(vx, vy) * 180 / Math.PI + 360) % 360; // 0 = N
   }
+  // Extract a street name from a human instruction if "name" is missing
+  function nameFromInstruction(instr='') {
+    const t = String(instr);
+    // Try common patterns
+    let m =
+      t.match(/\bonto\s+([^,;]+)$/i) ||
+      t.match(/\bonto\s+([^,;]+)[,;]/i) ||
+      t.match(/\bon\s+([^,;]+)$/i)   ||
+      t.match(/\bon\s+([^,;]+)[,;]/i)||
+      t.match(/\btoward\s+([^,;]+)$/i) ||
+      t.match(/\bto\s+([^,;]+)$/i);
+    if (m && m[1]) return m[1].trim();
+    // If nothing, return empty; caller will skip
+    return '';
+  }
+
+  // Build merged street-by-street assignments from ORS geojson
   function buildStreetAssignments(gj, { minStepMeters = 80 } = {}) {
     const feat = gj?.features?.[0];
     const seg = feat?.properties?.segments?.[0];
@@ -168,18 +178,25 @@
     const line = feat?.geometry?.coordinates || [];
     if (!line.length || !steps.length) return [];
 
-    const rows = steps
-      .filter(s => (s.name && s.name.trim().length) && (s.distance || 0) >= minStepMeters)
-      .map(s => {
-        const [i0, i1] = s.way_points || [0, 0];
-        const coords = line.slice(Math.max(0, i0), Math.min(line.length, i1 + 1));
-        const hdg = headingFromCoords(coords);
-        const dir = toCardinal4(hdg ?? 0);
-        return { name: s.name.trim(), km: +(s.distance / 1000).toFixed(2), dir };
-      });
+    const rows = [];
+    for (const s of steps) {
+      const [i0, i1] = s.way_points || [0, 0];
+      const coords = line.slice(Math.max(0, i0), Math.min(line.length, i1 + 1));
+      const distM = (s.distance && s.distance > 0) ? s.distance : (lengthFromCoordsKm(coords) * 1000);
+      if (distM < minStepMeters) continue;
+
+      const streetRaw = (s.name && s.name.trim().length) ? s.name.trim() : nameFromInstruction(s.instruction || '');
+      if (!streetRaw) continue;
+
+      const hdg = headingFromCoords(coords);
+      const dir = toCardinal4(hdg ?? 0);
+
+      rows.push({ name: streetRaw, km: +(distM/1000).toFixed(2), dir });
+    }
 
     if (!rows.length) return [];
 
+    // Merge consecutive same street + same bound
     const merged = [];
     for (const r of rows) {
       const last = merged[merged.length - 1];
@@ -190,6 +207,20 @@
       }
     }
     return merged;
+  }
+
+  // ===== Drawing =====
+  function drawRoute(geojson, color) {
+    ensureGroup();
+    const line = L.geoJSON(geojson, { style: { color, weight: 5, opacity: 0.9 } });
+    S.group.addLayer(line);
+    return line;
+  }
+  function addMarker(lat, lon, html, radius = 6) {
+    ensureGroup();
+    const m = L.circleMarker([lat, lon], { radius }).bindPopup(html);
+    S.group.addLayer(m);
+    return m;
   }
 
   // ===== Controls (titles above buttons) =====
@@ -304,14 +335,18 @@
           const gj = await getRoute([origin.lon, origin.lat], [dlon, dlat]);
           drawRoute(gj, i === 0 ? COLOR_FIRST : COLOR_OTHERS);
 
-          const seg = gj?.features?.[0]?.properties?.segments?.[0];
-          const km  = seg ? (seg.distance / 1000).toFixed(1) : '—';
+          const feat = gj?.features?.[0];
+          const seg  = feat?.properties?.segments?.[0];
+
+          // Total distance/time with robust fallbacks
+          let totalKm = (seg && seg.distance > 0) ? (seg.distance / 1000) : lengthFromCoordsKm(feat?.geometry?.coordinates || []);
+          const km  = totalKm.toFixed(1);
           const min = seg ? Math.round((seg.duration || 0) / 60) : '—';
 
-          // Turn-by-turn text (still available in popups if you want)
-          const steps = (seg?.steps || []).map(s => `${s.instruction} — ${(s.distance/1000).toFixed(2)} km`);
+          // Turn-by-turn (still available if you expand in popup)
+          const steps = (seg?.steps || []).map(s => `${s.instruction} — ${((s.distance||0)/1000).toFixed(2)} km`);
 
-          // NEW: full street-by-street assignments for the whole route
+          // Full street-by-street assignments for the whole route (with name/instruction + distance & heading)
           const assignments = buildStreetAssignments(gj);
 
           S.results.push({ label, lat: dlat, lon: dlon, km, min, steps, assignments, gj });
@@ -362,9 +397,9 @@
         .right { text-align:right; white-space:nowrap; }
       </style>`;
     const rows = S.results.map((r,i) => {
-      const lines = (r.assignments || []).map(a =>
-        `<tr><td>${a.dir}</td><td>${a.name}</td><td class="right">${a.km.toFixed(2)} km</td></tr>`
-      ).join('') || `<tr><td colspan="3"><em>No named streets on route</em></td></tr>`;
+      const lines = (r.assignments && r.assignments.length)
+        ? r.assignments.map(a => `<tr><td>${a.dir}</td><td>${a.name}</td><td class="right">${a.km.toFixed(2)} km</td></tr>`).join('')
+        : `<tr><td colspan="3"><em>No named streets on route</em></td></tr>`;
       return `
         <div class="card">
           <h2>${i+1}. ${r.label}</h2>
