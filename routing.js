@@ -1,9 +1,9 @@
-/* routing.js — Directions-only; street assignments for the whole route
- * Uses origin from top geocoder (window.ROUTING_ORIGIN set in script.js).
- * UI order: Search → Planning Districts → Planning Zones → Trip Generator → Report.
+/* routing.js — Directions-only; titles above buttons; stacked under PD & Zones
+ * Uses origin from the top geocoder (window.ROUTING_ORIGIN set in script.js).
  * Inline fallback key (override via ?orsKey=K1,K2 or save in UI):
  * eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6Ijk5NWI5MTE5OTM2YTRmYjNhNDRiZTZjNDRjODhhNTRhIiwiaCI6Im11cm11cjY0In0=
  */
+
 (function (global) {
   // ===== Config =====
   const INLINE_DEFAULT_KEY =
@@ -62,7 +62,7 @@
     else alert(html.replace(/<[^>]+>/g, ''));
   };
 
-  // ===== Placement: keep Trip + Report under PD & Zones in same column =====
+  // ===== Placement: ensure Trip + Report are **after** PD & Zones in same column =====
   function placeBelowPdAndZonesWithRetry() {
     const start = performance.now();
     const maxWaitMs = 2000;
@@ -74,7 +74,9 @@
 
       const trip   = document.querySelector('.routing-control.trip-card');
       const report = document.querySelector('.routing-control.report-card');
-      const pdZones = Array.from(document.querySelectorAll('.pd-control')); // expect ≥2 (PD + Zones)
+
+      // We consider PD+Zones present once we see at least 2 elements with class .pd-control
+      const pdZones = Array.from(document.querySelectorAll('.pd-control'));
       const ready = column && trip && report && pdZones.length >= 2;
 
       if (ready) {
@@ -83,7 +85,12 @@
         return;
       }
       if (performance.now() - start < maxWaitMs) return setTimeout(tick, 80);
-      if (column) { if (trip) column.appendChild(trip); if (report) column.appendChild(report); }
+
+      // Fallback
+      if (column) {
+        if (trip) column.appendChild(trip);
+        if (report) column.appendChild(report);
+      }
     })();
   }
 
@@ -101,6 +108,7 @@
     if (!res.ok) throw new Error(`ORS ${res.status}: ${await res.text().catch(() => res.statusText)}`);
     return res.json();
   }
+
   async function getRoute(originLonLat, destLonLat) {
     return orsFetch(`${EP.DIRECTIONS}/${PROFILE}/geojson`, {
       method: 'POST',
@@ -115,7 +123,21 @@
     });
   }
 
-  // ===== Street-assignment helpers =====
+  // ===== Drawing =====
+  function drawRoute(geojson, color) {
+    ensureGroup();
+    const line = L.geoJSON(geojson, { style: { color, weight: 5, opacity: 0.9 } });
+    S.group.addLayer(line);
+    return line;
+  }
+  function addMarker(lat, lon, html, radius = 6) {
+    ensureGroup();
+    const m = L.circleMarker([lat, lon], { radius }).bindPopup(html);
+    S.group.addLayer(m);
+    return m;
+  }
+
+  // ===== Street Assignment Helpers =====
   function toCardinal4(deg) {
     const a = (deg + 360) % 360;
     if (a >= 45 && a < 135) return 'EB';
@@ -132,10 +154,12 @@
       const k = Math.cos(((lat1 + lat2) / 2) * Math.PI / 180);
       const dx = (lon2 - lon1) * k;
       const dy = (lat2 - lat1);
-      vx += dx; vy += dy;
+      vx += dx;
+      vy += dy;
     }
     if (vx === 0 && vy === 0) return null;
-    return (Math.atan2(vx, vy) * 180 / Math.PI + 360) % 360; // 0° = N
+    const bearing = (Math.atan2(vx, vy) * 180 / Math.PI + 360) % 360; // 0 = N
+    return bearing;
   }
   function buildStreetAssignments(gj, { minStepMeters = 80 } = {}) {
     const feat = gj?.features?.[0];
@@ -156,7 +180,6 @@
 
     if (!rows.length) return [];
 
-    // merge consecutive rows with same street + same bound
     const merged = [];
     for (const r of rows) {
       const last = merged[merged.length - 1];
@@ -169,28 +192,14 @@
     return merged;
   }
 
-  // ===== Drawing =====
-  function drawRoute(geojson, color) {
-    ensureGroup();
-    const line = L.geoJSON(geojson, { style: { color, weight: 5, opacity: 0.9 } });
-    S.group.addLayer(line);
-    return line;
-  }
-  function addMarker(lat, lon, html, radius = 6) {
-    ensureGroup();
-    const m = L.circleMarker([lat, lon], { radius }).bindPopup(html);
-    S.group.addLayer(m);
-    return m;
-  }
-
-  // ===== Controls (titles above buttons; left column) =====
+  // ===== Controls (titles above buttons) =====
   const TripControl = L.Control.extend({
     options: { position: 'topleft' },
     onAdd() {
       const el = L.DomUtil.create('div', 'routing-control trip-card');
       el.innerHTML = `
         <div class="routing-header"><strong>Trip Generator</strong></div>
-        <div class="routing-actions" style="display:flex;gap:10px;flex-wrap:nowrap;margin-bottom:8px;">
+        <div class="routing-actions" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
           <button id="rt-gen">Generate Trips</button>
           <button id="rt-clr" class="ghost">Clear</button>
         </div>
@@ -212,13 +221,14 @@
       return el;
     }
   });
+
   const ReportControl = L.Control.extend({
     options: { position: 'topleft' },
     onAdd() {
       const el = L.DomUtil.create('div', 'routing-control report-card');
       el.innerHTML = `
         <div class="routing-header"><strong>Report</strong></div>
-        <div class="routing-actions" style="display:flex;gap:10px;flex-wrap:nowrap;margin-bottom:8px;">
+        <div class="routing-actions" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
           <button id="rt-print" disabled>Print Report</button>
         </div>
         <small class="routing-hint">Prints the directions already generated — no new API calls.</small>
@@ -227,6 +237,7 @@
       return el;
     }
   });
+
   function setReportEnabled(enabled) {
     const b = document.getElementById('rt-print');
     if (b) b.disabled = !enabled;
@@ -252,16 +263,16 @@
     };
     if (S.els.keys) S.els.keys.value = S.keys.join(',');
 
-    S.els.gen.onclick = generateTrips;
-    S.els.clr.onclick = () => clearAll();
+    S.els.gen.onclick   = generateTrips;
+    S.els.clr.onclick   = () => clearAll();
     S.els.print.onclick = () => printReport();
-    S.els.save.onclick = () => {
+    S.els.save.onclick  = () => {
       const arr = (S.els.keys.value || '').split(',').map(s => s.trim()).filter(Boolean);
       if (!arr.length) return popup('<b>Routing</b><br>Enter a key.');
       S.keys = arr; saveKeys(arr); setIndex(0);
       popup('<b>Routing</b><br>Keys saved.');
     };
-    S.els.url.onclick = () => {
+    S.els.url.onclick   = () => {
       const arr = parseUrlKeys();
       if (!arr.length) return popup('<b>Routing</b><br>No <code>?orsKey=</code> in URL.');
       S.keys = arr; setIndex(0);
@@ -296,19 +307,23 @@
           const seg = gj?.features?.[0]?.properties?.segments?.[0];
           const km  = seg ? (seg.distance / 1000).toFixed(1) : '—';
           const min = seg ? Math.round((seg.duration || 0) / 60) : '—';
-          const steps = (seg?.steps || []).map(s => `${s.instruction} — ${(s.distance / 1000).toFixed(2)} km`);
 
-          const assignments = buildStreetAssignments(gj); // NEW: street-by-street NB/EB/SB/WB rows
+          // Turn-by-turn text (still available in popups if you want)
+          const steps = (seg?.steps || []).map(s => `${s.instruction} — ${(s.distance/1000).toFixed(2)} km`);
+
+          // NEW: full street-by-street assignments for the whole route
+          const assignments = buildStreetAssignments(gj);
 
           S.results.push({ label, lat: dlat, lon: dlon, km, min, steps, assignments, gj });
 
-          const preview = assignments.slice(0, 6).map(a => `<li>${a.dir} ${a.name} — ${a.km} km</li>`).join('');
+          // Destination popup with an assignments preview + collapsible steps
+          const assignPreview = assignments.slice(0, 6).map(a => `<li>${a.dir} ${a.name} — ${a.km.toFixed(2)} km</li>`).join('');
           const html = `
             <div style="max-height:35vh;overflow:auto;">
               <strong>${label}</strong><br>${km} km • ${min} min
               <div style="margin-top:6px;">
                 <em>Street assignments</em>
-                <ul style="margin:6px 0 8px 18px; padding:0;">${preview || '<li><em>No named streets</em></li>'}</ul>
+                <ul style="margin:6px 0 8px 18px; padding:0;">${assignPreview || '<li><em>No named streets</em></li>'}</ul>
               </div>
               <details>
                 <summary>Turn-by-turn</summary>
@@ -344,4 +359,35 @@
         table { width:100%; border-collapse:collapse; margin-top:8px; }
         th, td { text-align:left; padding:6px 8px; border-bottom:1px solid #eee; }
         th { font-weight:700; background:#fafafa; }
-        .right {
+        .right { text-align:right; white-space:nowrap; }
+      </style>`;
+    const rows = S.results.map((r,i) => {
+      const lines = (r.assignments || []).map(a =>
+        `<tr><td>${a.dir}</td><td>${a.name}</td><td class="right">${a.km.toFixed(2)} km</td></tr>`
+      ).join('') || `<tr><td colspan="3"><em>No named streets on route</em></td></tr>`;
+      return `
+        <div class="card">
+          <h2>${i+1}. ${r.label}</h2>
+          <div class="sub">Distance: ${r.km} km • Time: ${r.min} min</div>
+          <table>
+            <thead><tr><th>Bound</th><th>Street</th><th class="right">Distance</th></tr></thead>
+            <tbody>${lines}</tbody>
+          </table>
+        </div>`;
+    }).join('');
+    w.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>Trip Report</title>${css}</head>
+    <body><h1>Trip Report — Street Assignments</h1>${rows}
+    <script>window.onload=()=>window.print();</script></body></html>`);
+    w.document.close();
+  }
+
+  // ===== Public API =====
+  const Routing = {
+    init(map) { init(map); },
+    clear() { clearAll(); },
+    setApiKeys(arr) { S.keys = [...arr]; saveKeys(S.keys); setIndex(0); }
+  };
+  global.Routing = Routing;
+
+  document.addEventListener('DOMContentLoaded', () => { if (global.map) Routing.init(global.map); });
+})(window);
