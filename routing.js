@@ -1,4 +1,4 @@
-/* routing.js — Directions-only; cards under PD & Zones; titles above buttons
+/* routing.js — Directions-only; stacked under PD & Zones; street-by-street assignments
  * Uses origin from the top geocoder (window.ROUTING_ORIGIN set in script.js).
  * Inline fallback key (override via ?orsKey=K1,K2 or save in UI):
  * eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6Ijk5NWI5MTE5OTM2YTRmYjNhNDRiZTZjNDRjODhhNTRhIiwiaCI6Im11cm11cjY0In0=
@@ -114,21 +114,17 @@
     });
   }
 
-  // ===== Geometry / headings / names =====
+  // ===== Geometry / headings / name extraction =====
   function haversineKm(lat1, lon1, lat2, lon2) {
-    const R = 6371;
-    const toRad = x => x * Math.PI / 180;
-    const dLat = toRad(lat2 - lat1);
-    const dLon = toRad(lon2 - lon1);
+    const R = 6371, toRad = x => x * Math.PI / 180;
+    const dLat = toRad(lat2 - lat1), dLon = toRad(lon2 - lon1);
     const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon/2)**2;
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-    return R * c;
+    return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
   }
   function lengthFromCoordsKm(coords) {
     let km = 0;
     for (let i=0;i<coords.length-1;i++){
-      const [lon1,lat1] = coords[i];
-      const [lon2,lat2] = coords[i+1];
+      const [lon1,lat1] = coords[i], [lon2,lat2] = coords[i+1];
       km += haversineKm(lat1,lon1,lat2,lon2);
     }
     return km;
@@ -144,34 +140,42 @@
     if (!coords || coords.length < 2) return null;
     let vx = 0, vy = 0;
     for (let i = 0; i < coords.length - 1; i++) {
-      const [lon1, lat1] = coords[i];
-      const [lon2, lat2] = coords[i + 1];
+      const [lon1, lat1] = coords[i], [lon2, lat2] = coords[i + 1];
       const k = Math.cos(((lat1 + lat2) / 2) * Math.PI / 180);
-      const dx = (lon2 - lon1) * k;
-      const dy = (lat2 - lat1);
-      vx += dx; vy += dy;
+      vx += (lon2 - lon1) * k;
+      vy += (lat2 - lat1);
     }
     if (vx === 0 && vy === 0) return null;
-    return (Math.atan2(vx, vy) * 180 / Math.PI + 360) % 360; // 0 = N
+    return (Math.atan2(vx, vy) * 180 / Math.PI + 360) % 360; // 0° = N
   }
-  // Extract a street name from a human instruction if "name" is missing
-  function nameFromInstruction(instr='') {
-    const t = String(instr);
-    // Try common patterns
-    let m =
-      t.match(/\bonto\s+([^,;]+)$/i) ||
-      t.match(/\bonto\s+([^,;]+)[,;]/i) ||
-      t.match(/\bon\s+([^,;]+)$/i)   ||
-      t.match(/\bon\s+([^,;]+)[,;]/i)||
-      t.match(/\btoward\s+([^,;]+)$/i) ||
-      t.match(/\bto\s+([^,;]+)$/i);
-    if (m && m[1]) return m[1].trim();
-    // If nothing, return empty; caller will skip
+  // Robust extractor for street names from instruction text
+  function nameFromInstruction(instr = '', prevName = '') {
+    const t = String(instr).trim();
+    if (!t) return '';
+    const s = t.replace(/\s+/g, ' ');
+    const patterns = [
+      /\bexit(?:\s+\d+)?\s+(?:onto|to)\s+([^,;.]+)\b/i,
+      /\bramp(?:\s+to)?\s+([^,;.]+)\b/i,
+      /\bmerge\s+(?:onto|to)\s+([^,;.]+)\b/i,
+      /\bcontinue\s+(?:onto|on)\s+([^,;.]+)\b/i,
+      /\bturn\s+(?:left|right)\s+(?:onto|to)\s+([^,;.]+)\b/i,
+      /\bkeep\s+(?:left|right)\s+(?:onto|to)?\s*([^,;.]+)\b/i,
+      /\bfollow\s+([^,;.]+)\b/i,
+      /\b(on|onto|to|toward|via)\s+([^,;.]+)\b/i
+    ];
+    for (const re of patterns) {
+      const m = s.match(re);
+      if (m && (m[2] || m[1])) {
+        const cand = (m[2] || m[1]).trim();
+        if (cand && !/^(the|a|an|roundabout|ramp|slip road)$/i.test(cand)) return cand;
+      }
+    }
+    if (/^continue\b/i.test(s) && prevName) return prevName;
     return '';
   }
 
   // Build merged street-by-street assignments from ORS geojson
-  function buildStreetAssignments(gj, { minStepMeters = 80 } = {}) {
+  function buildStreetAssignments(gj, { minStepMeters = 10 } = {}) {
     const feat = gj?.features?.[0];
     const seg = feat?.properties?.segments?.[0];
     const steps = seg?.steps || [];
@@ -179,24 +183,27 @@
     if (!line.length || !steps.length) return [];
 
     const rows = [];
+    let lastName = '';
+
     for (const s of steps) {
       const [i0, i1] = s.way_points || [0, 0];
       const coords = line.slice(Math.max(0, i0), Math.min(line.length, i1 + 1));
+
       const distM = (s.distance && s.distance > 0) ? s.distance : (lengthFromCoordsKm(coords) * 1000);
       if (distM < minStepMeters) continue;
 
-      const streetRaw = (s.name && s.name.trim().length) ? s.name.trim() : nameFromInstruction(s.instruction || '');
-      if (!streetRaw) continue;
+      const street = (s.name && s.name.trim()) || nameFromInstruction(s.instruction || '', lastName) || '';
+      if (!street) continue;
 
       const hdg = headingFromCoords(coords);
       const dir = toCardinal4(hdg ?? 0);
 
-      rows.push({ name: streetRaw, km: +(distM/1000).toFixed(2), dir });
+      rows.push({ name: street.trim(), km: +(distM/1000).toFixed(2), dir });
+      lastName = street.trim();
     }
 
     if (!rows.length) return [];
 
-    // Merge consecutive same street + same bound
     const merged = [];
     for (const r of rows) {
       const last = merged[merged.length - 1];
@@ -338,20 +345,20 @@
           const feat = gj?.features?.[0];
           const seg  = feat?.properties?.segments?.[0];
 
-          // Total distance/time with robust fallbacks
+          // Total distance/time (with geometry fallback)
           let totalKm = (seg && seg.distance > 0) ? (seg.distance / 1000) : lengthFromCoordsKm(feat?.geometry?.coordinates || []);
           const km  = totalKm.toFixed(1);
           const min = seg ? Math.round((seg.duration || 0) / 60) : '—';
 
-          // Turn-by-turn (still available if you expand in popup)
+          // Turn-by-turn text (still available)
           const steps = (seg?.steps || []).map(s => `${s.instruction} — ${((s.distance||0)/1000).toFixed(2)} km`);
 
-          // Full street-by-street assignments for the whole route (with name/instruction + distance & heading)
+          // Street-by-street assignments for the whole route
           const assignments = buildStreetAssignments(gj);
 
           S.results.push({ label, lat: dlat, lon: dlon, km, min, steps, assignments, gj });
 
-          // Destination popup with an assignments preview + collapsible steps
+          // Popup: assignments preview + collapsible steps
           const assignPreview = assignments.slice(0, 6).map(a => `<li>${a.dir} ${a.name} — ${a.km.toFixed(2)} km</li>`).join('');
           const html = `
             <div style="max-height:35vh;overflow:auto;">
