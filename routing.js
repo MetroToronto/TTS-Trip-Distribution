@@ -11,7 +11,7 @@
 
   const PROFILE = 'driving-car';
   const PREFERENCE = 'fastest';
-  const THROTTLE_MS = 1500; // keep < 40 req/min
+  const THROTTLE_MS = 1200; // keep < 40 req/min comfortably
 
   const COLOR_FIRST  = '#0b3aa5';
   const COLOR_OTHERS = '#2166f3';
@@ -62,7 +62,7 @@
     else alert(html.replace(/<[^>]+>/g, ''));
   };
 
-  // ===== Placement: ensure Trip + Report are **after** PD & Zones in same column =====
+  // ===== Placement: keep Trip + Report under PD & Zones in same column =====
   function placeBelowPdAndZonesWithRetry() {
     const start = performance.now();
     const maxWaitMs = 2000;
@@ -74,13 +74,11 @@
 
       const trip   = document.querySelector('.routing-control.trip-card');
       const report = document.querySelector('.routing-control.report-card');
-
       const pdZones = Array.from(document.querySelectorAll('.pd-control'));
       const ready = column && trip && report && pdZones.length >= 2;
 
       if (ready) { column.appendChild(trip); column.appendChild(report); return; }
       if (performance.now() - start < maxWaitMs) return setTimeout(tick, 80);
-
       if (column) { if (trip) column.appendChild(trip); if (report) column.appendChild(report); }
     })();
   }
@@ -100,7 +98,7 @@
     return res.json();
   }
 
-  // NOTE: request HTML instructions so we can parse bolded street names
+  // HTML instructions so we can read bolded street names
   async function getRoute(originLonLat, destLonLat) {
     return orsFetch(`${EP.DIRECTIONS}/${PROFILE}/geojson`, {
       method: 'POST',
@@ -108,14 +106,14 @@
         coordinates: [originLonLat, destLonLat],
         preference: PREFERENCE,
         instructions: true,
-        instructions_format: 'html',   // <= important
+        instructions_format: 'html',
         language: 'en',
         units: 'km'
       }
     });
   }
 
-  // ===== Geometry / headings / name extraction (HTML-aware) =====
+  // ===== Geometry / headings =====
   function haversineKm(lat1, lon1, lat2, lon2) {
     const R = 6371, toRad = x => x * Math.PI / 180;
     const dLat = toRad(lat2 - lat1), dLon = toRad(lon2 - lon1);
@@ -149,15 +147,41 @@
     if (vx === 0 && vy === 0) return null;
     return (Math.atan2(vx, vy) * 180 / Math.PI + 360) % 360; // 0° = N
   }
-  // Extract street name from ORS HTML instruction
+
+  // ===== Name extraction (HTML-aware, DOM-based) =====
+  function cleanStreetName(s) {
+    if (!s) return '';
+    let t = s.replace(/\s+/g,' ').trim();
+
+    // Drop common noise words
+    t = t.replace(/\b(?:the|a|an|ramp|slip road|roundabout)\b/gi, '').trim();
+
+    // If refs are appended with '/', keep the first human-friendly part
+    if (t.includes('/')) t = t.split('/')[0].trim();
+
+    // Remove trailing punctuation
+    t = t.replace(/[.,;]+$/,'');
+
+    // Avoid single hyphens etc.
+    if (/^[-–—]+$/.test(t)) return '';
+
+    return t;
+  }
+
   function nameFromInstructionHTML(instrHTML = '', prevName = '') {
     if (!instrHTML) return '';
-    const boldMatch = instrHTML.match(/<b>([^<]+)<\/b>/i);
-    if (boldMatch && boldMatch[1]) {
-      const cand = boldMatch[1].trim();
-      if (cand && !/^(roundabout|ramp|slip road)$/i.test(cand)) return cand;
-    }
-    const text = instrHTML.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+
+    // 1) Parse the HTML and collect bold/strong/abbr/span texts (ORS bolds street names)
+    const div = document.createElement('div');
+    div.innerHTML = instrHTML;
+    const candidates = Array.from(div.querySelectorAll('b,strong,abbr,span'))
+      .map(el => cleanStreetName(el.textContent || ''))
+      .filter(Boolean);
+
+    if (candidates.length) return candidates[candidates.length - 1]; // usually last bold is the street
+
+    // 2) Fallback: strip tags and use robust patterns
+    const text = (div.textContent || '').replace(/\s+/g,' ').trim();
     const pats = [
       /\bexit(?:\s+\d+)?\s+(?:onto|to)\s+([^,;.]+)\b/i,
       /\bramp(?:\s+to)?\s+([^,;.]+)\b/i,
@@ -171,13 +195,17 @@
     for (const re of pats) {
       const m = text.match(re);
       if (m && (m[2] || m[1])) {
-        const cand = (m[2] || m[1]).trim();
-        if (cand && !/^(the|a|an|roundabout|ramp|slip road)$/i.test(cand)) return cand;
+        const cand = cleanStreetName((m[2] || m[1]));
+        if (cand) return cand;
       }
     }
+
+    // 3) Continue with no explicit name: reuse previous
     if (/^continue\b/i.test(text) && prevName) return prevName;
+
     return '';
   }
+
   // Build merged street-by-street assignments from ORS geojson
   function buildStreetAssignments(gj, { minStepMeters = 5 } = {}) {
     const feat = gj?.features?.[0];
@@ -193,11 +221,13 @@
       const [i0, i1] = s.way_points || [0, 0];
       const coords = line.slice(Math.max(0, i0), Math.min(line.length, i1 + 1));
 
+      // Distance: prefer ORS, else compute from geometry
       const distM = (s.distance && s.distance > 0) ? s.distance : (lengthFromCoordsKm(coords) * 1000);
       if (distM < minStepMeters) continue;
 
+      // Name: step.name → HTML parse → reuse previous on "Continue"
       const street =
-        (s.name && s.name.trim()) ||
+        (s.name && cleanStreetName(s.name)) ||
         nameFromInstructionHTML(s.instruction || '', lastName) ||
         '';
       if (!street) continue;
@@ -205,12 +235,13 @@
       const hdg = headingFromCoords(coords);
       const dir = toCardinal4(hdg ?? 0);
 
-      rows.push({ name: street.trim(), km: +(distM/1000).toFixed(2), dir });
-      lastName = street.trim();
+      rows.push({ name: street, km: +(distM/1000).toFixed(2), dir });
+      lastName = street;
     }
 
     if (!rows.length) return [];
 
+    // Merge consecutive same street + same bound
     const merged = [];
     for (const r of rows) {
       const last = merged[merged.length - 1];
@@ -357,7 +388,7 @@
           const km  = totalKm.toFixed(1);
           const min = seg ? Math.round((seg.duration || 0) / 60) : '—';
 
-          // Turn-by-turn (preserved for popup details)
+          // Turn-by-turn (plain text) — still available in popups
           const steps = (seg?.steps || []).map(s => {
             const txt = String(s.instruction || '').replace(/<[^>]+>/g, '');
             const dist = ((s.distance || 0) / 1000).toFixed(2);
@@ -369,7 +400,7 @@
 
           S.results.push({ label, lat: dlat, lon: dlon, km, min, steps, assignments, gj });
 
-          // Popup: assignments preview + collapsible steps
+          // Popup preview
           const assignPreview = assignments.slice(0, 6).map(a => `<li>${a.dir} ${a.name} — ${a.km.toFixed(2)} km</li>`).join('');
           const html = `
             <div style="max-height:35vh;overflow:auto;">
@@ -421,7 +452,7 @@
       return `
         <div class="card">
           <h2>${i+1}. ${r.label}</h2>
-          <div class="sub">Distance: ${r.km} km • Time: ${r.min} min</div>
+          <div class="sub">Distance: ${r.km} km • ${r.min} min</div>
           <table>
             <thead><tr><th>Bound</th><th>Street</th><th class="right">Distance</th></tr></thead>
             <tbody>${lines}</tbody>
