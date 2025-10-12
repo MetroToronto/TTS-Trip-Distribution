@@ -100,6 +100,7 @@
     return res.json();
   }
 
+  // NOTE: request HTML instructions so we can parse bolded street names
   async function getRoute(originLonLat, destLonLat) {
     return orsFetch(`${EP.DIRECTIONS}/${PROFILE}/geojson`, {
       method: 'POST',
@@ -107,14 +108,14 @@
         coordinates: [originLonLat, destLonLat],
         preference: PREFERENCE,
         instructions: true,
-        instructions_format: 'text',
+        instructions_format: 'html',   // <= important
         language: 'en',
         units: 'km'
       }
     });
   }
 
-  // ===== Geometry / headings / name extraction =====
+  // ===== Geometry / headings / name extraction (HTML-aware) =====
   function haversineKm(lat1, lon1, lat2, lon2) {
     const R = 6371, toRad = x => x * Math.PI / 180;
     const dLat = toRad(lat2 - lat1), dLon = toRad(lon2 - lon1);
@@ -148,12 +149,16 @@
     if (vx === 0 && vy === 0) return null;
     return (Math.atan2(vx, vy) * 180 / Math.PI + 360) % 360; // 0° = N
   }
-  // Robust extractor for street names from instruction text
-  function nameFromInstruction(instr = '', prevName = '') {
-    const t = String(instr).trim();
-    if (!t) return '';
-    const s = t.replace(/\s+/g, ' ');
-    const patterns = [
+  // Extract street name from ORS HTML instruction
+  function nameFromInstructionHTML(instrHTML = '', prevName = '') {
+    if (!instrHTML) return '';
+    const boldMatch = instrHTML.match(/<b>([^<]+)<\/b>/i);
+    if (boldMatch && boldMatch[1]) {
+      const cand = boldMatch[1].trim();
+      if (cand && !/^(roundabout|ramp|slip road)$/i.test(cand)) return cand;
+    }
+    const text = instrHTML.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    const pats = [
       /\bexit(?:\s+\d+)?\s+(?:onto|to)\s+([^,;.]+)\b/i,
       /\bramp(?:\s+to)?\s+([^,;.]+)\b/i,
       /\bmerge\s+(?:onto|to)\s+([^,;.]+)\b/i,
@@ -163,19 +168,18 @@
       /\bfollow\s+([^,;.]+)\b/i,
       /\b(on|onto|to|toward|via)\s+([^,;.]+)\b/i
     ];
-    for (const re of patterns) {
-      const m = s.match(re);
+    for (const re of pats) {
+      const m = text.match(re);
       if (m && (m[2] || m[1])) {
         const cand = (m[2] || m[1]).trim();
         if (cand && !/^(the|a|an|roundabout|ramp|slip road)$/i.test(cand)) return cand;
       }
     }
-    if (/^continue\b/i.test(s) && prevName) return prevName;
+    if (/^continue\b/i.test(text) && prevName) return prevName;
     return '';
   }
-
   // Build merged street-by-street assignments from ORS geojson
-  function buildStreetAssignments(gj, { minStepMeters = 10 } = {}) {
+  function buildStreetAssignments(gj, { minStepMeters = 5 } = {}) {
     const feat = gj?.features?.[0];
     const seg = feat?.properties?.segments?.[0];
     const steps = seg?.steps || [];
@@ -192,7 +196,10 @@
       const distM = (s.distance && s.distance > 0) ? s.distance : (lengthFromCoordsKm(coords) * 1000);
       if (distM < minStepMeters) continue;
 
-      const street = (s.name && s.name.trim()) || nameFromInstruction(s.instruction || '', lastName) || '';
+      const street =
+        (s.name && s.name.trim()) ||
+        nameFromInstructionHTML(s.instruction || '', lastName) ||
+        '';
       if (!street) continue;
 
       const hdg = headingFromCoords(coords);
@@ -350,8 +357,12 @@
           const km  = totalKm.toFixed(1);
           const min = seg ? Math.round((seg.duration || 0) / 60) : '—';
 
-          // Turn-by-turn text (still available)
-          const steps = (seg?.steps || []).map(s => `${s.instruction} — ${((s.distance||0)/1000).toFixed(2)} km`);
+          // Turn-by-turn (preserved for popup details)
+          const steps = (seg?.steps || []).map(s => {
+            const txt = String(s.instruction || '').replace(/<[^>]+>/g, '');
+            const dist = ((s.distance || 0) / 1000).toFixed(2);
+            return `${txt} — ${dist} km`;
+          });
 
           // Street-by-street assignments for the whole route
           const assignments = buildStreetAssignments(gj);
