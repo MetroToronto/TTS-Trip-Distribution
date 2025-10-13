@@ -1,4 +1,4 @@
-/* routing.js — Directions-only; stacked under PD & Zones; street-by-street assignments
+/* routing.js — ORS Directions (1x/PD) + Snap v2 for street names (batched)
  * Uses origin from the top geocoder (window.ROUTING_ORIGIN set in script.js).
  * Inline fallback key (override via ?orsKey=K1,K2 or save in UI):
  * eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6Ijk5NWI5MTE5OTM2YTRmYjNhNDRiZTZjNDRjODhhNTRhIiwiaCI6Im11cm11cjY0In0=
@@ -11,7 +11,9 @@
 
   const PROFILE = 'driving-car';
   const PREFERENCE = 'fastest';
-  const THROTTLE_MS = 1200; // keep < 40 req/min for Directions
+  const THROTTLE_MS_DIRECTIONS = 1200; // keep < 40 req/min
+  const SNAP_BATCH_SIZE = 100;         // up to 5k per request is possible; 100 is conservative
+  const SAMPLE_EVERY_M = 50;           // sample spacing along each step polyline
 
   const COLOR_FIRST  = '#0b3aa5';
   const COLOR_OTHERS = '#2166f3';
@@ -19,7 +21,7 @@
   const ORS_BASE = 'https://api.openrouteservice.org';
   const EP = {
     DIRECTIONS: '/v2/directions',
-    REVERSE:    '/geocode/reverse'   // for naming unnamed steps
+    SNAP: '/v2/snap'
   };
 
   const LS_KEYS = 'ORS_KEYS';
@@ -32,9 +34,7 @@
     keys: [],
     keyIndex: 0,
     results: [], // [{label, lat, lon, km, min, steps[], assignments[], gj}]
-    els: {},
-    // cache: rounded "lon,lat" -> street name
-    nameCache: new Map()
+    els: {}
   };
 
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -67,7 +67,7 @@
     else alert(html.replace(/<[^>]+>/g, ''));
   };
 
-  // ===== Placement: keep Trip + Report under PD & Zones in same column =====
+  // ===== Place Trip + Report AFTER PD & Zones (same column) =====
   function placeBelowPdAndZonesWithRetry() {
     const start = performance.now();
     const maxWaitMs = 2000;
@@ -79,6 +79,7 @@
 
       const trip   = document.querySelector('.routing-control.trip-card');
       const report = document.querySelector('.routing-control.report-card');
+
       const pdZones = Array.from(document.querySelectorAll('.pd-control'));
       const ready = column && trip && report && pdZones.length >= 2;
 
@@ -104,7 +105,7 @@
     return res.json();
   }
 
-  // HTML instructions so we can read bolded street names if present
+  // Directions v2 (HTML instructions for popup; we use geometry for naming)
   async function getRoute(originLonLat, destLonLat) {
     return orsFetch(`${EP.DIRECTIONS}/${PROFILE}/geojson`, {
       method: 'POST',
@@ -119,35 +120,17 @@
     });
   }
 
-  // Reverse geocode a point to get a street name (ORS Pelias)
-  // CACHED and throttled by usage in generateTrips only.
-  async function reverseStreet(lon, lat) {
-    const key = `${lon.toFixed(5)},${lat.toFixed(5)}`;
-    if (S.nameCache.has(key)) return S.nameCache.get(key);
-
-    const data = await orsFetch(EP.REVERSE, {
-      method: 'GET',
-      query: { 'point.lon': String(lon), 'point.lat': String(lat), size: '1', 'boundary.country': 'CA' }
+  // Snap v2 batch
+  async function snapBatch(profile, locations) {
+    // POST /v2/snap/{profile}  { locations: [[lon,lat], ...] }
+    const res = await orsFetch(`${EP.SNAP}/${profile}`, {
+      method: 'POST',
+      body: { locations }
     });
-
-    let name = '';
-    const f0 = data?.features?.[0];
-    if (f0?.properties) {
-      // Try common Pelias fields
-      name =
-        f0.properties.street ||
-        f0.properties.name ||
-        f0.properties.locality ||
-        '';
-    }
-    name = cleanStreetName(name);
-    S.nameCache.set(key, name);
-    // light throttle to be kind to the geocoder (separate quota; 100 rpm typical)
-    await sleep(150);
-    return name;
+    return res;
   }
 
-  // ===== Geometry / headings =====
+  // ===== Geometry & headings =====
   function haversineKm(lat1, lon1, lat2, lon2) {
     const R = 6371, toRad = x => x * Math.PI / 180;
     const dLat = toRad(lat2 - lat1), dLon = toRad(lon2 - lon1);
@@ -162,13 +145,6 @@
     }
     return km;
   }
-  function toCardinal4(deg) {
-    const a = (deg + 360) % 360;
-    if (a >= 45 && a < 135) return 'EB';
-    if (a >= 135 && a < 225) return 'SB';
-    if (a >= 225 && a < 315) return 'WB';
-    return 'NB';
-  }
   function headingFromCoords(coords) {
     if (!coords || coords.length < 2) return null;
     let vx = 0, vy = 0;
@@ -181,122 +157,142 @@
     if (vx === 0 && vy === 0) return null;
     return (Math.atan2(vx, vy) * 180 / Math.PI + 360) % 360; // 0° = N
   }
-
-  // ===== Name extraction (HTML-aware) =====
-  function cleanStreetName(s) {
-    if (!s) return '';
-    let t = s.replace(/\s+/g,' ').trim();
-
-    // Drop common noise words
-    t = t.replace(/\b(?:the|a|an|ramp|slip road|roundabout)\b/gi, '').trim();
-
-    // If refs are appended with '/', keep the first human-friendly part
-    if (t.includes('/')) t = t.split('/')[0].trim();
-
-    // Remove trailing punctuation
-    t = t.replace(/[.,;]+$/,'');
-
-    if (/^[-–—]+$/.test(t)) return '';
-
-    return t;
+  function toCardinal4(deg) {
+    const a = (deg + 360) % 360;
+    if (a >= 45 && a < 135) return 'EB';
+    if (a >= 135 && a < 225) return 'SB';
+    if (a >= 225 && a < 315) return 'WB';
+    return 'NB';
   }
 
-  function nameFromInstructionHTML(instrHTML = '', prevName = '') {
-    if (!instrHTML) return '';
-    const div = document.createElement('div');
-    div.innerHTML = instrHTML;
-
-    // Prefer bold/strong/abbr/span
-    const candidates = Array.from(div.querySelectorAll('b,strong,abbr,span'))
-      .map(el => cleanStreetName(el.textContent || ''))
-      .filter(Boolean);
-    if (candidates.length) return candidates[candidates.length - 1];
-
-    // Fallback: plain text patterns
-    const text = (div.textContent || '').replace(/\s+/g,' ').trim();
-    const pats = [
-      /\bexit(?:\s+\d+)?\s+(?:onto|to)\s+([^,;.]+)\b/i,
-      /\bramp(?:\s+to)?\s+([^,;.]+)\b/i,
-      /\bmerge\s+(?:onto|to)\s+([^,;.]+)\b/i,
-      /\bcontinue\s+(?:onto|on)\s+([^,;.]+)\b/i,
-      /\bturn\s+(?:left|right)\s+(?:onto|to)\s+([^,;.]+)\b/i,
-      /\bkeep\s+(?:left|right)\s+(?:onto|to)?\s*([^,;.]+)\b/i,
-      /\bfollow\s+([^,;.]+)\b/i,
-      /\b(on|onto|to|toward|via)\s+([^,;.]+)\b/i
-    ];
-    for (const re of pats) {
-      const m = text.match(re);
-      if (m && (m[2] || m[1])) {
-        const cand = cleanStreetName((m[2] || m[1]));
-        if (cand) return cand;
+  // ===== Snap helpers =====
+  // Sample along a [lon,lat] polyline every ~d meters
+  function sampleAlong(coords, dMeters = SAMPLE_EVERY_M) {
+    if (!coords || coords.length < 2) return [];
+    const pts = [];
+    let acc = 0;
+    for (let i=0;i<coords.length-1;i++) {
+      const a = coords[i], b = coords[i+1];
+      const seg = haversineKm(a[1],a[0],b[1],b[0]) * 1000;
+      if (seg === 0) continue;
+      if (i===0) pts.push(a);
+      let t = (dMeters - acc) / seg;
+      while (t <= 1) {
+        const x = a[0] + (b[0]-a[0]) * t;
+        const y = a[1] + (b[1]-a[1]) * t;
+        pts.push([x,y]);
+        t += dMeters/seg;
       }
+      acc = (1 - (t - dMeters/seg - 1)) * seg;
     }
-    if (/^continue\b/i.test(text) && prevName) return prevName;
-    return '';
+    pts.push(coords[coords.length-1]);
+    // dedupe close points (>20m)
+    const out = [];
+    let prev = null;
+    for (const p of pts) {
+      if (!prev || haversineKm(prev[1],prev[0],p[1],p[0]) > 0.02) out.push(p);
+      prev = p;
+    }
+    return out;
   }
 
-  // Build rows for the whole route. If no name found for a step, we will fill it via reverse geocode.
-  function buildRawAssignments(gj) {
-    const feat = gj?.features?.[0];
+  // Extract a name from a Snap v2 item (handle varying payload shapes)
+  function nameFromSnapItem(item) {
+    if (!item) return '';
+    // Common structures: features[], snappedLocations[], or simple array
+    const props = item.properties || item;
+    const cand =
+      props?.name ||
+      props?.street ||
+      props?.way_name ||
+      props?.road ||
+      props?.label ||
+      '';
+    return String(cand || '').trim();
+  }
+
+  // Build per-step slices from Directions (geometry-driven)
+  function buildStepSlices(geojson) {
+    const feat = geojson?.features?.[0];
     const seg = feat?.properties?.segments?.[0];
     const steps = seg?.steps || [];
     const line = feat?.geometry?.coordinates || [];
-    if (!line.length || !steps.length) return [];
-
-    const rows = [];
-    let lastName = '';
+    const out = [];
 
     for (const s of steps) {
       const [i0, i1] = s.way_points || [0, 0];
       const coords = line.slice(Math.max(0, i0), Math.min(line.length, i1 + 1));
-
       const distM = (s.distance && s.distance > 0) ? s.distance : (lengthFromCoordsKm(coords) * 1000);
-      if (distM < 5) continue; // include tiny city blocks but ignore jitter
-
-      const fromInstr =
-        (s.name && cleanStreetName(s.name)) ||
-        nameFromInstructionHTML(s.instruction || '', lastName) ||
-        '';
-
+      if (distM < 5) continue; // ignore jitter
       const hdg = headingFromCoords(coords);
-      const dir = toCardinal4(hdg ?? 0);
-
-      const midIdx = Math.floor(coords.length / 2);
-      const [lonMid, latMid] = coords[midIdx] || coords[0];
-
-      rows.push({
-        name: fromInstr,            // may be blank for now
-        km: +(distM/1000).toFixed(2),
-        dir,
-        mid: [lonMid, latMid]       // for reverse geocode if needed
+      out.push({
+        coords,
+        distKm: +(distM/1000).toFixed(2),
+        dir: toCardinal4(hdg ?? 0),
+        initialName: (s.name || '').trim(), // may be blank
+        htmlInstr: s.instruction || ''      // for popup text only
       });
-
-      if (fromInstr) lastName = fromInstr;
     }
-    return rows;
+    return out;
   }
 
-  // Enrich rows that lack a name by reverse geocoding their midpoints.
-  async function enrichAssignments(rows) {
-    for (let i=0; i<rows.length; i++) {
-      const r = rows[i];
-      if (r.name) continue;
-      try {
-        const nm = await reverseStreet(r.mid[0], r.mid[1]);
-        if (nm) r.name = nm;
-      } catch (e) {
-        // ignore and keep blank
-      }
+  // Name the steps using Snap v2 majority vote (only for steps missing names)
+  async function nameStepsWithSnap(stepSlices) {
+    // Collect samples for all steps
+    const allSamples = [];
+    const ranges = []; // [start,end) for each step into allSamples
+    for (const st of stepSlices) {
+      const samples = sampleAlong(st.coords, SAMPLE_EVERY_M);
+      ranges.push([allSamples.length, allSamples.length + samples.length]);
+      allSamples.push(...samples);
     }
-    // Merge consecutive same street + same bound
+    if (!allSamples.length) return stepSlices.map(s => ({ ...s, name: (s.initialName || '').trim() }));
+
+    // Batch snap
+    const snapped = [];
+    for (let i=0; i<allSamples.length; i+=SNAP_BATCH_SIZE) {
+      const chunk = allSamples.slice(i, i+SNAP_BATCH_SIZE);
+      const res = await snapBatch(PROFILE, chunk);
+      const arr = res?.snappedLocations || res?.locations || res?.features || res || [];
+      for (const it of arr) snapped.push(it);
+    }
+
+    // Assign names via majority vote
+    const named = [];
+    for (let si=0; si<stepSlices.length; si++) {
+      const st = stepSlices[si];
+      const [a,b] = ranges[si];
+      const votes = new Map();
+      for (let k=a; k<b; k++) {
+        const nm = nameFromSnapItem(snapped[k]);
+        if (!nm) continue;
+        votes.set(nm, (votes.get(nm)||0)+1);
+      }
+      // choose the most frequent
+      let best = '';
+      let bestN = 0;
+      votes.forEach((n, nm) => { if (n > bestN) { bestN = n; best = nm; }});
+      named.push({ ...st, name: (st.initialName || best || '').trim() });
+    }
+    return named;
+  }
+
+  async function buildStreetAssignmentsWithSnap(geojson) {
+    const slices = buildStepSlices(geojson);
+    if (!slices.length) return [];
+    // Only snap if any step has no name
+    const needSnap = slices.some(s => !s.initialName);
+    const withNames = needSnap ? await nameStepsWithSnap(slices) : slices.map(s => ({ ...s, name: s.initialName }));
+
+    // Merge consecutive rows with same street + bound; drop empties
     const merged = [];
-    for (const r of rows) {
-      if (!r.name) continue;  // still blank → drop
+    for (const r of withNames) {
+      if (!r.name) continue;
       const last = merged[merged.length - 1];
       if (last && last.name === r.name && last.dir === r.dir) {
-        last.km = +(last.km + r.km).toFixed(2);
+        last.km = +(last.km + r.distKm).toFixed(2);
       } else {
-        merged.push({ name: r.name, dir: r.dir, km: r.km });
+        merged.push({ name: r.name, dir: r.dir, km: r.distKm });
       }
     }
     return merged;
@@ -404,7 +400,7 @@
     };
   }
 
-  // ===== Generate Trips (Directions for each selected PD) =====
+  // ===== Generate Trips =====
   async function generateTrips() {
     try {
       const origin = global.ROUTING_ORIGIN;
@@ -425,14 +421,14 @@
       for (let i = 0; i < targets.length; i++) {
         const [dlon, dlat, label] = targets[i];
         try {
+          // 1) Directions (1 call per PD)
           const gj = await getRoute([origin.lon, origin.lat], [dlon, dlat]);
-
           drawRoute(gj, i === 0 ? COLOR_FIRST : COLOR_OTHERS);
 
           const feat = gj?.features?.[0];
           const seg  = feat?.properties?.segments?.[0];
 
-          // Total distance/time (with geometry fallback)
+          // Distance/time with geometry fallback
           let totalKm = (seg && seg.distance > 0) ? (seg.distance / 1000) : lengthFromCoordsKm(feat?.geometry?.coordinates || []);
           const km  = totalKm.toFixed(1);
           const min = seg ? Math.round((seg.duration || 0) / 60) : '—';
@@ -444,10 +440,8 @@
             return `${txt} — ${dist} km`;
           });
 
-          // 1) Build raw rows (may have blanks)
-          const raw = buildRawAssignments(gj);
-          // 2) Enrich blanks via reverse geocode (cached) — happens DURING generation
-          const assignments = await enrichAssignments(raw);
+          // 2) Street-by-street via Snap v2 (batched points; no Reverse)
+          const assignments = await buildStreetAssignmentsWithSnap(gj);
 
           S.results.push({ label, lat: dlat, lon: dlon, km, min, steps, assignments, gj });
 
@@ -470,7 +464,7 @@
           console.error(e);
           popup(`<b>Routing</b><br>Route failed for ${label}<br><small>${e.message}</small>`);
         }
-        if (i < targets.length - 1) await sleep(THROTTLE_MS);
+        if (i < targets.length - 1) await sleep(THROTTLE_MS_DIRECTIONS);
       }
 
       setReportEnabled(S.results.length > 0);
