@@ -1,8 +1,11 @@
-/* routing.js — Directions (1x/PD) + Movements (NB/EB/SB/WB) + Names
- * Names source priority:
- *   1) ORS Snap v2 /road (if it provides names on your tenant)
- *   2) Fallback: OSM Overpass (1 call per PD) — nearest way name/ref
+/* routing.js — Directions (1x/PD) + Movements (NB/EB/SB/WB)
+ * Names: ORS Snap v2 /road → Overpass fallback (1 call/PD).
  * Report uses cached results only (no extra API calls).
+ * Rules:
+ *  - Switch confirmation (≥120 m) to prevent jitter/backtracking
+ *  - Bound locked within each continuous street appearance (curves keep initial NB/EB/SB/WB)
+ *  - Repeats allowed (leaving & coming back creates a new row)
+ *  - Overpass nearest accepted only if within 45 m
  */
 (function (global) {
   // ===== Config =====
@@ -11,12 +14,18 @@
 
   const PROFILE = 'driving-car';
   const PREFERENCE = 'fastest';
-  const THROTTLE_MS_DIRECTIONS = 1200; // keep < 40 req/min
-  const SNAP_BATCH_SIZE = 200;
-  const SAMPLE_EVERY_M = 50;
+  const THROTTLE_MS_DIRECTIONS = 1200; // < 40 req/min
+  const SAMPLE_EVERY_M = 50;           // sampling distance along route
+  const SNAP_BATCH_SIZE = 200;         // Snap batch size
+
+  // Movement smoothing
+  const SWITCH_CONFIRM_M = 120;        // require new street to persist ≥ this to switch
+  const MIN_FRAGMENT_M   = 60;         // drop tiny fragments
+  const MAX_WAY_SNAP_M   = 45;         // accept Overpass nearest only if within this
 
   const COLOR_FIRST  = '#0b3aa5';
   const COLOR_OTHERS = '#2166f3';
+
   const ORS_BASE = 'https://api.openrouteservice.org';
 
   const LS_KEYS = 'ORS_KEYS';
@@ -108,7 +117,7 @@
     });
   }
 
-  // ===== SNAP v2 (road) — send both shapes; tenant will accept one =====
+  // ===== SNAP v2 (road) — send both shapes to be tenant-proof =====
   async function snapRoad(points) {
     if (!points?.length) return [];
     const url = `${ORS_BASE}/v2/snap/road`;
@@ -118,20 +127,17 @@
       body: JSON.stringify({ points, locations: points })
     });
     if ([401,403,429].includes(res.status) && rotateKey()) return snapRoad(points);
-    if (!res.ok) return []; // treat as “no names” (don’t break flow)
+    if (!res.ok) return []; // treat as no snap info
     const json = await res.json();
     return Array.isArray(json?.features) ? json.features : [];
   }
 
   // ===== Overpass fallback (1 call per PD) =====
   async function overpassFetchWays(bbox) {
-    // bbox: [south, west, north, east]
     const [s,w,n,e] = bbox;
     const q = `
       [out:json][timeout:25];
-      way
-        ["highway"]
-        (${s},${w},${n},${e});
+      way["highway"](${s},${w},${n},${e});
       (._;>;);
       out body geom;`;
     const res = await fetch('https://overpass-api.de/api/interpreter', {
@@ -141,11 +147,8 @@
     });
     if (!res.ok) throw new Error(`Overpass ${res.status}`);
     const json = await res.json();
-    // Build ways with geometry array [ [lon,lat], ... ] and a name/ref
     const nodes = new Map();
-    if (Array.isArray(json.elements)) {
-      for (const el of json.elements) if (el.type === 'node') nodes.set(el.id, [el.lon, el.lat]);
-    }
+    for (const el of json.elements || []) if (el.type === 'node') nodes.set(el.id, [el.lon, el.lat]);
     const ways = [];
     for (const el of json.elements || []) {
       if (el.type !== 'way') continue;
@@ -155,15 +158,14 @@
       const tags = el.tags || {};
       ways.push({
         coords,
-        name: tags.name || '',
-        ref: tags.ref || '',
-        label: tags['name:en'] || tags.name || tags.ref || ''
+        name: tags['name:en'] || tags.name || '',
+        ref: tags.ref || ''
       });
     }
     return ways;
   }
 
-  // ===== Geometry / math =====
+  // ===== Math / geometry =====
   const toRad = d => d*Math.PI/180;
   const toDeg = r => r*180/Math.PI;
   function haversineMeters(a,b){
@@ -194,12 +196,11 @@
   }
   function cardinal4(deg){ if (deg>=315||deg<45) return "NB"; if (deg<135) return "EB"; if (deg<225) return "SB"; return "WB"; }
 
-  // ===== Helpers: bbox of geometry =====
+  // ===== BBox with small padding =====
   function bboxOfCoords(coords) {
     let w= Infinity, s= Infinity, e=-Infinity, n=-Infinity;
     for (const [x,y] of coords){ if (x<w) w=x; if (x>e) e=x; if (y<s) s=y; if (y>n) n=y; }
-    // pad ~150m
-    const pad = 0.002; // ~200m around Toronto (lat ~43.7)
+    const pad = 0.002; // ~200m
     return [s-pad, w-pad, n+pad, e+pad];
   }
 
@@ -223,8 +224,8 @@
     return '';
   }
 
-  // Nearest way & name from Overpass set
-  function nearestWayName(point, ways){
+  // Nearest way & distance from Overpass set
+  function nearestWayNameAndDist(point, ways){
     let best=null, bestD=Infinity;
     for (const w of ways){
       const cs = w.coords;
@@ -233,12 +234,12 @@
         if (d < bestD){ bestD = d; best = w; }
       }
     }
-    if (!best) return '';
-    return normalizeName(best.label || best.name || (best.ref ? `Highway ${best.ref}` : ''));
+    if (!best) return ['', Infinity];
+    const nm = normalizeName(best.name || (best.ref ? `Highway ${best.ref}` : ''));
+    return [nm, bestD];
   }
-  // distance from point to segment (approx by sampling perpendicularly using haversine)
+  // distance from point to segment using simple planar meters
   function pointToSegmentMeters(p, a, b){
-    // Convert to simple planar meters using lat-scale (good enough for short segments)
     const k = Math.cos(toRad((a[1]+b[1])/2)) * 111320; // m/deg for lon
     const ky = 110540; // m/deg for lat
     const ax = (a[0])*k, ay = (a[1])*ky, bx=(b[0])*k, by=(b[1])*ky, px=(p[0])*k, py=(p[1])*ky;
@@ -251,7 +252,7 @@
     return Math.sqrt(dx*dx + dy*dy);
   }
 
-  // ===== Movements (sample → name → merge) =====
+  // ===== Movements (sample → name → switch confirm → merge) =====
   async function buildMovements(coords, segForFallback) {
     const { pts: sampled } = sampleLineWithIndex(coords, SAMPLE_EVERY_M);
     if (sampled.length < 2) return [];
@@ -262,59 +263,88 @@
       for (let i=0;i<sampled.length;i+=SNAP_BATCH_SIZE){
         const chunk = sampled.slice(i, i+SNAP_BATCH_SIZE);
         const feats = await snapRoad(chunk);
-        // pad/trim
         if (feats.length < chunk.length) for (let k=feats.length;k<chunk.length;k++) feats.push({});
         else if (feats.length > chunk.length) feats.length = chunk.length;
         snapFeatures.push(...feats);
       }
     } catch { snapFeatures = []; }
 
-    // If Snap yielded <30% named samples, fetch Overpass once and name via nearest way
-    let overpassWays = null;
+    // If Snap yielded few names, fetch Overpass once
     const snapNames = snapFeatures.map(f => pickFromSnapProps(f?.properties || {}));
     const namedCount = snapNames.filter(Boolean).length;
+    let overpassWays = null;
     if (namedCount < (sampled.length-1) * 0.3) {
       const bbox = bboxOfCoords(coords);
       try { overpassWays = await overpassFetchWays(bbox); }
       catch (e) { console.warn('Overpass failed:', e); }
     }
 
-    // Build rows
+    // Helper to get a preferred name at sample i
+    const nameAt = (i) => {
+      let nm = snapNames[i] || '';
+      if (!nm && overpassWays) {
+        const [n2, d2] = nearestWayNameAndDist(sampled[i], overpassWays);
+        if (d2 <= MAX_WAY_SNAP_M) nm = n2;
+      }
+      if (!nm && segForFallback?.steps?.length) {
+        const steps = segForFallback.steps;
+        const idx = Math.floor((i / (sampled.length-1)) * steps.length);
+        const st = steps[Math.max(0, Math.min(steps.length-1, idx))];
+        nm = normalizeName(st?.name || st?.instruction?.replace(/<[^>]*>/g,'') || '');
+      }
+      return nm || '(unnamed)';
+    };
+
+    // State machine for switch-confirmation & bound-locking
     const rows = [];
-    let cur = null;
+    let curName = nameAt(0);
+    let curBound = cardinal4(bearingDeg(sampled[0], sampled[1])); // lock at start
+    let curDist  = 0;
+
+    let pendingName = null;  // candidate street we're trying to switch to
+    let pendingDist = 0;     // how long we've stayed on candidate
 
     for (let i=0;i<sampled.length-1;i++){
       const segDist = haversineMeters(sampled[i], sampled[i+1]);
       if (segDist <= 0) continue;
-      const bound = cardinal4(bearingDeg(sampled[i], sampled[i+1]));
 
-      let name = snapNames[i] || '';
-      if (!name && overpassWays) name = nearestWayName(sampled[i], overpassWays);
-      if (!name && segForFallback?.steps?.length) {
-        // very last fallback: find closest step by along-route order
-        const steps = segForFallback.steps;
-        const idx = Math.floor((i / (sampled.length-1)) * steps.length);
-        const step = steps[Math.max(0, Math.min(steps.length-1, idx))];
-        name = normalizeName(step?.name || step?.instruction?.replace(/<[^>]*>/g,'') || '');
+      const observedName = nameAt(i);
+      const observedBound = cardinal4(bearingDeg(sampled[i], sampled[i+1])); // only used if we switch
+
+      if (observedName === curName) {
+        // Still on the same street: accumulate and cancel pending
+        curDist += segDist;
+        pendingName = null;
+        pendingDist = 0;
+        continue;
       }
-      if (!name) name = '(unnamed)';
 
-      if (!cur) cur = { dir: bound, name, m: 0 };
-      if (cur.dir === bound && cur.name === name) cur.m += segDist;
-      else { rows.push(cur); cur = { dir: bound, name, m: segDist }; }
+      // We saw a different street
+      if (pendingName === observedName) {
+        pendingDist += segDist;
+        if (pendingDist >= SWITCH_CONFIRM_M) {
+          // Confirm switch: finalize previous row if large enough
+          if (curDist >= MIN_FRAGMENT_M)
+            rows.push({ dir: curBound, name: curName, km: +(curDist/1000).toFixed(2) });
+          // Start new segment; lock bound to the first heading on this new street
+          curName = pendingName;
+          curBound = observedBound;
+          curDist = pendingDist;
+          pendingName = null;
+          pendingDist = 0;
+        }
+      } else {
+        // New candidate replaces the old one
+        pendingName = observedName;
+        pendingDist = segDist;
+      }
     }
-    if (cur) rows.push(cur);
 
-    // Merge tiny jitters & format
-    const merged = [];
-    for (const r of rows) {
-      if (merged.length && r.name === merged[merged.length-1].name && r.dir === merged[merged.length-1].dir) {
-        merged[merged.length-1].m += r.m;
-      } else merged.push({...r});
-    }
-    return merged
-      .filter(r => r.m >= 35) // drop micro fragments
-      .map(r => ({ dir: r.dir, name: r.name, km: +(r.m/1000).toFixed(2) }));
+    // Flush last segment
+    if (curDist >= MIN_FRAGMENT_M)
+      rows.push({ dir: curBound, name: curName, km: +(curDist/1000).toFixed(2) });
+
+    return rows;
   }
 
   // ===== Drawing =====
@@ -495,44 +525,3 @@
   function printReport() {
     if (!S.results.length) return popup('<b>Routing</b><br>Generate trips first.');
     const w = window.open('', '_blank');
-    const css = `
-      <style>
-        body { font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; padding:16px; }
-        h1 { margin:0 0 8px; font-size:20px; }
-        .card { border:1px solid #ddd; border-radius:12px; padding:12px; margin:12px 0; }
-        .sub { color:#555; margin-bottom:8px; }
-        table { width:100%; border-collapse:collapse; margin-top:8px; }
-        th, td { text-align:left; padding:6px 8px; border-bottom:1px solid #eee; }
-        th { font-weight:700; background:#fafafa; }
-        .right { text-align:right; white-space:nowrap; }
-      </style>`;
-    const rows = S.results.map((r,i) => {
-      const lines = (r.assignments && r.assignments.length)
-        ? r.assignments.map(a => `<tr><td>${a.dir}</td><td>${a.name}</td><td class="right">${a.km.toFixed(2)} km</td></tr>`).join('')
-        : `<tr><td colspan="3"><em>No named streets on route</em></td></tr>`;
-      return `
-        <div class="card">
-          <h2>${i+1}. ${r.label}</h2>
-          <div class="sub">Distance: ${r.km} km • ${r.min} min</div>
-          <table>
-            <thead><tr><th>Bound</th><th>Street</th><th class="right">Distance</th></tr></thead>
-            <tbody>${lines}</tbody>
-          </table>
-        </div>`;
-    }).join('');
-    w.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>Trip Report</title>${css}</head>
-    <body><h1>Trip Report — Street Assignments</h1>${rows}
-    <script>window.onload=()=>window.print();</script></body></html>`);
-    w.document.close();
-  }
-
-  // ===== Public API =====
-  const Routing = {
-    init(map) { init(map); },
-    clear() { clearAll(); },
-    setApiKeys(arr) { S.keys = Array.isArray(arr) ? [...arr] : []; saveKeys(S.keys); setIndex(0); }
-  };
-  global.Routing = Routing;
-
-  document.addEventListener('DOMContentLoaded', () => { if (global.map) Routing.init(global.map); });
-})(window);
