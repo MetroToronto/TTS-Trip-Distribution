@@ -117,13 +117,12 @@
   // ===== SNAP v2 (road) — endpoint/body compatible with your tenant =====
   async function snapRoad(locations) {
     // Body shape expected here: { locations: [[lon,lat], ...] }
-    // If your server prefers 'points', swap key name below.
     if (!locations?.length) return [];
     const url = `${ORS_BASE}/v2/snap/road`;
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Authorization': currentKey(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ locations })   // <-- key is 'locations'
+      body: JSON.stringify({ locations })
     });
     if ([401,403,429].includes(res.status) && rotateKey()) return snapRoad(locations);
     if (!res.ok) {
@@ -169,29 +168,113 @@
     return "WB";
   }
 
-  // ===== Naming helpers =====
-  function pickStreetName(props={}){
-    const cands=[props.name,props.road,props.street,props.way_name,props.label,props.ref,props.display_name]
-      .filter(Boolean).map(String);
-    const norm=s=>s
-      .replace(/\b(hwy)\b/ig,"Highway")
-      .replace(/\b(hwy)\s*(\d+)\b/ig,"Highway $2")
-      .replace(/\b(st)\b\.?/ig,"Street")
-      .replace(/\b(rd)\b\.?/ig,"Road")
-      .replace(/\b(ave)\b\.?/ig,"Avenue")
-      .replace(/\s+/g," ").trim();
-    const seen=new Set(); const uniq=[];
-    for (const s of cands.map(norm)) if (!seen.has(s)){ seen.add(s); uniq.push(s); }
-    if (!uniq.length && props.ref) return `Highway ${props.ref}`;
-    if (uniq[0] && /^\d+$/.test(uniq[0])) return `Highway ${uniq[0]}`;
-    return uniq[0]||"";
+  // ===== Directions HTML fallback parser (used only if snap has no name at a point) =====
+  function nameFromInstructionHTML(instrHTML = '', prevName = '') {
+    if (!instrHTML) return '';
+    const div = document.createElement('div');
+    div.innerHTML = instrHTML;
+    const candidates = Array.from(div.querySelectorAll('b,strong,abbr,span'))
+      .map(el => String(el.textContent || '').trim())
+      .filter(Boolean);
+    if (candidates.length) return candidates[candidates.length - 1];
+    const text = (div.textContent || '').replace(/\s+/g,' ').trim();
+    const pats = [
+      /\bexit(?:\s+\d+)?\s+(?:onto|to)\s+([^,;.]+)\b/i,
+      /\bramp(?:\s+to)?\s+([^,;.]+)\b/i,
+      /\bmerge\s+(?:onto|to)\s+([^,;.]+)\b/i,
+      /\bcontinue\s+(?:onto|on)\s+([^,;.]+)\b/i,
+      /\bturn\s+(?:left|right)\s+(?:onto|to)\s+([^,;.]+)\b/i,
+      /\bkeep\s+(?:left|right)\s+(?:onto|to)?\s*([^,;.]+)\b/i,
+      /\bfollow\s+([^,;.]+)\b/i
+    ];
+    for (const re of pats) {
+      const m = text.match(re);
+      if (m && m[1]) return m[1].trim();
+    }
+    if (/^continue\b/i.test(text) && prevName) return prevName;
+    return '';
+  }
+
+  // ===== Deep name extractor for Snap features =====
+  function pickStreetNameDeep(props = {}) {
+    // Collect candidate strings by scanning known keys + deep nested structures (e.g., props.tags.name)
+    const directKeys = ['name','road','street','way_name','label','ref','ref_name','display_name','official_name','loc_name','alt_name','signed_name','abbr','short_name'];
+    const candidates = [];
+
+    const push = (v, key='') => {
+      if (!v) return;
+      if (typeof v === 'string') {
+        const s = v.trim();
+        if (s) candidates.push([key.toLowerCase(), s]);
+      }
+    };
+
+    // 1) Direct keys on root
+    for (const k of directKeys) push(props[k], k);
+
+    // 2) Nested common containers
+    const nests = [props.tags, props.properties, props.attrs, props.meta, props.edge, props.way, props.osm, props.segment, props.road];
+    for (const obj of nests) if (obj && typeof obj === 'object') {
+      for (const k of directKeys) push(obj[k], k);
+      // Sometimes refs are like "ON 401"
+      if (obj.ref && typeof obj.ref === 'string') push(obj.ref, 'ref');
+    }
+
+    // 3) Generic deep scan (shallow BFS up to depth 3)
+    const q = [];
+    const pushObj = (o, depth=0) => {
+      if (!o || typeof o !== 'object' || depth > 3) return;
+      for (const [k,v] of Object.entries(o)) {
+        if (typeof v === 'string' && /(name|street|road|way|label|ref)/i.test(k)) push(v, k);
+        else if (typeof v === 'object') pushObj(v, depth+1);
+      }
+    };
+    pushObj(props, 0);
+
+    // Normalize & score
+    const norm = (s) => s
+      .replace(/\s+/g,' ')
+      .replace(/\b(hwy)\b/ig,'Highway')
+      .replace(/\b(hwy)\s*(\d+)\b/ig,'Highway $2')
+      .replace(/\b(st)\b\.?/ig,'Street')
+      .replace(/\b(rd)\b\.?/ig,'Road')
+      .replace(/\b(ave)\b\.?/ig,'Avenue')
+      .trim();
+
+    const scored = [];
+    for (const [key, raw] of candidates) {
+      let s = norm(raw);
+      if (!s) continue;
+      // Strip province prefix like "ON 401"
+      if (/^ON\s*\d+\b/i.test(s)) s = s.replace(/^ON\s*/i, 'Highway ');
+      // Avoid weird long labels
+      if (s.length > 80) continue;
+      // Heuristic score: prefer explicit 'name' over 'ref', and names with letters
+      let score = 0;
+      if (/name|street|road|way_name|label/.test(key)) score += 5;
+      if (/ref/.test(key)) score += 2;
+      if (/[A-Za-z]/.test(s)) score += 3;
+      if (/^Highway\s*\d+/.test(s)) score += 2;
+      if (/^\d+$/.test(s)) { s = `Highway ${s}`; score += 1; }
+      scored.push({ s, score });
+    }
+
+    if (!scored.length) {
+      // final fallback: use plain ref if present
+      if (props.ref && /^\d+[A-Z]?$/.test(String(props.ref))) return `Highway ${props.ref}`;
+      return '';
+    }
+
+    scored.sort((a,b)=> b.score - a.score || b.s.length - a.s.length);
+    return scored[0].s;
   }
 
   // ===== Movements from polyline (sample → snap → name → bound → merge) =====
   async function buildMovementsFromPolyline(coords, {
     sampleMeters = SAMPLE_EVERY_M,
     minMeters = 40,
-    headingWindow = 1
+    headingWindow = 1,
+    stepFallback = null // optional Directions step array for HTML fallback
   } = {}) {
     const sampled = sampleLine(coords, sampleMeters);
     if (!sampled || sampled.length<2) return [];
@@ -210,6 +293,15 @@
       features.push(...feats);
     }
 
+    // A tiny helper to fallback to step HTML around this index if Snap gives no name
+    const nameFromStepsAround = (i) => {
+      if (!Array.isArray(stepFallback) || !stepFallback.length) return '';
+      // crude mapping: proportional index into steps
+      const idx = Math.floor((i / sampled.length) * stepFallback.length);
+      const html = stepFallback[Math.max(0, Math.min(stepFallback.length-1, idx))]?.instruction || '';
+      return nameFromInstructionHTML(html, '');
+    };
+
     // Name + bound per consecutive sample pair
     const rows=[];
     let cur=null;
@@ -222,7 +314,9 @@
     for (let i=0;i<sampled.length-1;i++){
       const segDist=haversineMeters(sampled[i], sampled[i+1]);
       if (segDist<=0) continue;
-      const name = pickStreetName(features[i]?.properties||{}) || "(unnamed)";
+      const props = features[i]?.properties || {};
+      let name = pickStreetNameDeep(props);
+      if (!name) name = nameFromStepsAround(i) || "(unnamed)";
       const bound = getHeading(i);
 
       if (!cur){ cur={street:name, bound, distance_m:0}; }
@@ -403,7 +497,8 @@
           const movRows = await buildMovementsFromPolyline(coords, {
             sampleMeters: SAMPLE_EVERY_M,
             minMeters: 40,
-            headingWindow: 1
+            headingWindow: 1,
+            stepFallback: seg?.steps || []
           });
           assignments = movRows.map(r => ({ dir: r.bound, name: r.street, km: +(r.distance_m/1000).toFixed(2) }));
         } catch (e) {
