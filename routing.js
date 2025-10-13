@@ -114,17 +114,18 @@
     });
   }
 
-  // ===== SNAP v2 (road) — endpoint/body compatible with your tenant =====
-  async function snapRoad(locations) {
-    // Body shape expected here: { locations: [[lon,lat], ...] }
-    if (!locations?.length) return [];
+  // ===== SNAP v2 (road) — send BOTH keys to be tenant-proof =====
+  async function snapRoad(pointsArr) {
+    // We send both { points: [...] } and { locations: [...] }.
+    // Tenants ignore the extra key; this saves us from format mismatches.
+    if (!pointsArr?.length) return [];
     const url = `${ORS_BASE}/v2/snap/road`;
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Authorization': currentKey(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ locations })
+      body: JSON.stringify({ points: pointsArr, locations: pointsArr })
     });
-    if ([401,403,429].includes(res.status) && rotateKey()) return snapRoad(locations);
+    if ([401,403,429].includes(res.status) && rotateKey()) return snapRoad(pointsArr);
     if (!res.ok) {
       const t = await res.text().catch(()=> '');
       throw new Error(`Snap road ${res.status} ${t}`);
@@ -143,18 +144,21 @@
     const s=Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLng/2)**2;
     return 2*R*Math.asin(Math.sqrt(s));
   }
-  function sampleLine(coords, stepM){
-    if (!coords || coords.length<2) return coords||[];
-    const out=[coords[0]];
+
+  // Sample and also remember the *approximate* polyline index when the sample was emitted.
+  function sampleLineWithIndex(coords, stepM){
+    if (!coords || coords.length<2) return { pts: coords||[], idx: coords?.map((_,i)=>i)||[] };
+    const pts=[coords[0]], idx=[0];
     let acc=0;
     for (let i=1;i<coords.length;i++){
       const seg=haversineMeters(coords[i-1], coords[i]);
       acc+=seg;
-      if (acc>=stepM){ out.push(coords[i]); acc=0; }
+      if (acc>=stepM){ pts.push(coords[i]); idx.push(i); acc=0; }
     }
-    if (out[out.length-1]!==coords[coords.length-1]) out.push(coords[coords.length-1]);
-    return out;
+    if (pts[pts.length-1]!==coords[coords.length-1]) { pts.push(coords[coords.length-1]); idx.push(coords.length-1); }
+    return { pts, idx };
   }
+
   function bearingDeg(a,b){
     const [lng1,lat1]=[toRad(a[0]),toRad(a[1])], [lng2,lat2]=[toRad(b[0]),toRad(b[1])];
     const y=Math.sin(lng2-lng1)*Math.cos(lat2);
@@ -168,7 +172,7 @@
     return "WB";
   }
 
-  // ===== Directions HTML fallback parser (used only if snap has no name at a point) =====
+  // ===== Directions HTML fallback parser =====
   function nameFromInstructionHTML(instrHTML = '', prevName = '') {
     if (!instrHTML) return '';
     const div = document.createElement('div');
@@ -197,8 +201,7 @@
 
   // ===== Deep name extractor for Snap features =====
   function pickStreetNameDeep(props = {}) {
-    // Collect candidate strings by scanning known keys + deep nested structures (e.g., props.tags.name)
-    const directKeys = ['name','road','street','way_name','label','ref','ref_name','display_name','official_name','loc_name','alt_name','signed_name','abbr','short_name'];
+    const directKeys = ['name','road','street','way_name','label','ref','ref_name','display_name','official_name','loc_name','alt_name','signed_name','abbr','short_name','name:en','official_name:en'];
     const candidates = [];
 
     const push = (v, key='') => {
@@ -209,18 +212,14 @@
       }
     };
 
-    // 1) Direct keys on root
     for (const k of directKeys) push(props[k], k);
 
-    // 2) Nested common containers
     const nests = [props.tags, props.properties, props.attrs, props.meta, props.edge, props.way, props.osm, props.segment, props.road];
     for (const obj of nests) if (obj && typeof obj === 'object') {
       for (const k of directKeys) push(obj[k], k);
-      // Sometimes refs are like "ON 401"
       if (obj.ref && typeof obj.ref === 'string') push(obj.ref, 'ref');
     }
 
-    // 3) Generic deep scan (shallow BFS up to depth 3)
     const q = [];
     const pushObj = (o, depth=0) => {
       if (!o || typeof o !== 'object' || depth > 3) return;
@@ -231,7 +230,6 @@
     };
     pushObj(props, 0);
 
-    // Normalize & score
     const norm = (s) => s
       .replace(/\s+/g,' ')
       .replace(/\b(hwy)\b/ig,'Highway')
@@ -245,11 +243,8 @@
     for (const [key, raw] of candidates) {
       let s = norm(raw);
       if (!s) continue;
-      // Strip province prefix like "ON 401"
       if (/^ON\s*\d+\b/i.test(s)) s = s.replace(/^ON\s*/i, 'Highway ');
-      // Avoid weird long labels
       if (s.length > 80) continue;
-      // Heuristic score: prefer explicit 'name' over 'ref', and names with letters
       let score = 0;
       if (/name|street|road|way_name|label/.test(key)) score += 5;
       if (/ref/.test(key)) score += 2;
@@ -260,7 +255,6 @@
     }
 
     if (!scored.length) {
-      // final fallback: use plain ref if present
       if (props.ref && /^\d+[A-Z]?$/.test(String(props.ref))) return `Highway ${props.ref}`;
       return '';
     }
@@ -274,13 +268,26 @@
     sampleMeters = SAMPLE_EVERY_M,
     minMeters = 40,
     headingWindow = 1,
-    stepFallback = null // optional Directions step array for HTML fallback
+    stepFallbackObj = null // pass seg (so we have steps + way_points)
   } = {}) {
-    const sampled = sampleLine(coords, sampleMeters);
+    const { pts: sampled, idx: sampledIdx } = sampleLineWithIndex(coords, sampleMeters);
     if (!sampled || sampled.length<2) return [];
 
-    // Snap all samples in batches
+    // Prepare step fallback mapping: way_point index -> instruction/name
+    let stepsMeta = [];
+    if (stepFallbackObj && Array.isArray(stepFallbackObj.steps)) {
+      stepsMeta = stepFallbackObj.steps.map(s => ({
+        from: (s.way_points?.[0] ?? 0),
+        to:   (s.way_points?.[1] ?? 0),
+        html: s.instruction || '',
+        name: (s.name || '').trim()
+      }));
+    }
+
     const features = [];
+    let unnamedSnapCount = 0;
+
+    // Snap all samples in batches
     for (let i=0;i<sampled.length;i+=SNAP_BATCH_SIZE){
       const chunk = sampled.slice(i, i+SNAP_BATCH_SIZE);
       const feats = await snapRoad(chunk);
@@ -293,13 +300,13 @@
       features.push(...feats);
     }
 
-    // A tiny helper to fallback to step HTML around this index if Snap gives no name
-    const nameFromStepsAround = (i) => {
-      if (!Array.isArray(stepFallback) || !stepFallback.length) return '';
-      // crude mapping: proportional index into steps
-      const idx = Math.floor((i / sampled.length) * stepFallback.length);
-      const html = stepFallback[Math.max(0, Math.min(stepFallback.length-1, idx))]?.instruction || '';
-      return nameFromInstructionHTML(html, '');
+    // A helper to fallback to Directions step for a given sample index
+    const nameFromStepsAt = (sampleIndex) => {
+      if (!stepsMeta.length) return '';
+      const coordIdx = sampledIdx[Math.max(0, Math.min(sampledIdx.length-1, sampleIndex))];
+      const st = stepsMeta.find(s => coordIdx >= s.from && coordIdx <= s.to);
+      if (!st) return '';
+      return nameFromInstructionHTML(st.html, st.name) || st.name || '';
     };
 
     // Name + bound per consecutive sample pair
@@ -314,9 +321,13 @@
     for (let i=0;i<sampled.length-1;i++){
       const segDist=haversineMeters(sampled[i], sampled[i+1]);
       if (segDist<=0) continue;
+
       const props = features[i]?.properties || {};
       let name = pickStreetNameDeep(props);
-      if (!name) name = nameFromStepsAround(i) || "(unnamed)";
+      if (!name) {
+        unnamedSnapCount++;
+        name = nameFromStepsAt(i) || "(unnamed)";
+      }
       const bound = getHeading(i);
 
       if (!cur){ cur={street:name, bound, distance_m:0}; }
@@ -338,6 +349,17 @@
       } else merged.push({...r});
     }
     merged.forEach(r=>r.distance_m=Math.round(r.distance_m));
+
+    // Debug: surface when your tenant returns few/zero names so we can see keys
+    const unnamedRate = unnamedSnapCount / Math.max(1, sampled.length-1);
+    if (unnamedRate > 0.7) {
+      console.warn('[Routing] Snap names mostly empty (', Math.round(unnamedRate*100), '% ). Example properties:');
+      for (let j=0; j<Math.min(5, features.length); j++){
+        const p = features[j]?.properties;
+        if (p) console.warn('Snap props sample #', j, JSON.parse(JSON.stringify(p)));
+      }
+    }
+
     return merged;
   }
 
@@ -473,7 +495,6 @@
           feat = gj?.features?.[0];
           seg  = feat?.properties?.segments?.[0];
 
-          // Distance/time with geometry fallback
           let totalKm = (seg && seg.distance > 0) ? (seg.distance / 1000) : lengthFromCoordsKm(feat?.geometry?.coordinates || []);
           km  = totalKm.toFixed(1);
           min = seg ? Math.round((seg.duration || 0) / 60) : '—';
@@ -490,7 +511,7 @@
           return `${txt} — ${dist} km`;
         });
 
-        // 2) Movements via Snap v2 (no reverse geocode)
+        // 2) Movements via Snap v2 + robust fallback to Directions step names
         let assignments = [];
         try {
           const coords = feat?.geometry?.coordinates || [];
@@ -498,12 +519,11 @@
             sampleMeters: SAMPLE_EVERY_M,
             minMeters: 40,
             headingWindow: 1,
-            stepFallback: seg?.steps || []
+            stepFallbackObj: seg // gives us steps + way_points
           });
           assignments = movRows.map(r => ({ dir: r.bound, name: r.street, km: +(r.distance_m/1000).toFixed(2) }));
         } catch (e) {
           console.warn('Snap failed; falling back to minimal movements:', e);
-          // Fallback: at least provide NB/EB/SB/WB merged without names
           assignments = buildFallbackMovements(feat?.geometry?.coordinates || []);
         }
 
@@ -536,7 +556,6 @@
     }
   }
 
-  // lengthFromCoordsKm (used above)
   function lengthFromCoordsKm(coords) {
     let km = 0;
     for (let i=0;i<coords.length-1;i++){
@@ -546,10 +565,10 @@
     return km;
   }
 
-  // Fallback movements if Snap fails: merges by direction only with "(unnamed)"
+  // Fallback movements if everything fails: merges by direction only with "(unnamed)"
   function buildFallbackMovements(coords) {
     if (!coords || coords.length < 2) return [];
-    const sampled = sampleLine(coords, SAMPLE_EVERY_M);
+    const { pts: sampled } = sampleLineWithIndex(coords, SAMPLE_EVERY_M);
     const rows = [];
     let cur = null;
     for (let i=0;i<sampled.length-1;i++){
