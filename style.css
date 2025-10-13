@@ -1,8 +1,12 @@
-/* ---------- Layout ---------- */
+/* =========================
+   Layout
+   ========================= */
 html, body { height: 100%; margin: 0; }
 #map { height: 100%; width: 100%; }
 
-/* ---------- Design tokens ---------- */
+/* =========================
+   Design tokens
+   ========================= */
 :root {
   --ui-bg: #fff;
   --ui-border: #ddd;
@@ -14,250 +18,221 @@ html, body { height: 100%; margin: 0; }
 
   --pd-stroke: #ff6600;
   --pd-selected: #d40000;
-  --zone-stroke: #2166f3;
-  --zone-selected: #0b3aa5;
 
-  --btn-bg: #fff;
-  --btn-bg-ghost: #f7f7f7;
-  --btn-border: #bbb;
-  --btn-hover: #f0f0f0;
+  --btn-bg: #f6f7f8;
+  --btn-bg-ghost: transparent;
+  --btn-border: #cfd3d7;
+  --btn-hover: #eef1f4;
+
+  --chip-bg: #f1f5f9;
+  --chip-text: #0f172a;
+
+  --title: #111827;
+  --subtle: #64748b;
 }
 
-/* ---------- Unified card shell (PD, Zones, Trip, Report) ---------- */
-.pd-control,
-.routing-control,
-.report-control {
+/* =========================
+   Leaflet control column
+   ========================= */
+.leaflet-left .leaflet-control {
+  margin-left: 12px;
+}
+.leaflet-top .leaflet-control {
+  margin-top: 12px;
+}
+
+/* A single vertical column of cards on the left */
+#leftColumn,
+.leaflet-left .leaflet-top {
+  width: 280px;                 /* tune 250–300 as desired */
+  min-width: 250px;
+  max-width: 320px;
+}
+#leftColumn .panel,
+.leaflet-control.panel {
   background: var(--ui-bg);
-  padding: var(--ui-pad);
-  box-shadow: var(--ui-shadow);
+  border: 1px solid var(--ui-border);
   border-radius: var(--ui-radius);
-  font: 14px/1.3 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-  width: 250px;
-  max-width: 250px;
+  box-shadow: var(--ui-shadow);
+  padding: var(--ui-pad);
+  width: 100%;
+  box-sizing: border-box;
 }
 
-/* Titles on top (like your “old format”) */
+/* Ensure the geocoder matches column width */
+.leaflet-control-geocoder {
+  width: 100%;
+}
+.leaflet-control-geocoder .leaflet-control-geocoder-form input {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/* =========================
+   Headings & sections
+   ========================= */
 .pd-header,
-.routing-header {
-  display: block;
-  margin-bottom: 6px;
-}
-.pd-header strong,
-.routing-header strong {
-  display: block;
-  font-weight: 800;
-  font-size: 20px;
-  margin: 0 0 8px 0;
-}
-
-/* Action rows under the title */
-.pd-actions,
-.routing-actions {
+.zn-header,
+.routing-header,
+.report-header {
   display: flex;
   align-items: center;
-  gap: var(--ui-gap);
-  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 6px;
+  margin-bottom: 8px;
 }
 
-/* ---------- Buttons & inputs ---------- */
-.pd-control button,
-.routing-control button,
-.report-control button {
+.pd-header strong,
+.zn-header strong,
+.routing-header strong,
+.report-header strong {
+  color: var(--title);
+  font-size: 16px;
+  line-height: 1.2;
+  margin: 0;
+  font-weight: 700;
+}
+
+.section-subtle {
+  color: var(--subtle);
+  font-size: 12px;
+}
+
+/* =========================
+   Buttons / inputs
+   ========================= */
+button,
+input[type="button"],
+input[type="submit"] {
   appearance: none;
   background: var(--btn-bg);
   border: 1px solid var(--btn-border);
-  border-radius: 12px;
-  padding: 7px 12px;
+  border-radius: 10px;
+  padding: 6px 10px;
+  font-size: 13px;
+  line-height: 1;
+  color: #111;
   cursor: pointer;
-  font: inherit;
 }
-.pd-control button:hover,
-.routing-control button:hover,
-.report-control button:hover { background: var(--btn-hover); }
-.pd-control button.active,
-.routing-control button.active { border-color: #888; box-shadow: inset 0 0 0 1px #888; }
+button:hover { background: var(--btn-hover); }
 button.ghost { background: var(--btn-bg-ghost); }
 
-.pd-control input[type="text"],
-.routing-control input[type="text"] {
+.button-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+/* Full-width buttons when needed */
+.button-row.full {
+  grid-template-columns: 1fr;
+}
+
+input[type="text"],
+input[type="number"] {
   width: 100%;
   padding: 7px 9px;
   border: 1px solid var(--ui-border);
   border-radius: 8px;
-  font: inherit;
   box-sizing: border-box;
 }
 
-/* ---------- PD list ---------- */
-.pd-list {
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: 4px;
-  max-height: 300px;
+/* =========================
+   PD / Zone lists & chips
+   ========================= */
+.pd-list,
+#pd-list,
+.zone-list {
+  margin: 8px 0 0 0;
+  padding: 0;
+  list-style: none;
+  max-height: 220px;
   overflow: auto;
-  padding: 2px;
-  border-top: 1px dashed var(--ui-border);
+}
+
+.zone-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
   margin-top: 6px;
 }
-.pd-item { display: flex; align-items: center; gap: 8px; padding: 4px 2px; border-radius: 4px; }
-.pd-item:hover { background: rgba(0,0,0,.03); }
-.pd-cbx { flex: 0 0 auto; margin: 0 2px 0 0; width: 14px; height: 14px; }
-.pd-name { cursor: pointer; flex: 1; user-select: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.pd-item.selected .pd-name { font-weight: 600; }
 
-/* ---------- PD selected label (center pin) ---------- */
-.pd-label .leaflet-tooltip {
-  background: rgba(255, 255, 255, 0.95);
+.zone-chip {
+  background: var(--chip-bg);
+  color: var(--chip-text);
   border: 1px solid var(--ui-border);
-  border-radius: 6px;
-  box-shadow: var(--ui-shadow);
-  color: #000;
-  font-weight: 600;
-  padding: 4px 8px;
-}
-
-/* ---------- Zones (chips, popup) ---------- */
-.zone-label { }
-.zone-tag {
-  display: inline-block;
-  padding: 2px 6px;
   border-radius: 999px;
-  border: 1px solid var(--zone-stroke);
-  background: #fff;
-  font-weight: 600;
+  padding: 4px 8px;
   font-size: 12px;
-  line-height: 1.1;
-  box-shadow: var(--ui-shadow);
   user-select: none;
 }
-.zone-popup .leaflet-popup-content { font: 14px/1.3 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
 
-/* ---------- Zones control inline search ---------- */
-.pz-inline-search {
-  width: 100%;
-  padding: 6px 8px;
-  border: 1px solid var(--ui-border);
-  border-radius: 6px;
-  font: inherit;
-  box-sizing: border-box;
-}
-
-/* ---------- Routing control (Trip Generator & Keys) ---------- */
-.routing-control .routing-section + .routing-section {
-  border-top: 1px dashed var(--ui-border);
-  margin-top: 10px;
-  padding-top: 10px;
-}
-.routing-row { display: flex; gap: var(--ui-gap); align-items: center; flex-wrap: wrap; margin-top: 8px; }
-.routing-hint { color: #666; font-size: 12.5px; margin-top: 4px; display: block; }
-
-/* Key manager sub-section */
-.key-row { display: grid; grid-template-columns: 1fr; gap: 8px; }
-#txt-ors-keys { font-family: ui-monospace, Menlo, Consolas, "Liberation Mono", monospace; }
-
-/* ---------- Leaflet tweaks ---------- */
-.leaflet-popup-content { margin: 8px 10px; }
-.leaflet-popup-content-wrapper { border-radius: 10px; }
-
-/* ---------- Top geocoder (match 250px) ---------- */
-.leaflet-control-geocoder { width: 250px; max-width: 250px; }
-.leaflet-control-geocoder-form input { font-size: 16px; padding: 8px 10px; height: 38px; }
-
-/* ====== compact headers ====== */
-.pd-header strong,
-.routing-header strong {
-  font-size: 16px;     /* down from 20–24 */
-  line-height: 1.2;
-  margin: 0 0 6px 0;
-  font-weight: 700;
-}
-
-/* ====== put actions on ONE row ====== */
-.pd-actions,
-.routing-actions {
-  display: flex;
-  gap: 6px;            /* tighter gap so 3 items fit */
-  flex-wrap: nowrap;   /* no wrapping */
-  align-items: center;
-}
-
-/* Compact buttons to prevent wrapping */
-.pd-control button,
-.routing-control button,
-.report-control button {
-  font-size: 13px;
-  padding: 5px 9px;
-  white-space: nowrap; /* keep labels on one line */
-}
-
-/* In the PD header you have 3 items: Select all / Clear all / Expand.
-   Make them share the row cleanly inside 250px. */
-.pd-header .pd-actions > button {
-  flex: 1 1 0;         /* 3 equal buttons */
-  min-width: 0;        /* allow shrinking */
-}
-
-/* Zones row: Engage / Disengage / Zone # in one line at 250px */
-.pd-header .pd-actions #pz-engage,
-.pd-header .pd-actions #pz-disengage {
-  flex: 0 0 auto;      /* keep natural width */
-}
-.pd-header .pd-actions #pz-inline-search {
-  flex: 1 1 auto;      /* let the input take remaining space */
-  min-width: 80px;     /* still small enough to fit */
-  max-width: 100%;
-  margin-left: 4px;
-  font-size: 13px;
-  padding: 6px 8px;
-}
-
-/* Keep card + geocoder widths at 250px */
-.leaflet-control-geocoder { width: 250px; max-width: 250px; }
-.leaflet-control-geocoder-form input { height: 36px; font-size: 15px; }
-
-.pd-control, .routing-control, .report-control {
-  width: 250px !important;
-  max-width: 250px !important;
-}
-/* --- FIX: Planning Districts toolbar --- */
-
-/* Don't stretch PD buttons; keep natural width so click/handlers work */
-.pd-header .pd-actions {
-  display: flex;
-  gap: 6px;
-  flex-wrap: nowrap;          /* stay on one line */
-  justify-content: flex-start;
-  align-items: center;
-}
-
-/* Critical: stop equal-width stretching that could break interactions */
-.pd-header .pd-actions > button {
-  flex: 0 0 auto;             /* natural width */
-  min-width: 0;               /* allow compact layout */
-}
-
-/* If the PD Expand uses a dropdown/overlay, don't clip it */
-.pd-control { overflow: visible; }
-
-/* Compact button sizing so all PD actions fit on one row at 250px */
-.pd-control .pd-actions > button {
-  font-size: 13px;
-  padding: 5px 9px;
-  white-space: nowrap;
-}
-
-/* Keep titles compact (in case they were still large) */
-.pd-header strong,
-.routing-header strong {
-  font-size: 16px;
-
-  /* Collapse behavior for Planning Districts */
+/* Collapse behavior for Planning Districts */
 .pd-control.collapsed .pd-list,
 .pd-control.collapsed #pd-list {
   display: none !important;
 }
 
-  line-height: 1.2;
-  margin: 0 0 6px 0;
-  font-weight: 700;
+/* =========================
+   Routing + Report
+   ========================= */
+.routing-control .options {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--ui-border-strong);
 }
+
+.report-control .report-card {
+  border: 1px solid var(--ui-border);
+  border-radius: 12px;
+  padding: 8px;
+  margin-top: 8px;
+}
+
+.report-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 6px;
+  font-size: 13px;
+}
+.report-table th,
+.report-table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--ui-border);
+  text-align: left;
+}
+.report-table th {
+  background: #fafafa;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+/* Print tweaks */
+@media print {
+  .leaflet-control { box-shadow: none !important; }
+  .report-control .report-card { page-break-inside: avoid; }
+}
+
+/* =========================
+   Map layer styles (optional)
+   ========================= */
+.pd-boundary {
+  stroke: var(--pd-stroke);
+  stroke-width: 2px;
+  fill: rgba(255,102,0,0.08);
+}
+.pd-boundary.selected {
+  stroke: var(--pd-selected);
+  fill: rgba(212,0,0,0.1);
+}
+
+/* =========================
+   Utilities
+   ========================= */
+.m-0 { margin: 0 !important; }
+.mt-6 { margin-top: 6px !important; }
+.mt-8 { margin-top: 8px !important; }
+.mb-8 { margin-bottom: 8px !important; }
+.hidden { display: none !important; }
