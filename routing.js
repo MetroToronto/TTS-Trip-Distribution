@@ -6,6 +6,7 @@
  *  - Bound locked within each continuous street appearance (curves keep initial NB/EB/SB/WB)
  *  - Repeats allowed (leaving & coming back creates a new row)
  *  - Overpass nearest accepted only if within 45 m
+ * NOTE: Controls are always placed in Leaflet's top-left by default; no DOM reparenting.
  */
 (function (global) {
   // ===== Config =====
@@ -67,24 +68,6 @@
     if (ll) L.popup().setLatLng(ll).setContent(html).openOn(S.map);
     else alert(html.replace(/<[^>]+>/g, ''));
   };
-
-  function placeBelowPdAndZonesWithRetry() {
-    const start = performance.now();
-    const maxWaitMs = 2000;
-    (function tick(){
-      const geocoder = document.querySelector('.leaflet-control-geocoder');
-      const column =
-        geocoder?.closest('.leaflet-top.leaflet-left, .leaflet-top.leaflet-right') ||
-        document.querySelector('.leaflet-top.leaflet-left');
-      const trip   = document.querySelector('.routing-control.trip-card');
-      const report = document.querySelector('.routing-control.report-card');
-      const pdZones = Array.from(document.querySelectorAll('.pd-control'));
-      const ready = column && trip && report && pdZones.length >= 2;
-      if (ready) { column.appendChild(trip); column.appendChild(report); return; }
-      if (performance.now() - start < maxWaitMs) return setTimeout(tick, 80);
-      if (column) { if (trip) column.appendChild(trip); if (report) column.appendChild(report); }
-    })();
-  }
 
   // ===== ORS fetch =====
   async function orsFetch(path, { method = 'GET', body, query } = {}) {
@@ -238,7 +221,6 @@
     const nm = normalizeName(best.name || (best.ref ? `Highway ${best.ref}` : ''));
     return [nm, bestD];
   }
-  // distance from point to segment using simple planar meters
   function pointToSegmentMeters(p, a, b){
     const k = Math.cos(toRad((a[1]+b[1])/2)) * 111320; // m/deg for lon
     const ky = 110540; // m/deg for lat
@@ -298,11 +280,12 @@
     // State machine for switch-confirmation & bound-locking
     const rows = [];
     let curName = nameAt(0);
-    let curBound = cardinal4(bearingDeg(sampled[0], sampled[1])); // lock at start
+    let curBound = cardinal4(bearingDeg(sampled[0], sampled[1])); // lock at start of this appearance
     let curDist  = 0;
 
     let pendingName = null;  // candidate street we're trying to switch to
     let pendingDist = 0;     // how long we've stayed on candidate
+    let pendingFirstBound = null;
 
     for (let i=0;i<sampled.length-1;i++){
       const segDist = haversineMeters(sampled[i], sampled[i+1]);
@@ -314,8 +297,7 @@
       if (observedName === curName) {
         // Still on the same street: accumulate and cancel pending
         curDist += segDist;
-        pendingName = null;
-        pendingDist = 0;
+        pendingName = null; pendingDist = 0; pendingFirstBound = null;
         continue;
       }
 
@@ -328,15 +310,15 @@
             rows.push({ dir: curBound, name: curName, km: +(curDist/1000).toFixed(2) });
           // Start new segment; lock bound to the first heading on this new street
           curName = pendingName;
-          curBound = observedBound;
+          curBound = pendingFirstBound ?? observedBound;
           curDist = pendingDist;
-          pendingName = null;
-          pendingDist = 0;
+          pendingName = null; pendingDist = 0; pendingFirstBound = null;
         }
       } else {
         // New candidate replaces the old one
         pendingName = observedName;
         pendingDist = segDist;
+        pendingFirstBound = observedBound; // lock bound for candidate
       }
     }
 
@@ -363,7 +345,7 @@
 
   // ===== Controls =====
   const TripControl = L.Control.extend({
-    options: { position: 'topleft' },
+    options: { position: 'topleft' }, // always top-left; no DOM reparenting
     onAdd() {
       const el = L.DomUtil.create('div', 'routing-control trip-card');
       el.innerHTML = `
@@ -392,7 +374,7 @@
   });
 
   const ReportControl = L.Control.extend({
-    options: { position: 'topleft' },
+    options: { position: 'topleft' }, // always top-left
     onAdd() {
       const el = L.DomUtil.create('div', 'routing-control report-card');
       el.innerHTML = `
@@ -418,10 +400,11 @@
     S.keys = loadKeys();
     setIndex(getIndex());
 
+    // Add controls (always visible in top-left)
     S.map.addControl(new TripControl());
     S.map.addControl(new ReportControl());
-    placeBelowPdAndZonesWithRetry();
 
+    // Wire handlers after controls exist
     S.els = {
       gen: document.getElementById('rt-gen'),
       clr: document.getElementById('rt-clr'),
@@ -432,21 +415,21 @@
     };
     if (S.els.keys) S.els.keys.value = S.keys.join(',');
 
-    S.els.gen.onclick   = generateTrips;
-    S.els.clr.onclick   = () => clearAll();
-    S.els.print.onclick = () => printReport();
-    S.els.save.onclick  = () => {
+    S.els.gen && (S.els.gen.onclick   = generateTrips);
+    S.els.clr && (S.els.clr.onclick   = () => clearAll());
+    S.els.print && (S.els.print.onclick = () => printReport());
+    S.els.save && (S.els.save.onclick  = () => {
       const arr = (S.els.keys.value || '').split(',').map(s => s.trim()).filter(Boolean);
       if (!arr.length) return popup('<b>Routing</b><br>Enter a key.');
       S.keys = arr; saveKeys(arr); setIndex(0);
       popup('<b>Routing</b><br>Keys saved.');
-    };
-    S.els.url.onclick   = () => {
+    });
+    S.els.url && (S.els.url.onclick   = () => {
       const arr = parseUrlKeys();
       if (!arr.length) return popup('<b>Routing</b><br>No <code>?orsKey=</code> in URL.');
       S.keys = arr; setIndex(0);
       popup('<b>Routing</b><br>Using keys from URL.');
-    };
+    });
   }
 
   // ===== Generate Trips =====
@@ -525,3 +508,44 @@
   function printReport() {
     if (!S.results.length) return popup('<b>Routing</b><br>Generate trips first.');
     const w = window.open('', '_blank');
+    const css = `
+      <style>
+        body { font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; padding:16px; }
+        h1 { margin:0 0 8px; font-size:20px; }
+        .card { border:1px solid #ddd; border-radius:12px; padding:12px; margin:12px 0; }
+        .sub { color:#555; margin-bottom:8px; }
+        table { width:100%; border-collapse:collapse; margin-top:8px; }
+        th, td { text-align:left; padding:6px 8px; border-bottom:1px solid #eee; }
+        th { font-weight:700; background:#fafafa; }
+        .right { text-align:right; white-space:nowrap; }
+      </style>`;
+    const rows = S.results.map((r,i) => {
+      const lines = (r.assignments && r.assignments.length)
+        ? r.assignments.map(a => `<tr><td>${a.dir}</td><td>${a.name}</td><td class="right">${a.km.toFixed(2)} km</td></tr>`).join('')
+        : `<tr><td colspan="3"><em>No named streets on route</em></td></tr>`;
+      return `
+        <div class="card">
+          <h2>${i+1}. ${r.label}</h2>
+          <div class="sub">Distance: ${r.km} km • ${r.min} min</div>
+          <table>
+            <thead><tr><th>Bound</th><th>Street</th><th class="right">Distance</th></tr></thead>
+            <tbody>${lines}</tbody>
+          </table>
+        </div>`;
+    }).join('');
+    w.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>Trip Report</title>${css}</head>
+    <body><h1>Trip Report — Street Assignments</h1>${rows}
+    <script>window.onload=()=>window.print();</script></body></html>`);
+    w.document.close();
+  }
+
+  // ===== Public API =====
+  const Routing = {
+    init(map) { init(map); },
+    clear() { clearAll(); },
+    setApiKeys(arr) { S.keys = Array.isArray(arr) ? [...arr] : []; saveKeys(S.keys); setIndex(0); }
+  };
+  global.Routing = Routing;
+
+  document.addEventListener('DOMContentLoaded', () => { if (global.map) Routing.init(global.map); });
+})(window);
