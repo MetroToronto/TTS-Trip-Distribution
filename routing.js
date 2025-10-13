@@ -1,12 +1,11 @@
 /* routing.js — Directions (1x/PD) + Movements (NB/EB/SB/WB)
  * Names: ORS Snap v2 /road → Overpass fallback (1 call/PD).
  * Report uses cached results only (no extra API calls).
- * Rules:
- *  - Switch confirmation (≥120 m) to prevent jitter/backtracking
- *  - Bound locked within each continuous street appearance (curves keep initial NB/EB/SB/WB)
- *  - Repeats allowed (leaving & coming back creates a new row)
- *  - Overpass nearest accepted only if within 45 m
- * NOTE: Controls are always placed in Leaflet's top-left by default; no DOM reparenting.
+ * Smoothing:
+ *  - SWITCH_CONFIRM_M: new street must persist before switching
+ *  - REJOIN_WINDOW_M: if we switch then return to previous within this distance, merge back (no duplicate row)
+ *  - BOUND_AVG_WINDOW_M: initial bound for a street is the average heading over this window
+ *  - Repeats allowed later in route; only near-immediate backtracks are merged
  */
 (function (global) {
   // ===== Config =====
@@ -15,14 +14,15 @@
 
   const PROFILE = 'driving-car';
   const PREFERENCE = 'fastest';
-  const THROTTLE_MS_DIRECTIONS = 1200; // < 40 req/min
-  const SAMPLE_EVERY_M = 50;           // sampling distance along route
-  const SNAP_BATCH_SIZE = 200;         // Snap batch size
+  const THROTTLE_MS_DIRECTIONS = 1200;
 
-  // Movement smoothing
-  const SWITCH_CONFIRM_M = 120;        // require new street to persist ≥ this to switch
-  const MIN_FRAGMENT_M   = 60;         // drop tiny fragments
-  const MAX_WAY_SNAP_M   = 45;         // accept Overpass nearest only if within this
+  const SAMPLE_EVERY_M      = 50;   // sampling distance along route
+  const SNAP_BATCH_SIZE     = 200;  // Snap batch size
+  const SWITCH_CONFIRM_M    = 150;  // require new street to persist ≥ this to switch
+  const REJOIN_WINDOW_M     = 200;  // if we return to previous within this, merge (avoid dup)
+  const MIN_FRAGMENT_M      = 60;   // drop tiny fragments
+  const MAX_WAY_SNAP_M      = 45;   // accept Overpass nearest only if within this
+  const BOUND_AVG_WINDOW_M  = 150;  // distance used to average initial bound
 
   const COLOR_FIRST  = '#0b3aa5';
   const COLOR_OTHERS = '#2166f3';
@@ -38,7 +38,7 @@
     group: null,
     keys: [],
     keyIndex: 0,
-    results: [], // [{label, lat, lon, km, min, steps[], assignments[], gj}]
+    results: [],
     els: {}
   };
 
@@ -85,7 +85,6 @@
     return res.json();
   }
 
-  // Directions v2
   async function getRoute(originLonLat, destLonLat) {
     return orsFetch(`/v2/directions/${PROFILE}/geojson`, {
       method: 'POST',
@@ -100,22 +99,22 @@
     });
   }
 
-  // ===== SNAP v2 (road) — send both shapes to be tenant-proof =====
+  // ===== SNAP v2 =====
   async function snapRoad(points) {
     if (!points?.length) return [];
     const url = `${ORS_BASE}/v2/snap/road`;
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Authorization': currentKey(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ points, locations: points })
+      body: JSON.stringify({ points, locations: points }) // send both to be tenant-proof
     });
     if ([401,403,429].includes(res.status) && rotateKey()) return snapRoad(points);
-    if (!res.ok) return []; // treat as no snap info
+    if (!res.ok) return [];
     const json = await res.json();
     return Array.isArray(json?.features) ? json.features : [];
   }
 
-  // ===== Overpass fallback (1 call per PD) =====
+  // ===== Overpass fallback =====
   async function overpassFetchWays(bbox) {
     const [s,w,n,e] = bbox;
     const q = `
@@ -179,7 +178,23 @@
   }
   function cardinal4(deg){ if (deg>=315||deg<45) return "NB"; if (deg<135) return "EB"; if (deg<225) return "SB"; return "WB"; }
 
-  // ===== BBox with small padding =====
+  // Average heading over distance window starting at index i
+  function avgHeading(sampled, iStart, windowM) {
+    let vx = 0, vy = 0, acc = 0;
+    for (let i=iStart; i<sampled.length-1 && acc < windowM; i++) {
+      const a = sampled[i], b = sampled[i+1];
+      const d = haversineMeters(a,b); if (d <= 0) continue;
+      const br = bearingDeg(a,b) * Math.PI/180;
+      vx += Math.cos(br) * d;
+      vy += Math.sin(br) * d;
+      acc += d;
+    }
+    if (vx === 0 && vy === 0) return cardinal4(bearingDeg(sampled[iStart], sampled[Math.min(sampled.length-1, iStart+1)]));
+    const deg = (Math.atan2(vy, vx) * 180/Math.PI + 360) % 360;
+    return cardinal4(deg);
+  }
+
+  // ===== Helpers =====
   function bboxOfCoords(coords) {
     let w= Infinity, s= Infinity, e=-Infinity, n=-Infinity;
     for (const [x,y] of coords){ if (x<w) w=x; if (x>e) e=x; if (y<s) s=y; if (y>n) n=y; }
@@ -187,7 +202,6 @@
     return [s-pad, w-pad, n+pad, e+pad];
   }
 
-  // ===== Naming utils =====
   function normalizeName(s){
     if (!s) return '';
     return String(s)
@@ -207,7 +221,6 @@
     return '';
   }
 
-  // Nearest way & distance from Overpass set
   function nearestWayNameAndDist(point, ways){
     let best=null, bestD=Infinity;
     for (const w of ways){
@@ -222,8 +235,8 @@
     return [nm, bestD];
   }
   function pointToSegmentMeters(p, a, b){
-    const k = Math.cos(toRad((a[1]+b[1])/2)) * 111320; // m/deg for lon
-    const ky = 110540; // m/deg for lat
+    const k = Math.cos(toRad((a[1]+b[1])/2)) * 111320;
+    const ky = 110540;
     const ax = (a[0])*k, ay = (a[1])*ky, bx=(b[0])*k, by=(b[1])*ky, px=(p[0])*k, py=(p[1])*ky;
     const vx = bx-ax, vy=by-ay, wx=px-ax, wy=py-ay;
     const c1 = vx*wx + vy*wy;
@@ -234,12 +247,12 @@
     return Math.sqrt(dx*dx + dy*dy);
   }
 
-  // ===== Movements (sample → name → switch confirm → merge) =====
+  // ===== Movements builder =====
   async function buildMovements(coords, segForFallback) {
     const { pts: sampled } = sampleLineWithIndex(coords, SAMPLE_EVERY_M);
     if (sampled.length < 2) return [];
 
-    // Try SNAP first
+    // Snap
     let snapFeatures = [];
     try { 
       for (let i=0;i<sampled.length;i+=SNAP_BATCH_SIZE){
@@ -251,7 +264,6 @@
       }
     } catch { snapFeatures = []; }
 
-    // If Snap yielded few names, fetch Overpass once
     const snapNames = snapFeatures.map(f => pickFromSnapProps(f?.properties || {}));
     const namedCount = snapNames.filter(Boolean).length;
     let overpassWays = null;
@@ -261,7 +273,6 @@
       catch (e) { console.warn('Overpass failed:', e); }
     }
 
-    // Helper to get a preferred name at sample i
     const nameAt = (i) => {
       let nm = snapNames[i] || '';
       if (!nm && overpassWays) {
@@ -277,52 +288,90 @@
       return nm || '(unnamed)';
     };
 
-    // State machine for switch-confirmation & bound-locking
     const rows = [];
+
+    // Current "appearance"
     let curName = nameAt(0);
-    let curBound = cardinal4(bearingDeg(sampled[0], sampled[1])); // lock at start of this appearance
+    let curBound = avgHeading(sampled, 0, BOUND_AVG_WINDOW_M);
     let curDist  = 0;
 
-    let pendingName = null;  // candidate street we're trying to switch to
-    let pendingDist = 0;     // how long we've stayed on candidate
-    let pendingFirstBound = null;
+    // Pending switch candidate
+    let pendName = null;
+    let pendDist = 0;
+    let pendBoundAvgStartIdx = 0; // index where pending started
+    let switchingHold = null; // hold previous segment until rejoin window passes
+
+    // Distance already traversed on the *new* street since switch confirm
+    let distOnNewSinceConfirm = 0;
 
     for (let i=0;i<sampled.length-1;i++){
       const segDist = haversineMeters(sampled[i], sampled[i+1]);
       if (segDist <= 0) continue;
 
-      const observedName = nameAt(i);
-      const observedBound = cardinal4(bearingDeg(sampled[i], sampled[i+1])); // only used if we switch
+      const obsName = nameAt(i);
 
-      if (observedName === curName) {
-        // Still on the same street: accumulate and cancel pending
+      // If a prior switch was confirmed but not yet finalized (rejoin window), check for rejoin
+      if (switchingHold) {
+        distOnNewSinceConfirm += segDist;
+        if (obsName === switchingHold.name && distOnNewSinceConfirm < REJOIN_WINDOW_M) {
+          // Rejoin previous before window: cancel switch, continue previous segment
+          curName = switchingHold.name;
+          curBound = switchingHold.bound;
+          curDist  = switchingHold.dist + segDist;
+          switchingHold = null;
+          pendName = null; pendDist = 0;
+          continue;
+        }
+        if (distOnNewSinceConfirm >= REJOIN_WINDOW_M) {
+          // Finalize the previous row
+          if (switchingHold.dist >= MIN_FRAGMENT_M)
+            rows.push({ dir: switchingHold.bound, name: switchingHold.name, km: +(switchingHold.dist/1000).toFixed(2) });
+          switchingHold = null; // firm on new street now
+        }
+      }
+
+      if (obsName === curName) {
         curDist += segDist;
-        pendingName = null; pendingDist = 0; pendingFirstBound = null;
+        pendName = null; pendDist = 0;
         continue;
       }
 
-      // We saw a different street
-      if (pendingName === observedName) {
-        pendingDist += segDist;
-        if (pendingDist >= SWITCH_CONFIRM_M) {
-          // Confirm switch: finalize previous row if large enough
-          if (curDist >= MIN_FRAGMENT_M)
-            rows.push({ dir: curBound, name: curName, km: +(curDist/1000).toFixed(2) });
-          // Start new segment; lock bound to the first heading on this new street
-          curName = pendingName;
-          curBound = pendingFirstBound ?? observedBound;
-          curDist = pendingDist;
-          pendingName = null; pendingDist = 0; pendingFirstBound = null;
+      // Observe a candidate new street
+      if (pendName === obsName) {
+        pendDist += segDist;
+        if (pendDist >= SWITCH_CONFIRM_M) {
+          // Confirm the switch: compute the bound for the new street by averaging ahead
+          const newBound = avgHeading(sampled, Math.max(0, i - Math.ceil(pendDist / SAMPLE_EVERY_M)), BOUND_AVG_WINDOW_M);
+          // Put current segment on hold (we might rejoin quickly)
+          switchingHold = { name: curName, bound: curBound, dist: curDist };
+          distOnNewSinceConfirm = 0;
+          // Start new current
+          curName = pendName;
+          curBound = newBound;
+          curDist  = pendDist;
+          pendName = null; pendDist = 0;
         }
       } else {
-        // New candidate replaces the old one
-        pendingName = observedName;
-        pendingDist = segDist;
-        pendingFirstBound = observedBound; // lock bound for candidate
+        // New candidate replaces old
+        pendName = obsName;
+        pendDist = segDist;
+        pendBoundAvgStartIdx = i; // used by avgHeading upon confirm
       }
     }
 
-    // Flush last segment
+    // Finalize any pending switch (beyond rejoin window not reached)
+    if (switchingHold) {
+      // If we ended before REJOIN_WINDOW_M, merge back
+      if (distOnNewSinceConfirm < REJOIN_WINDOW_M) {
+        curName = switchingHold.name;
+        curBound = switchingHold.bound;
+        curDist += switchingHold.dist;
+      } else {
+        if (switchingHold.dist >= MIN_FRAGMENT_M)
+          rows.push({ dir: switchingHold.bound, name: switchingHold.name, km: +(switchingHold.dist/1000).toFixed(2) });
+      }
+    }
+
     if (curDist >= MIN_FRAGMENT_M)
       rows.push({ dir: curBound, name: curName, km: +(curDist/1000).toFixed(2) });
 
@@ -345,7 +394,7 @@
 
   // ===== Controls =====
   const TripControl = L.Control.extend({
-    options: { position: 'topleft' }, // always top-left; no DOM reparenting
+    options: { position: 'topleft' },
     onAdd() {
       const el = L.DomUtil.create('div', 'routing-control trip-card');
       el.innerHTML = `
@@ -374,7 +423,7 @@
   });
 
   const ReportControl = L.Control.extend({
-    options: { position: 'topleft' }, // always top-left
+    options: { position: 'topleft' },
     onAdd() {
       const el = L.DomUtil.create('div', 'routing-control report-card');
       el.innerHTML = `
@@ -400,11 +449,9 @@
     S.keys = loadKeys();
     setIndex(getIndex());
 
-    // Add controls (always visible in top-left)
     S.map.addControl(new TripControl());
     S.map.addControl(new ReportControl());
 
-    // Wire handlers after controls exist
     S.els = {
       gen: document.getElementById('rt-gen'),
       clr: document.getElementById('rt-clr'),
@@ -415,21 +462,21 @@
     };
     if (S.els.keys) S.els.keys.value = S.keys.join(',');
 
-    S.els.gen && (S.els.gen.onclick   = generateTrips);
-    S.els.clr && (S.els.clr.onclick   = () => clearAll());
-    S.els.print && (S.els.print.onclick = () => printReport());
-    S.els.save && (S.els.save.onclick  = () => {
+    if (S.els.gen)   S.els.gen.onclick   = generateTrips;
+    if (S.els.clr)   S.els.clr.onclick   = () => clearAll();
+    if (S.els.print) S.els.print.onclick = () => printReport();
+    if (S.els.save)  S.els.save.onclick  = () => {
       const arr = (S.els.keys.value || '').split(',').map(s => s.trim()).filter(Boolean);
       if (!arr.length) return popup('<b>Routing</b><br>Enter a key.');
       S.keys = arr; saveKeys(arr); setIndex(0);
       popup('<b>Routing</b><br>Keys saved.');
-    });
-    S.els.url && (S.els.url.onclick   = () => {
+    };
+    if (S.els.url)   S.els.url.onclick   = () => {
       const arr = parseUrlKeys();
       if (!arr.length) return popup('<b>Routing</b><br>No <code>?orsKey=</code> in URL.');
       S.keys = arr; setIndex(0);
       popup('<b>Routing</b><br>Using keys from URL.');
-    });
+    };
   }
 
   // ===== Generate Trips =====
@@ -442,7 +489,7 @@
       addMarker(origin.lat, origin.lon, `<b>Origin</b><br>${origin.label}`, 6);
 
       let targets = [];
-      if (typeof global.getSelectedPDTargets === 'function') targets = global.getSelectedPDTargets(); // [lon,lat,label]
+      if (typeof global.getSelectedPDTargets === 'function') targets = global.getSelectedPDTargets();
       if (!targets.length) return popup('<b>Routing</b><br>No PDs selected.');
 
       try {
@@ -453,22 +500,21 @@
       for (let i = 0; i < targets.length; i++) {
         const [dlon, dlat, label] = targets[i];
 
-        // 1) Directions
         let gj = null, feat = null, seg = null, km = '—', min = '—';
         try {
           gj = await getRoute([origin.lon, origin.lat], [dlon, dlat]);
           drawRoute(gj, i === 0 ? COLOR_FIRST : COLOR_OTHERS);
+
           feat = gj?.features?.[0];
           seg  = feat?.properties?.segments?.[0];
+
           const coords = feat?.geometry?.coordinates || [];
           const totalKm = (seg && seg.distance > 0) ? (seg.distance / 1000) : lengthFromCoordsKm(coords);
           km  = totalKm.toFixed(1);
           min = seg ? Math.round((seg.duration || 0) / 60) : '—';
 
-          // 2) Movements + names (Snap → Overpass fallback)
           const assignments = await buildMovements(coords, seg);
 
-          // Turn-by-turn (plain text) for popup details only
           const steps = (seg?.steps || []).map(s => {
             const txt = String(s.instruction || '').replace(/<[^>]+>/g, '');
             const dist = ((s.distance || 0) / 1000).toFixed(2);
