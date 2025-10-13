@@ -1,4 +1,4 @@
-/* routing.js — ORS Directions (1x/PD) + Snap v2 for street names (batched)
+/* routing.js — ORS Directions (1x/PD) + Snap v2 (batched) for street names
  * Uses origin from the top geocoder (window.ROUTING_ORIGIN set in script.js).
  * Inline fallback key (override via ?orsKey=K1,K2 or save in UI):
  * eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6Ijk5NWI5MTE5OTM2YTRmYjNhNDRiZTZjNDRjODhhNTRhIiwiaCI6Im11cm11cjY0In0=
@@ -12,7 +12,7 @@
   const PROFILE = 'driving-car';
   const PREFERENCE = 'fastest';
   const THROTTLE_MS_DIRECTIONS = 1200; // keep < 40 req/min
-  const SNAP_BATCH_SIZE = 100;         // up to 5k per request is possible; 100 is conservative
+  const SNAP_BATCH_SIZE = 200;         // ORS allows large batches; 200 is safe
   const SAMPLE_EVERY_M = 50;           // sample spacing along each step polyline
 
   const COLOR_FIRST  = '#0b3aa5';
@@ -165,8 +165,7 @@
     return 'NB';
   }
 
-  // ===== Snap helpers =====
-  // Sample along a [lon,lat] polyline every ~d meters
+  // ===== Sampling =====
   function sampleAlong(coords, dMeters = SAMPLE_EVERY_M) {
     if (!coords || coords.length < 2) return [];
     const pts = [];
@@ -196,19 +195,82 @@
     return out;
   }
 
-  // Extract a name from a Snap v2 item (handle varying payload shapes)
+  // ===== Name helpers =====
+  function cleanStreetName(s) {
+    if (!s) return '';
+    let t = String(s).replace(/\s+/g,' ').trim();
+    if (t.includes('/')) t = t.split('/')[0].trim();
+    t = t.replace(/[.,;]+$/,'');
+    if (/^[-–—]+$/.test(t)) return '';
+    return t;
+  }
+
+  // ORS Directions HTML sometimes bolds street names
+  function nameFromInstructionHTML(instrHTML = '', prevName = '') {
+    if (!instrHTML) return '';
+    const div = document.createElement('div');
+    div.innerHTML = instrHTML;
+    const candidates = Array.from(div.querySelectorAll('b,strong,abbr,span'))
+      .map(el => cleanStreetName(el.textContent || ''))
+      .filter(Boolean);
+    if (candidates.length) return candidates[candidates.length - 1];
+
+    // Fallback regexes on text
+    const text = (div.textContent || '').replace(/\s+/g,' ').trim();
+    const pats = [
+      /\bexit(?:\s+\d+)?\s+(?:onto|to)\s+([^,;.]+)\b/i,
+      /\bramp(?:\s+to)?\s+([^,;.]+)\b/i,
+      /\bmerge\s+(?:onto|to)\s+([^,;.]+)\b/i,
+      /\bcontinue\s+(?:onto|on)\s+([^,;.]+)\b/i,
+      /\bturn\s+(?:left|right)\s+(?:onto|to)\s+([^,;.]+)\b/i,
+      /\bkeep\s+(?:left|right)\s+(?:onto|to)?\s*([^,;.]+)\b/i,
+      /\bfollow\s+([^,;.]+)\b/i,
+      /\b(on|onto|to|toward|via)\s+([^,;.]+)\b/i
+    ];
+    for (const re of pats) {
+      const m = text.match(re);
+      if (m && (m[2] || m[1])) {
+        const cand = cleanStreetName((m[2] || m[1]));
+        if (cand) return cand;
+      }
+    }
+    if (/^continue\b/i.test(text) && prevName) return prevName;
+    return '';
+  }
+
+  // Robust extractor: look for any property whose key suggests a road name
   function nameFromSnapItem(item) {
     if (!item) return '';
-    // Common structures: features[], snappedLocations[], or simple array
-    const props = item.properties || item;
-    const cand =
-      props?.name ||
-      props?.street ||
-      props?.way_name ||
-      props?.road ||
-      props?.label ||
-      '';
-    return String(cand || '').trim();
+    const props = item.properties || item; // handle different shapes
+    if (!props || typeof props !== 'object') return '';
+    // direct hits first
+    const direct =
+      props.name || props.street || props.way_name || props.road || props.label || props.ref;
+    if (direct) return cleanStreetName(direct);
+
+    // heuristic: pick the longest-looking value from keys that look like names
+    let best = '';
+    for (const [k, v] of Object.entries(props)) {
+      if (!v || typeof v !== 'string') continue;
+      const kk = k.toLowerCase();
+      if (/(name|road|street|label|ref|way)/.test(kk)) {
+        const cand = cleanStreetName(v);
+        if (cand && cand.length > best.length) best = cand;
+      }
+    }
+    return best;
+  }
+
+  // Normalize Snap response to a flat array (one per input point) when possible
+  function flattenSnapResponse(res) {
+    // Common shapes seen:
+    // - { snappedLocations: [ { properties:{...}, geometry:{...} }, ... ] }
+    // - { features: [ { properties:{...}, ... }, ... ] }  (GeoJSON FC)
+    // - [ { properties:{...} }, ... ]
+    // - { locations: [...] } (older libs)
+    const a = res?.snappedLocations || res?.features || res?.locations || res;
+    if (Array.isArray(a)) return a;
+    return [];
   }
 
   // Build per-step slices from Directions (geometry-driven)
@@ -230,7 +292,7 @@
         distKm: +(distM/1000).toFixed(2),
         dir: toCardinal4(hdg ?? 0),
         initialName: (s.name || '').trim(), // may be blank
-        htmlInstr: s.instruction || ''      // for popup text only
+        htmlInstr: s.instruction || ''      // for fallback parse
       });
     }
     return out;
@@ -252,12 +314,26 @@
     const snapped = [];
     for (let i=0; i<allSamples.length; i+=SNAP_BATCH_SIZE) {
       const chunk = allSamples.slice(i, i+SNAP_BATCH_SIZE);
-      const res = await snapBatch(PROFILE, chunk);
-      const arr = res?.snappedLocations || res?.locations || res?.features || res || [];
-      for (const it of arr) snapped.push(it);
+      try {
+        const res = await snapBatch(PROFILE, chunk);
+        const arr = flattenSnapResponse(res);
+        snapped.push(...arr);
+      } catch (e) {
+        console.warn('Snap batch failed, continuing:', e);
+        // keep indexes consistent (pad with empty objects)
+        for (let k=0;k<chunk.length;k++) snapped.push({});
+      }
     }
 
-    // Assign names via majority vote
+    // If service returned fewer items than requested, pad; if more, trim
+    if (snapped.length < allSamples.length) {
+      const miss = allSamples.length - snapped.length;
+      for (let i=0; i<miss; i++) snapped.push({});
+    } else if (snapped.length > allSamples.length) {
+      snapped.length = allSamples.length;
+    }
+
+    // Assign names via majority vote; fallback to HTML parse when empty
     const named = [];
     for (let si=0; si<stepSlices.length; si++) {
       const st = stepSlices[si];
@@ -272,7 +348,13 @@
       let best = '';
       let bestN = 0;
       votes.forEach((n, nm) => { if (n > bestN) { bestN = n; best = nm; }});
-      named.push({ ...st, name: (st.initialName || best || '').trim() });
+
+      let finalName = (st.initialName || best || '').trim();
+      if (!finalName) {
+        const parsed = nameFromInstructionHTML(st.htmlInstr, '');
+        if (parsed) finalName = parsed;
+      }
+      named.push({ ...st, name: finalName });
     }
     return named;
   }
@@ -280,7 +362,6 @@
   async function buildStreetAssignmentsWithSnap(geojson) {
     const slices = buildStepSlices(geojson);
     if (!slices.length) return [];
-    // Only snap if any step has no name
     const needSnap = slices.some(s => !s.initialName);
     const withNames = needSnap ? await nameStepsWithSnap(slices) : slices.map(s => ({ ...s, name: s.initialName }));
 
@@ -440,8 +521,13 @@
             return `${txt} — ${dist} km`;
           });
 
-          // 2) Street-by-street via Snap v2 (batched points; no Reverse)
+          // 2) Street-by-street via Snap v2 (no Reverse)
           const assignments = await buildStreetAssignmentsWithSnap(gj);
+
+          // Debug aid: if you still see blanks, open console to inspect one step’s snap props
+          if (!assignments.length) {
+            console.warn('Snap produced no names. Inspect steps:', seg?.steps);
+          }
 
           S.results.push({ label, lat: dlat, lon: dlon, km, min, steps, assignments, gj });
 
