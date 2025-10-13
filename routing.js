@@ -10,8 +10,8 @@
   const PROFILE = 'driving-car';
   const PREFERENCE = 'fastest';
   const THROTTLE_MS_DIRECTIONS = 1200; // keep < 40 req/min
-  const SNAP_BATCH_SIZE = 200;         // safe batch size per Snap request
-  const SAMPLE_EVERY_M = 50;           // spacing for polyline sampling
+  const SNAP_BATCH_SIZE = 200;         // batch size per Snap request
+  const SAMPLE_EVERY_M = 50;           // spacing for polyline sampling (movements)
 
   const COLOR_FIRST  = '#0b3aa5';
   const COLOR_OTHERS = '#2166f3';
@@ -114,16 +114,18 @@
     });
   }
 
-  // ===== SNAP v2 (road) — correct endpoint + schema =====
-  async function snapRoad(pointsLngLat) {
-    if (!pointsLngLat?.length) return [];
+  // ===== SNAP v2 (road) — endpoint/body compatible with your tenant =====
+  async function snapRoad(locations) {
+    // Body shape expected here: { locations: [[lon,lat], ...] }
+    // If your server prefers 'points', swap key name below.
+    if (!locations?.length) return [];
     const url = `${ORS_BASE}/v2/snap/road`;
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Authorization': currentKey(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ points: pointsLngLat })
+      body: JSON.stringify({ locations })   // <-- key is 'locations'
     });
-    if ([401,403,429].includes(res.status) && rotateKey()) return snapRoad(pointsLngLat);
+    if ([401,403,429].includes(res.status) && rotateKey()) return snapRoad(locations);
     if (!res.ok) {
       const t = await res.text().catch(()=> '');
       throw new Error(`Snap road ${res.status} ${t}`);
@@ -367,61 +369,72 @@
 
       for (let i = 0; i < targets.length; i++) {
         const [dlon, dlat, label] = targets[i];
+
+        // 1) Directions (1 call per PD)
+        let gj = null, feat = null, seg = null, km = '—', min = '—';
         try {
-          // 1) Directions (1 call per PD)
-          const gj = await getRoute([origin.lon, origin.lat], [dlon, dlat]);
+          gj = await getRoute([origin.lon, origin.lat], [dlon, dlat]);
           drawRoute(gj, i === 0 ? COLOR_FIRST : COLOR_OTHERS);
 
-          const feat = gj?.features?.[0];
-          const seg  = feat?.properties?.segments?.[0];
+          feat = gj?.features?.[0];
+          seg  = feat?.properties?.segments?.[0];
 
           // Distance/time with geometry fallback
           let totalKm = (seg && seg.distance > 0) ? (seg.distance / 1000) : lengthFromCoordsKm(feat?.geometry?.coordinates || []);
-          const km  = totalKm.toFixed(1);
-          const min = seg ? Math.round((seg.duration || 0) / 60) : '—';
+          km  = totalKm.toFixed(1);
+          min = seg ? Math.round((seg.duration || 0) / 60) : '—';
+        } catch (e) {
+          console.error('Directions failed:', e);
+          popup(`<b>Routing</b><br>Routing failed for ${label}<br><small>${e.message}</small>`);
+          continue; // if directions fail, skip this PD
+        }
 
-          // Turn-by-turn (plain text) for popup details only
-          const steps = (seg?.steps || []).map(s => {
-            const txt = String(s.instruction || '').replace(/<[^>]+>/g, '');
-            const dist = ((s.distance || 0) / 1000).toFixed(2);
-            return `${txt} — ${dist} km`;
-          });
+        // Turn-by-turn (plain text) for popup details only
+        const steps = (seg?.steps || []).map(s => {
+          const txt = String(s.instruction || '').replace(/<[^>]+>/g, '');
+          const dist = ((s.distance || 0) / 1000).toFixed(2);
+          return `${txt} — ${dist} km`;
+        });
 
-          // 2) Movements via Snap v2 (no reverse geocode)
+        // 2) Movements via Snap v2 (no reverse geocode)
+        let assignments = [];
+        try {
           const coords = feat?.geometry?.coordinates || [];
           const movRows = await buildMovementsFromPolyline(coords, {
             sampleMeters: SAMPLE_EVERY_M,
             minMeters: 40,
             headingWindow: 1
           });
-          const assignments = movRows.map(r => ({ dir: r.bound, name: r.street, km: +(r.distance_m/1000).toFixed(2) }));
-
-          S.results.push({ label, lat: dlat, lon: dlon, km, min, steps, assignments, gj });
-
-          // Popup preview
-          const assignPreview = assignments.slice(0, 6).map(a => `<li>${a.dir} ${a.name} — ${a.km.toFixed(2)} km</li>`).join('');
-          const html = `
-            <div style="max-height:35vh;overflow:auto;">
-              <strong>${label}</strong><br>${km} km • ${min} min
-              <div style="margin-top:6px;">
-                <em>Street assignments</em>
-                <ul style="margin:6px 0 8px 18px; padding:0;">${assignPreview || '<li><em>No named streets</em></li>'}</ul>
-              </div>
-              <details>
-                <summary>Turn-by-turn</summary>
-                <ol style="margin:6px 0 0 18px; padding:0;">${steps.map(s=>`<li>${s}</li>`).join('')}</ol>
-              </details>
-            </div>`;
-          addMarker(dlat, dlon, html, 5).openPopup();
+          assignments = movRows.map(r => ({ dir: r.bound, name: r.street, km: +(r.distance_m/1000).toFixed(2) }));
         } catch (e) {
-          console.error(e);
-          popup(`<b>Routing</b><br>Route failed for ${label}<br><small>${e.message}</small>`);
+          console.warn('Snap failed; falling back to minimal movements:', e);
+          // Fallback: at least provide NB/EB/SB/WB merged without names
+          assignments = buildFallbackMovements(feat?.geometry?.coordinates || []);
         }
+
+        S.results.push({ label, lat: dlat, lon: dlon, km, min, steps, assignments, gj });
+
+        // Popup preview
+        const assignPreview = assignments.slice(0, 6).map(a => `<li>${a.dir} ${a.name} — ${a.km.toFixed(2)} km</li>`).join('');
+        const html = `
+          <div style="max-height:35vh;overflow:auto;">
+            <strong>${label}</strong><br>${km} km • ${min} min
+            <div style="margin-top:6px;">
+              <em>Street assignments</em>
+              <ul style="margin:6px 0 8px 18px; padding:0;">${assignPreview || '<li><em>No named streets</em></li>'}</ul>
+            </div>
+            <details>
+              <summary>Turn-by-turn</summary>
+              <ol style="margin:6px 0 0 18px; padding:0;">${steps.map(s=>`<li>${s}</li>`).join('')}</ol>
+            </details>
+          </div>`;
+        addMarker(dlat, dlon, html, 5).openPopup();
+
         if (i < targets.length - 1) await sleep(THROTTLE_MS_DIRECTIONS);
       }
 
       setReportEnabled(S.results.length > 0);
-      popup('<b>Routing</b><br>All routes generated. Popups added at each destination.');
+      if (S.results.length) popup('<b>Routing</b><br>All routes processed. Popups added at each destination.');
     } catch (e) {
       console.error(e);
       popup(`<b>Routing</b><br>${e.message || 'Unknown error.'}`);
@@ -436,6 +449,23 @@
       km += (haversineMeters([lon1,lat1],[lon2,lat2]) / 1000);
     }
     return km;
+  }
+
+  // Fallback movements if Snap fails: merges by direction only with "(unnamed)"
+  function buildFallbackMovements(coords) {
+    if (!coords || coords.length < 2) return [];
+    const sampled = sampleLine(coords, SAMPLE_EVERY_M);
+    const rows = [];
+    let cur = null;
+    for (let i=0;i<sampled.length-1;i++){
+      const d = haversineMeters(sampled[i], sampled[i+1]);
+      const b = cardinal4(bearingDeg(sampled[i], sampled[i+1]));
+      if (!cur) cur = { dir: b, name: '(unnamed)', km: 0 };
+      if (cur.dir === b) cur.km += d/1000;
+      else { rows.push({ ...cur }); cur = { dir: b, name: '(unnamed)', km: d/1000 }; }
+    }
+    if (cur) rows.push(cur);
+    return rows.map(r => ({ ...r, km: +r.km.toFixed(2) }));
   }
 
   // ===== Print Report (cached; no new API calls) =====
