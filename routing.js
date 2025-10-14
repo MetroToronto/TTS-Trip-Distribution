@@ -1,9 +1,9 @@
-/* routing.js — natural step listing (no highway special-casing), robust coords, stable UI */
+/* routing.js — natural step listing (no highway rules), robust coords, stable UI */
 (function (global) {
   // ===== Tunables ===========================================================
-  const MIN_FRAGMENT_M      = 20;   // drop only *very* tiny noise segments
-  const BOUND_LOCK_WINDOW_M = 300;  // meters used to stabilize heading
-  const SAMPLE_EVERY_M      = 50;   // resample polyline for heading
+  const MIN_FRAGMENT_M      = 20;   // drop only very tiny noise segments
+  const BOUND_LOCK_WINDOW_M = 300;  // meters to stabilize heading labels
+  const SAMPLE_EVERY_M      = 50;   // resampling interval for heading
   const PER_REQUEST_DELAY   = 80;   // ms between PD requests
 
   const PROFILE    = 'driving-car';
@@ -150,14 +150,17 @@
     return s;
   }
   function stepName(step) {
+    // 1) Prefer ORS-provided name exactly as-is (trimmed)
     const field = normalizeName(step?.name || step?.road || '');
     if (field) return field;
 
+    // 2) Fallback: extract trailing place from instruction without rewriting tokens
+    //    e.g., "Take the ramp onto ON-401 E" -> "ON-401 E"
     const t = cleanHtml(step?.instruction || '');
-    // Fallback: “onto/on X …”
-    const m = t.match(/\b(?:onto|on|to|toward|towards)\s+([A-Za-z0-9 .'\-\/&]+)$/i);
+    const m = t.match(/\b(?:onto|on|to|toward|towards)\s+([A-Za-z0-9 .,'\-\/&()]+)$/i);
     if (m) return normalizeName(m[1]);
 
+    // 3) Nothing usable
     return '';
   }
 
@@ -236,7 +239,7 @@
     }
   }
 
-  // ===== Movement list (no highway cutoff) =================================
+  // ===== Movement list (no highway special-casing) ==========================
   function sliceCoords(full, i0, i1){
     const s = Math.max(0, Math.min(i0, full.length - 1));
     const e = Math.max(0, Math.min(i1, full.length - 1));
@@ -293,7 +296,7 @@
       pushRow(nm, i0, i1, [i0, i1]);
     }
 
-    // Drop near-zero totals; keep everything else (no highway logic)
+    // Keep everything except near-zero noise; no highway detection/filtering.
     return rows.filter(r => r.km >= 0.02);
   }
 
