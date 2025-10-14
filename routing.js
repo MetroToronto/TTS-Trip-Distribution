@@ -1,8 +1,4 @@
-/* routing.js — simplified naming + hardened ORS calls
-   - Keeps ORS step names (no Snap v2 remnants)
-   - Always lists the first highway, then stops
-   - Adds coordinate sanitization + robust retry for ORS 500/2099
-*/
+/* routing.js — simplified naming, robust coord validation, reliable highways */
 (function (global) {
   // ===== Tunables ===========================================================
   const MIN_FRAGMENT_M      = 60;   // keep tiny fragments only if highway
@@ -33,18 +29,69 @@
     results: [],
   };
 
-  // ===== Helpers ============================================================
+  // ===== Small helpers ======================================================
   const byId   = (id) => document.getElementById(id);
-  const toRad  = (d) => d * Math.PI / 180;
   const sleep  = (ms) => new Promise(r => setTimeout(r, ms));
   const qParam = (k) => new URLSearchParams(location.search).get(k) || '';
+  const toRad  = (d) => d * Math.PI / 180;
 
+  function isFiniteNum(n){ return Number.isFinite(n) && !Number.isNaN(n); }
+  function num(x){ const n = typeof x === 'string' ? parseFloat(x) : +x; return Number.isFinite(n) ? n : NaN; }
+  function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
+
+  // Accepts anything-ish; returns [lon, lat] or throws with context
+  function sanitizeLonLat(input){
+    let arr = Array.isArray(input) ? input : [undefined, undefined];
+    // Many sources provide strings—coerce
+    let x = num(arr[0]);
+    let y = num(arr[1]);
+
+    // If swapped (|x|<=90, |y|>90) then swap back
+    if (isFiniteNum(x) && isFiniteNum(y) && Math.abs(x) <= 90 && Math.abs(y) > 90){
+      const t = x; x = y; y = t;
+    }
+
+    if (!isFiniteNum(x) || !isFiniteNum(y)){
+      throw new Error(`Invalid coordinate (NaN). Raw: ${JSON.stringify(input)}`);
+    }
+    x = clamp(x, -180, 180);
+    y = clamp(y,  -85,  85);
+    return [x, y];
+  }
+
+  // Normalize possible outputs from getSelectedPDTargets()
+  // Expected shapes:
+  //   [lon, lat, label]  OR  {lon,lat,label}  OR strings of those
+  function normalizeTargets(rawList){
+    const out = [];
+    const bad = [];
+    (rawList || []).forEach((t, i) => {
+      let lon, lat, label;
+      if (Array.isArray(t)) {
+        lon = t[0]; lat = t[1]; label = t[2] ?? `PD ${i+1}`;
+      } else if (t && typeof t === 'object') {
+        lon = t.lon ?? t.lng ?? t.x;
+        lat = t.lat ?? t.y;
+        label = t.label ?? t.name ?? `PD ${i+1}`;
+      }
+      try {
+        const pair = sanitizeLonLat([lon, lat]);
+        out.push([pair[0], pair[1], label]);
+      } catch (e) {
+        bad.push({ index: i, value: t, reason: String(e.message || e) });
+      }
+    });
+    return { good: out, bad };
+  }
+
+  // ===== Distances / bearings ==============================================
   function haversineMeters(a, b) {
     const R = 6371000;
-    const [x1, y1] = a, [x2, y2] = b;
-    const dLat = toRad(y2 - y1), dLng = toRad(x2 - x1);
-    const s = Math.sin(dLat/2)**2 + Math.cos(toRad(y1))*Math.cos(toRad(y2))*Math.sin(dLng/2)**2 * Math.sin(dLng/2)**2;
-    return 2 * R * Math.asin(Math.sqrt(Math.sin(dLat/2)**2 + Math.cos(toRad(y1))*Math.cos(toRad(y2))*Math.sin(dLng/2)**2));
+    const [lon1, lat1] = a, [lon2, lat2] = b;
+    const dLat = toRad(lat2 - lat1);
+    const dLon = toRad(lon2 - lon1);
+    const s = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon/2)**2;
+    return 2 * R * Math.asin(Math.sqrt(s));
   }
   function bearingDeg(a, b) {
     const [lng1, lat1] = [toRad(a[0]), toRad(a[1])], [lng2, lat2] = [toRad(b[0]), toRad(b[1])];
@@ -104,33 +151,11 @@
     return /\b(Highway\s?\d{2,3}|Gardiner\s+Expressway|Don Valley Parkway|QEW|DVP|Allen Road|Black Creek Drive)\b/i.test(name);
   }
 
-  // ===== Coords sanitization (prevents 2099 from bad inputs) ===============
-  function isFiniteNum(n){ return Number.isFinite(n) && !Number.isNaN(n); }
-  function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
-
-  // Accepts [lon, lat]; returns a safe [lon, lat]
-  function sanitizeLonLat(pair){
-    let [x, y] = Array.isArray(pair) ? pair : [NaN, NaN];
-    x = +x; y = +y;
-
-    // If they look swapped (|x|<=90 and |y|>=90), swap back
-    if (isFiniteNum(x) && isFiniteNum(y) && Math.abs(x) <= 90 && Math.abs(y) > 90){
-      const tmp = x; x = y; y = tmp;
-    }
-
-    if (!isFiniteNum(x) || !isFiniteNum(y)) throw new Error('Invalid coordinate (NaN).');
-    x = clamp(x, -180, 180);
-    y = clamp(y,  -85,  85); // keep away from poles
-    return [x, y];
-  }
-
   // ===== ORS keys & fetch with retry =======================================
   function savedKeys() {
     try { return JSON.parse(localStorage.getItem(LS_KEYS) || '[]'); } catch { return []; }
   }
-  function saveKeys(arr) {
-    localStorage.setItem(LS_KEYS, JSON.stringify(Array.isArray(arr) ? arr : []));
-  }
+  function saveKeys(arr) { localStorage.setItem(LS_KEYS, JSON.stringify(Array.isArray(arr) ? arr : [])); }
   function getIndex() { return +(localStorage.getItem(LS_ACTIVE_INDEX) || 0) || 0; }
   function setIndex(i) { localStorage.setItem(LS_ACTIVE_INDEX, String(i)); }
 
@@ -158,13 +183,11 @@
       body: method === 'GET' ? undefined : JSON.stringify(body)
     });
 
-    // Handle quota / auth, rotate key
+    // Rotate on auth/quota, retry on one transient 500
     if ([401,403,429].includes(res.status) && rotateKey()){
       await sleep(150);
       return orsFetch(path, { method, body, query }, attempt + 1);
     }
-
-    // Retry a transient 500 once with small backoff
     if (res.status === 500 && attempt < 1){
       await sleep(200);
       return orsFetch(path, { method, body, query }, attempt + 1);
@@ -177,7 +200,7 @@
     return res.json();
   }
 
-  // Try normal → if 500/2099 comes back, attempt a SAFE swap of *one* point once.
+  // Try normal; if we get ORS 500/2099, attempt a one-time destination swap.
   async function getRoute(originLonLat, destLonLat) {
     let o = sanitizeLonLat(originLonLat);
     let d = sanitizeLonLat(destLonLat);
@@ -196,14 +219,12 @@
     try {
       return await orsFetch(`/v2/directions/${PROFILE}/geojson`, { method: 'POST', body: baseBody });
     } catch (e) {
-      // Only consider fallback on the specific 500/2099 signature
       const msg = String(e.message || '');
       const is2099 = msg.includes('ORS 500') && (msg.includes('"code":2099') || msg.includes('code:2099'));
       if (!is2099) throw e;
 
-      // Fallback: try swap of destination (common case is centroid lat/lon accidentally reversed upstream)
-      const dSwap = [d[1], d[0]];
-      const bodySwap = { ...baseBody, coordinates: [o, sanitizeLonLat(dSwap)] };
+      const dSwap = sanitizeLonLat([d[1], d[0]]);
+      const bodySwap = { ...baseBody, coordinates: [o, dSwap] };
       return await orsFetch(`/v2/directions/${PROFILE}/geojson`, { method: 'POST', body: bodySwap });
     }
   }
@@ -221,7 +242,6 @@
     const e = Math.max(0, Math.min(w1, fullCoords.length - 1));
     if (e <= s + 1) return '';
 
-    // Advance ~limitM from start of step
     let acc = 0, cut = s + 1;
     for (let i = s + 1; i <= e; i++){
       acc += haversineMeters(fullCoords[i-1], fullCoords[i]);
@@ -273,7 +293,7 @@
     return rows.filter(r => r.km >= (isHighwayName(r.name) ? 0 : 0.05));
   }
 
-  // ===== Map draw & orchestration ==========================================
+  // ===== Map drawing & orchestration =======================================
   function clearAll(){
     S.results = [];
     if (S.group) S.group.clearLayers();
@@ -286,19 +306,36 @@
   }
 
   async function generate(){
+    // 1) Origin
     const origin = global.ROUTING_ORIGIN; // set by script.js geocoder
     if (!origin) { alert('Pick an origin address first.'); return; }
+    let originLonLat;
+    try {
+      originLonLat = sanitizeLonLat([origin.lng, origin.lat]);
+    } catch (e) {
+      console.error('Origin invalid:', origin, e);
+      alert('Origin has invalid coordinates. Please re-select the address.');
+      return;
+    }
 
-    const targets = (global.getSelectedPDTargets && global.getSelectedPDTargets()) || [];
-    if (!targets.length) { alert('Select at least one PD.'); return; }
+    // 2) Targets
+    const rawTargets = (global.getSelectedPDTargets && global.getSelectedPDTargets()) || [];
+    const { good: targets, bad } = normalizeTargets(rawTargets);
+    if (bad.length){
+      console.warn('Some PD targets were invalid and will be skipped:', bad);
+      const list = bad.slice(0,5).map(b => `#${b.index+1}: ${b.reason}`).join('\n');
+      alert(`Some PDs have invalid coordinates and were skipped:\n${list}${bad.length>5?'\n…':''}`);
+    }
+    if (!targets.length){
+      alert('Select at least one PD with valid coordinates.'); return;
+    }
 
     setBusy(true); clearAll();
-    try {
-      const originLonLat = sanitizeLonLat([+origin.lng, +origin.lat]);
 
+    try {
       for (let idx = 0; idx < targets.length; idx++){
         const [lon, lat, label] = targets[idx];
-        const destLonLat = sanitizeLonLat([+lon, +lat]);
+        const destLonLat = sanitizeLonLat([lon, lat]);
 
         const json  = await getRoute(originLonLat, destLonLat);
         const feat  = json.features?.[0];
@@ -329,7 +366,7 @@
   function printReport(){
     if (!S.results.length) { alert('No trips generated yet.'); return; }
 
-    const rowsHtml = S.results.map((r, i) => {
+    const rowsHtml = S.results.map((r) => {
       const mov = buildMovementsFromDirections(r.route.coords, r.route.steps);
       const lines = mov.map(m => `<tr><td>${m.dir || ''}</td><td>${m.name}</td><td style="text-align:right">${(m.km||0).toFixed(2)}</td></tr>`).join('');
       return `
