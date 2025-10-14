@@ -1,16 +1,14 @@
-/* routing.js — simplified naming (no Snap v2 logic), reliable highway rows
-   - Uses ORS Directions v2 (geojson) only
-   - Keeps step names as-is (trim/collapse whitespace only)
-   - First highway/expressway always appears, then list stops
-   - Stable NB/EB/SB/WB using first ~300 m of each step
+/* routing.js — simplified naming + hardened ORS calls
+   - Keeps ORS step names (no Snap v2 remnants)
+   - Always lists the first highway, then stops
+   - Adds coordinate sanitization + robust retry for ORS 500/2099
 */
 (function (global) {
   // ===== Tunables ===========================================================
-  const SWITCH_CONFIRM_M    = 200;  // minimum distance to accept a new street row
-  const REJOIN_WINDOW_M     = 600;  // allow re-merge with same street within window
-  const MIN_FRAGMENT_M      = 60;   // drop tiny noise fragments (non-highway)
-  const BOUND_LOCK_WINDOW_M = 300;  // length used to compute stable bearing
-  const SAMPLE_EVERY_M      = 50;   // resample polyline for bearing stability
+  const MIN_FRAGMENT_M      = 60;   // keep tiny fragments only if highway
+  const BOUND_LOCK_WINDOW_M = 300;  // meters used to stabilize heading
+  const SAMPLE_EVERY_M      = 50;   // resampling for heading
+  const PER_REQUEST_DELAY   = 80;   // ms between PD requests
 
   const PROFILE    = 'driving-car';
   const PREFERENCE = 'fastest';
@@ -19,7 +17,7 @@
   const COLOR_FIRST  = '#0b3aa5';
   const COLOR_OTHERS = '#2166f3';
 
-  // Fallback inline key (will be ignored if ?orsKey or saved keys exist)
+  // Fallback inline key (ignored if ?orsKey or saved keys exist)
   const INLINE_DEFAULT_KEY =
     'eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6Ijk5NWI5MTE5OTM2YTRmYjNhNDRiZTZjNDRjODhhNTRhIiwiaCI6Im11cm11cjY0In0=';
 
@@ -29,25 +27,24 @@
   // ===== State ==============================================================
   const S = {
     map: null,
-    group: null,            // L.LayerGroup for polylines
+    group: null,
     keys: [],
     keyIndex: 0,
-    results: [],            // [{dest:{lon,lat,label}, route:{coords,steps}}]
-    els: {}                 // for controls
+    results: [],
   };
 
-  // ===== Small helpers ======================================================
-  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-  const getParam = (k) => new URLSearchParams(location.search).get(k) || '';
-  const byId = (id) => document.getElementById(id);
+  // ===== Helpers ============================================================
+  const byId   = (id) => document.getElementById(id);
+  const toRad  = (d) => d * Math.PI / 180;
+  const sleep  = (ms) => new Promise(r => setTimeout(r, ms));
+  const qParam = (k) => new URLSearchParams(location.search).get(k) || '';
 
-  // ===== Geometry / math helpers ===========================================
-  const toRad = d => d * Math.PI / 180;
   function haversineMeters(a, b) {
-    const R = 6371000; const [x1, y1] = a, [x2, y2] = b;
+    const R = 6371000;
+    const [x1, y1] = a, [x2, y2] = b;
     const dLat = toRad(y2 - y1), dLng = toRad(x2 - x1);
-    const s = Math.sin(dLat/2)**2 + Math.cos(toRad(y1))*Math.cos(toRad(y2))*Math.sin(dLng/2)**2;
-    return 2 * R * Math.asin(Math.sqrt(s));
+    const s = Math.sin(dLat/2)**2 + Math.cos(toRad(y1))*Math.cos(toRad(y2))*Math.sin(dLng/2)**2 * Math.sin(dLng/2)**2;
+    return 2 * R * Math.asin(Math.sqrt(Math.sin(dLat/2)**2 + Math.cos(toRad(y1))*Math.cos(toRad(y2))*Math.sin(dLng/2)**2));
   }
   function bearingDeg(a, b) {
     const [lng1, lat1] = [toRad(a[0]), toRad(a[1])], [lng2, lat2] = [toRad(b[0]), toRad(b[1])];
@@ -56,8 +53,8 @@
     return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
   }
   function circularMean(degArr) {
-    const sx = degArr.reduce((a,d) => a + Math.cos(toRad(d)), 0);
-    const sy = degArr.reduce((a,d) => a + Math.sin(toRad(d)), 0);
+    const sx = degArr.reduce((a, d) => a + Math.cos(toRad(d)), 0);
+    const sy = degArr.reduce((a, d) => a + Math.sin(toRad(d)), 0);
     return (Math.atan2(sy, sx) * 180 / Math.PI + 360) % 360;
   }
   function boundFrom(deg) {
@@ -79,44 +76,55 @@
     return out;
   }
 
-  // ===== Name handling (simplified) ========================================
+  // ===== Minimal naming (no rewrites) ======================================
   function cleanHtml(s) { return String(s || '').replace(/<[^>]*>/g, '').trim(); }
-
-  // Minimal normalization: trim + collapse spaces; NEVER rewrite highway names.
   function normalizeName(raw) {
     if (!raw) return '';
-    let s = String(raw).trim().replace(/\s+/g, ' ');
+    const s = String(raw).trim().replace(/\s+/g, ' ');
     if (!s || /^unnamed\b/i.test(s) || /^[-–]+$/.test(s)) return '';
     return s;
   }
-
-  // Pull name for a step: prefer step.name; otherwise parse from instruction.
   function stepName(step) {
-    const byField = normalizeName(step?.name || step?.road || '');
-    if (byField) return byField;
+    const field = normalizeName(step?.name || step?.road || '');
+    if (field) return field;
 
     const t = cleanHtml(step?.instruction || '');
-    // Try explicit named expressways first
-    const named = t.match(/\b(Gardiner(?:\s+Expressway)?|Don Valley Parkway|DVP|QEW|Allen Road|Black Creek Drive)\b/i);
+    // Named expressways
+    const named = t.match(/\b(Gardiner(?:\s+Expressway)?|Don Valley Parkway|QEW|DVP|Allen Road|Black Creek Drive)\b/i);
     if (named) return normalizeName(named[1]);
-
-    // Try generic highway numbers like ON-401 / Hwy 404 / 427
+    // Highway numbers like ON-401 / Hwy 404 / 427
     const hnum = t.match(/\b(?:ON|Ontario)?[-– ]?(?:Hwy|HWY|Highway|RTE|Route)?\s*(\d{2,3})\b/);
     if (hnum) return normalizeName(`Highway ${hnum[1]}`);
-
     // Fallback: "onto X" / "on X"
     const m = t.match(/\b(?:onto|on|to|toward|towards)\s+([A-Za-z0-9 .'\-\/&]+)$/i);
     if (m) return normalizeName(m[1]);
-
     return '';
   }
-
-  // Simple highway check (no rewriting)
-  function isHighwayName(name = '') {
+  function isHighwayName(name='') {
     return /\b(Highway\s?\d{2,3}|Gardiner\s+Expressway|Don Valley Parkway|QEW|DVP|Allen Road|Black Creek Drive)\b/i.test(name);
   }
 
-  // ===== ORS requests =======================================================
+  // ===== Coords sanitization (prevents 2099 from bad inputs) ===============
+  function isFiniteNum(n){ return Number.isFinite(n) && !Number.isNaN(n); }
+  function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
+
+  // Accepts [lon, lat]; returns a safe [lon, lat]
+  function sanitizeLonLat(pair){
+    let [x, y] = Array.isArray(pair) ? pair : [NaN, NaN];
+    x = +x; y = +y;
+
+    // If they look swapped (|x|<=90 and |y|>=90), swap back
+    if (isFiniteNum(x) && isFiniteNum(y) && Math.abs(x) <= 90 && Math.abs(y) > 90){
+      const tmp = x; x = y; y = tmp;
+    }
+
+    if (!isFiniteNum(x) || !isFiniteNum(y)) throw new Error('Invalid coordinate (NaN).');
+    x = clamp(x, -180, 180);
+    y = clamp(y,  -85,  85); // keep away from poles
+    return [x, y];
+  }
+
+  // ===== ORS keys & fetch with retry =======================================
   function savedKeys() {
     try { return JSON.parse(localStorage.getItem(LS_KEYS) || '[]'); } catch { return []; }
   }
@@ -127,170 +135,183 @@
   function setIndex(i) { localStorage.setItem(LS_ACTIVE_INDEX, String(i)); }
 
   function hydrateKeys() {
-    const urlKey = getParam('orsKey');
+    const urlKey = qParam('orsKey');
     const saved = savedKeys();
     const inline = [INLINE_DEFAULT_KEY];
     S.keys = (urlKey ? [urlKey] : []).concat(saved.length ? saved : inline);
     S.keyIndex = Math.min(getIndex(), Math.max(0, S.keys.length - 1));
   }
-  function currentKey() { return S.keys[Math.min(Math.max(S.keyIndex, 0), S.keys.length - 1)] || ''; }
-  function rotateKey() {
+  function currentKey(){ return S.keys[Math.min(Math.max(S.keyIndex,0), S.keys.length-1)] || ''; }
+  function rotateKey(){
     if (S.keys.length <= 1) return false;
     S.keyIndex = (S.keyIndex + 1) % S.keys.length;
     setIndex(S.keyIndex);
     return true;
-    }
+  }
 
-  async function orsFetch(path, { method = 'GET', body, query } = {}) {
+  async function orsFetch(path, { method='GET', body, query } = {}, attempt = 0){
     const url = new URL(ORS_BASE + path);
-    if (query) Object.entries(query).forEach(([k, v]) => url.searchParams.set(k, v));
+    if (query) Object.entries(query).forEach(([k,v]) => url.searchParams.set(k, v));
     const res = await fetch(url.toString(), {
       method,
       headers: { Authorization: currentKey(), ...(method !== 'GET' && { 'Content-Type':'application/json' }) },
       body: method === 'GET' ? undefined : JSON.stringify(body)
     });
-    if ([401,403,429].includes(res.status) && rotateKey()) return orsFetch(path, { method, body, query });
-    if (!res.ok) throw new Error(`ORS ${res.status}: ${await res.text().catch(()=>res.statusText)}`);
+
+    // Handle quota / auth, rotate key
+    if ([401,403,429].includes(res.status) && rotateKey()){
+      await sleep(150);
+      return orsFetch(path, { method, body, query }, attempt + 1);
+    }
+
+    // Retry a transient 500 once with small backoff
+    if (res.status === 500 && attempt < 1){
+      await sleep(200);
+      return orsFetch(path, { method, body, query }, attempt + 1);
+    }
+
+    if (!res.ok){
+      const txt = await res.text().catch(()=>res.statusText);
+      throw new Error(`ORS ${res.status}: ${txt}`);
+    }
     return res.json();
   }
 
+  // Try normal → if 500/2099 comes back, attempt a SAFE swap of *one* point once.
   async function getRoute(originLonLat, destLonLat) {
-    return orsFetch(`/v2/directions/${PROFILE}/geojson`, {
-      method: 'POST',
-      body: {
-        coordinates: [originLonLat, destLonLat],
-        preference: PREFERENCE,
-        instructions: true,
-        instructions_format: 'html',
-        language: 'en',
-        units: 'km'
-      }
-    });
+    let o = sanitizeLonLat(originLonLat);
+    let d = sanitizeLonLat(destLonLat);
+
+    const baseBody = {
+      coordinates: [o, d],
+      preference: PREFERENCE,
+      instructions: true,
+      instructions_format: 'html',
+      language: 'en',
+      geometry_simplify: false,
+      elevation: false,
+      units: 'km'
+    };
+
+    try {
+      return await orsFetch(`/v2/directions/${PROFILE}/geojson`, { method: 'POST', body: baseBody });
+    } catch (e) {
+      // Only consider fallback on the specific 500/2099 signature
+      const msg = String(e.message || '');
+      const is2099 = msg.includes('ORS 500') && (msg.includes('"code":2099') || msg.includes('code:2099'));
+      if (!is2099) throw e;
+
+      // Fallback: try swap of destination (common case is centroid lat/lon accidentally reversed upstream)
+      const dSwap = [d[1], d[0]];
+      const bodySwap = { ...baseBody, coordinates: [o, sanitizeLonLat(dSwap)] };
+      return await orsFetch(`/v2/directions/${PROFILE}/geojson`, { method: 'POST', body: bodySwap });
+    }
   }
 
-  // ===== Movement list builder (directions-only) ============================
-  function sliceCoords(fullCoords, i0, i1) {
-    const s = Math.max(0, Math.min(i0, fullCoords.length - 1));
-    const e = Math.max(0, Math.min(i1, fullCoords.length - 1));
-    if (e <= s) return fullCoords.slice(s, s + 1);
-    return fullCoords.slice(s, e + 1);
+  // ===== Movement list ======================================================
+  function sliceCoords(full, i0, i1){
+    const s = Math.max(0, Math.min(i0, full.length - 1));
+    const e = Math.max(0, Math.min(i1, full.length - 1));
+    return e <= s ? full.slice(s, s + 1) : full.slice(s, e + 1);
   }
-
-  function stableBoundForStep(fullCoords, waypoints, limitM = BOUND_LOCK_WINDOW_M) {
+  function stableBoundForStep(fullCoords, waypoints, limitM = BOUND_LOCK_WINDOW_M){
     if (!Array.isArray(waypoints) || waypoints.length !== 2) return '';
     const [w0, w1] = waypoints;
     const s = Math.max(0, Math.min(w0, fullCoords.length - 1));
     const e = Math.max(0, Math.min(w1, fullCoords.length - 1));
     if (e <= s + 1) return '';
 
-    // Walk from s forward until ~limitM reached
-    let accum = 0;
-    let cut = s + 1;
-    for (let i = s + 1; i <= e; i++) {
-      accum += haversineMeters(fullCoords[i - 1], fullCoords[i]);
-      if (accum >= limitM) { cut = i; break; }
+    // Advance ~limitM from start of step
+    let acc = 0, cut = s + 1;
+    for (let i = s + 1; i <= e; i++){
+      acc += haversineMeters(fullCoords[i-1], fullCoords[i]);
+      if (acc >= limitM) { cut = i; break; }
     }
     const seg = fullCoords.slice(s, Math.max(cut, s + 1) + 1);
     const samples = resample(seg, SAMPLE_EVERY_M);
     if (samples.length < 2) return '';
 
     const bearings = [];
-    for (let i = 1; i < samples.length; i++) bearings.push(bearingDeg(samples[i - 1], samples[i]));
+    for (let i = 1; i < samples.length; i++) bearings.push(bearingDeg(samples[i-1], samples[i]));
     const mean = circularMean(bearings);
     return boundFrom(mean);
   }
 
-  function buildMovementsFromDirections(coords, steps) {
+  function buildMovementsFromDirections(coords, steps){
     if (!coords?.length || !steps?.length) return [];
-
     const rows = [];
-    const pushRow = (name, i0, i1, waypoints, isHighway) => {
+
+    const pushRow = (name, i0, i1, waypoints, isHwy) => {
       const nm = normalizeName(name);
       if (!nm) return;
-
       const seg = sliceCoords(coords, i0, i1);
       if (seg.length < 2) return;
 
-      // distance of this row
-      let meters = 0; for (let i = 1; i < seg.length; i++) meters += haversineMeters(seg[i - 1], seg[i]);
-      // Keep tiny fragments only if it's the highway row
-      if (meters < MIN_FRAGMENT_M && !isHighway) return;
+      // Distance
+      let meters = 0; for (let i = 1; i < seg.length; i++) meters += haversineMeters(seg[i-1], seg[i]);
+      if (meters < MIN_FRAGMENT_M && !isHwy) return;
 
       const dir = stableBoundForStep(coords, waypoints, BOUND_LOCK_WINDOW_M) || '';
-
       const last = rows[rows.length - 1];
-      if (last && last.name === nm && last.dir === dir) {
+      if (last && last.name === nm && last.dir === dir){
         last.km = +(last.km + meters / 1000).toFixed(2);
       } else {
         rows.push({ dir, name: nm, km: +(meters / 1000).toFixed(2) });
       }
     };
 
-    let stopped = false;
-    for (const step of steps) {
+    for (const step of steps){
       const nm = stepName(step);
       const isHwy = isHighwayName(nm);
-      const [i0, i1] = Array.isArray(step.way_points) ? step.way_points : step.wayPoints || step.waypoints || [0, 0];
-
-      // Push row
+      const wp = step.way_points || step.wayPoints || step.waypoints || [0, 0];
+      const [i0, i1] = wp;
       pushRow(nm, i0, i1, [i0, i1], isHwy);
-
-      if (isHwy) { stopped = true; break; }
+      if (isHwy) break; // stop after first highway row appears
     }
 
-    // Remove ultra-short non-highway rows at the start that can appear before the first meaningful segment
-    return rows.filter(r => r.km >= (isHighwayName(r.name) ? 0 : (SWITCH_CONFIRM_M / 1000)));
+    // Keep all highway rows; for non-highways, drop near-zero totals
+    return rows.filter(r => r.km >= (isHighwayName(r.name) ? 0 : 0.05));
   }
 
-  // ===== Map drawing & orchestration =======================================
-  function clearAll() {
+  // ===== Map draw & orchestration ==========================================
+  function clearAll(){
     S.results = [];
     if (S.group) S.group.clearLayers();
-    setReportEnabled(false);
+    const btn = byId('rt-print'); if (btn) btn.disabled = true;
   }
-
-  function drawRoute(coords, color) {
+  function drawRoute(coords, color){
     if (!coords?.length) return;
     if (!S.group) S.group = L.layerGroup().addTo(S.map);
-    L.polyline(coords.map(([lng, lat]) => [lat, lng]), {
-      color, weight: 4, opacity: 0.9
-    }).addTo(S.group);
+    L.polyline(coords.map(([lng, lat]) => [lat, lng]), { color, weight: 4, opacity: 0.9 }).addTo(S.group);
   }
 
-  async function generate() {
-    const origin = global.ROUTING_ORIGIN; // {lat, lng} from script.js geocoder
+  async function generate(){
+    const origin = global.ROUTING_ORIGIN; // set by script.js geocoder
     if (!origin) { alert('Pick an origin address first.'); return; }
 
     const targets = (global.getSelectedPDTargets && global.getSelectedPDTargets()) || [];
     if (!targets.length) { alert('Select at least one PD.'); return; }
 
-    setBusy(true);
-    clearAll();
-
+    setBusy(true); clearAll();
     try {
-      const originLonLat = [origin.lng, origin.lat];
+      const originLonLat = sanitizeLonLat([+origin.lng, +origin.lat]);
 
-      for (let idx = 0; idx < targets.length; idx++) {
+      for (let idx = 0; idx < targets.length; idx++){
         const [lon, lat, label] = targets[idx];
-        const destLonLat = [lon, lat];
+        const destLonLat = sanitizeLonLat([+lon, +lat]);
 
-        const json = await getRoute(originLonLat, destLonLat);
-        const feat = json.features?.[0];
+        const json  = await getRoute(originLonLat, destLonLat);
+        const feat  = json.features?.[0];
         const coords = feat?.geometry?.coordinates || [];
-        const steps = feat?.properties?.segments?.[0]?.steps || [];
+        const steps  = feat?.properties?.segments?.[0]?.steps || [];
 
-        // Keep for printing
-        S.results.push({
-          dest: { lon, lat, label },
-          route: { coords, steps }
-        });
-
-        // Draw
+        S.results.push({ dest: { lon, lat, label }, route: { coords, steps }});
         drawRoute(coords, idx === 0 ? COLOR_FIRST : COLOR_OTHERS);
-        await sleep(60); // gentle pacing for UI
+
+        await sleep(PER_REQUEST_DELAY);
       }
 
-      setReportEnabled(true);
+      const printBtn = byId('rt-print'); if (printBtn) printBtn.disabled = false;
     } catch (e) {
       console.error(e);
       alert('Routing error: ' + e.message);
@@ -299,25 +320,18 @@
     }
   }
 
-  function setBusy(b) {
+  function setBusy(b){
     const g = byId('rt-generate');
-    if (g) { g.disabled = b; g.textContent = b ? 'Generating…' : 'Generate Trips'; }
+    if (g){ g.disabled = b; g.textContent = b ? 'Generating…' : 'Generate Trips'; }
   }
 
-  // ===== Print report =======================================================
-  function setReportEnabled(enabled) {
-    const b = byId('rt-print');
-    if (b) b.disabled = !enabled;
-  }
-
-  function km(n) { return (n || 0).toFixed(2); }
-
-  function printReport() {
+  // ===== Print Report =======================================================
+  function printReport(){
     if (!S.results.length) { alert('No trips generated yet.'); return; }
 
-    const cards = S.results.map((r, i) => {
-      const rows = buildMovementsFromDirections(r.route.coords, r.route.steps);
-      const lines = rows.map(m => `<tr><td>${m.dir || ''}</td><td>${m.name}</td><td style="text-align:right">${km(m.km)}</td></tr>`).join('');
+    const rowsHtml = S.results.map((r, i) => {
+      const mov = buildMovementsFromDirections(r.route.coords, r.route.steps);
+      const lines = mov.map(m => `<tr><td>${m.dir || ''}</td><td>${m.name}</td><td style="text-align:right">${(m.km||0).toFixed(2)}</td></tr>`).join('');
       return `
         <div class="card">
           <h2>Destination: ${r.dest.label || (r.dest.lon+','+r.dest.lat)}</h2>
@@ -339,13 +353,12 @@
         .card{page-break-inside:avoid;margin-bottom:22px;}
       </style>
     `;
-
     const w = window.open('', '_blank');
-    w.document.write(`<!doctype html><meta charset="utf-8"><title>Trip Report</title>${css}<h1>Trip Report — Street List</h1>${cards}<script>onload=()=>print();</script>`);
+    w.document.write(`<!doctype html><meta charset="utf-8"><title>Trip Report</title>${css}<h1>Trip Report — Street List</h1>${rowsHtml}<script>onload=()=>print();</script>`);
     w.document.close();
   }
 
-  // ===== Controls (UI) ======================================================
+  // ===== Controls ===========================================================
   const GeneratorControl = L.Control.extend({
     options: { position: 'topleft' },
     onAdd() {
@@ -355,6 +368,7 @@
         <div class="routing-actions" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
           <button id="rt-generate">Generate Trips</button>
           <button id="rt-clear" class="ghost">Clear</button>
+          <button id="rt-print" disabled>Print Report</button>
         </div>
         <details>
           <summary><strong>Keys</strong></summary>
@@ -373,78 +387,51 @@
     }
   });
 
-  const ReportControl = L.Control.extend({
-    options: { position: 'topleft' },
-    onAdd() {
-      const el = L.DomUtil.create('div', 'routing-control report-card');
-      el.innerHTML = `
-        <div class="routing-header"><strong>Report</strong></div>
-        <div class="routing-actions" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
-          <button id="rt-print" disabled>Print Report</button>
-        </div>
-        <small class="routing-hint">Prints the routes already generated — no new API calls.</small>`;
-      L.DomEvent.disableClickPropagation(el);
-      return el;
-    }
-  });
-
-  function wireControls() {
+  function wireControls(){
     const g = byId('rt-generate');
     const c = byId('rt-clear');
+    const p = byId('rt-print');
     const s = byId('rt-save');
     const u = byId('rt-url');
     const inp = byId('rt-keys');
 
     if (g) g.onclick = () => generate();
     if (c) c.onclick = () => clearAll();
+    if (p) p.onclick = () => printReport();
+
     if (s && inp) s.onclick = () => {
       const arr = inp.value.split(',').map(x => x.trim()).filter(Boolean);
-      saveKeys(arr);
-      hydrateKeys();
+      saveKeys(arr); hydrateKeys();
       alert(`Saved ${S.keys.length} key(s).`);
     };
     if (u) u.onclick = () => {
-      const k = getParam('orsKey');
+      const k = qParam('orsKey');
       if (!k) alert('Add ?orsKey=YOUR_KEY to the URL query.');
       else { saveKeys([k]); hydrateKeys(); alert('Using orsKey from URL.'); }
     };
   }
 
-  // ===== Init (robust, one-time) ===========================================
-  function init(map) {
-    if (!map) return;
+  // ===== Init ===============================================================
+  function innerInit(map){
     S.map = map;
     hydrateKeys();
-
     if (!S.group) S.group = L.layerGroup().addTo(map);
-
-    const genCtl = new GeneratorControl();
-    const repCtl = new ReportControl();
-    map.addControl(genCtl);
-    map.addControl(repCtl);
-
-    // Delay wiring a tick to ensure DOM nodes exist
-    setTimeout(() => { wireControls(); }, 0);
+    map.addControl(new GeneratorControl());
+    setTimeout(wireControls, 0);
   }
 
-  // Expose API
   const Routing = {
-    init(map) {
-      // guard: wait until map is loaded so buttons don’t race and disappear
-      if (!map || !map._loaded) {
-        const retry = () => (map && map._loaded) ? init(map) : setTimeout(retry, 80);
+    init(map){
+      if (!map || !map._loaded){
+        const retry = () => (map && map._loaded) ? innerInit(map) : setTimeout(retry, 80);
         return retry();
       }
-      init(map);
-    },
-    clear() { clearAll(); },
-    printReport() { printReport(); },
-    _debugBuild(rowsArgs) { return buildMovementsFromDirections(...rowsArgs); }
+      innerInit(map);
+    }
   };
 
   global.Routing = Routing;
 
-  // Auto-init once DOM is ready and a global map exists (matches your script.js)
   document.addEventListener('DOMContentLoaded', () => {
     const tryInit = () => {
       if (global.map && (global.map._loaded || global.map._size)) Routing.init(global.map);
