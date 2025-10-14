@@ -1,10 +1,4 @@
-/* routing.js — ORS Directions + Snap v2 (ghost-resistant + highway cutoff)
- * - Primary names from ORS steps; Snap v2 only fills blanks and must pass heading test
- * - Collapse tiny detours (rejoin window), allow repeats later
- * - Lock NB/EB/SB/WB from first N meters of street appearance
- * - Stop reporting once a highway/expressway is reached
- * - Print uses cached results only
- */
+/* routing.js — ORS Directions + Snap v2 (ghost-resistant + highway cutoff) */
 (function (global) {
   // -------- Tunables --------
   const SWITCH_CONFIRM_M    = 200;
@@ -13,7 +7,7 @@
   const SAMPLE_EVERY_M      = 50;
   const SNAP_BATCH_SIZE     = 180;
   const BOUND_LOCK_WINDOW_M = 300;
-  const HEADING_TOLERANCE   = 45;   // max deg difference to accept Snap name
+  const HEADING_TOLERANCE   = 45;
   const HIGHWAY_CUTOFF      = /(Highway\s?\d{2,3}|Expressway|Express\b|Collector\b|Gardiner|Don Valley Parkway|DVP\b|QEW\b)/i;
 
   const PROFILE    = 'driving-car';
@@ -47,10 +41,7 @@
     const x=Math.cos(lat1)*Math.sin(lat2)-Math.sin(lat1)*Math.cos(lat2)*Math.cos(lng2-lng1);
     return (Math.atan2(y,x)*180/Math.PI+360)%360;
   }
-  function smallestAngleDiff(a,b){
-    let d = ((a-b+540)%360)-180;
-    return Math.abs(d);
-  }
+  function smallestAngleDiff(a,b){ let d=((a-b+540)%360)-180; return Math.abs(d); }
   function cardinal4(deg){ if (deg>=315||deg<45) return 'NB'; if (deg<135) return 'EB'; if (deg<225) return 'SB'; return 'WB'; }
   function sampleLine(coords, stepM){
     if (!coords || coords.length<2) return coords||[];
@@ -171,10 +162,8 @@
     const sampled = sampleLine(coords, SAMPLE_EVERY_M);
     if (sampled.length < 2) return [];
 
-    // 1) Build a per-sample heading along the route
     const segHeading = i => bearingDeg(sampled[i], sampled[i+1]);
 
-    // 2) ORS step names (primary)
     const steps = seg?.steps || [];
     const stepNameAt = (i) => {
       if (!steps.length) return '';
@@ -184,7 +173,6 @@
       return normalizeName(raw);
     };
 
-    // 3) Snap (fallback), with heading test
     let snapFeats = [];
     try {
       for (let i=0;i<sampled.length;i+=SNAP_BATCH_SIZE){
@@ -197,7 +185,6 @@
     } catch { snapFeats = []; }
     const snapNameAt = (i) => pickFromSnapProps(snapFeats[i]?.properties || {});
 
-    // 4) Choose name per sample: prefer ORS step; else Snap if heading matches
     const names = [];
     for (let i=0;i<sampled.length-1;i++){
       const fromStep = stepNameAt(i);
@@ -205,16 +192,14 @@
       const fromSnap = snapNameAt(i);
       if (fromSnap) {
         const h = segHeading(i);
-        // Simple heading gate to avoid side-street ghosts
-        const ok = smallestAngleDiff(h, h) <= HEADING_TOLERANCE; // (we don't have snap heading; gate is trivial)
-        names[i] = ok ? fromSnap : '';  // keep empty if not ok
+        const ok = smallestAngleDiff(h, h) <= HEADING_TOLERANCE; // placeholder gate
+        names[i] = ok ? fromSnap : '';
       } else {
         names[i] = '';
       }
     }
     names[names.length-1] ||= names[names.length-2] || '';
 
-    // 5) State machine (switch-confirm + rejoin-window + bound lock)
     const rows = [];
     let curName = names[0] || '(unnamed)';
     let curDist = 0;
@@ -222,7 +207,6 @@
     let pendName=null, pendDist=0;
     let holdPrev=null, distOnNew=0;
 
-    // helpers
     const pushRow = (dir,name,meters) => {
       const nm = normalizeName(name);
       if (!nm || nm==='(unnamed)') return;
@@ -233,10 +217,8 @@
       const segDist = haversineMeters(sampled[i], sampled[i+1]);
       if (segDist <= 0) continue;
 
-      // prefer step; if no step, take snap; else carry forward previous
       const observed = names[i] || curName;
 
-      // if we already hit highway, stop collecting more (but finish current)
       if (HIGHWAY_CUTOFF.test(curName)) { curDist += segDist; continue; }
 
       if (holdPrev) {
@@ -273,7 +255,6 @@
       }
     }
 
-    // finalize
     if (holdPrev) {
       if (distOnNew < REJOIN_WINDOW_M) {
         curName = holdPrev.name; curBound = holdPrev.bound; curDist += holdPrev.dist;
@@ -283,7 +264,6 @@
     }
     if (curDist >= MIN_FRAGMENT_M) pushRow(curBound, curName, curDist);
 
-    // Cut off everything AFTER first highway (if any)
     const idx = rows.findIndex(r => HIGHWAY_CUTOFF.test(r.name));
     return idx >= 0 ? rows.slice(0, idx+1) : rows;
   }
@@ -341,15 +321,34 @@
   function init(map){
     S.map=map; S.keys=loadKeys(); setIndex(getIndex());
     S.map.addControl(new TripControl()); S.map.addControl(new ReportControl());
-    S.els={ gen:$('#rt-gen'), clr:$('#rt-clr'), print:$('#rt-print'), keys:$('#rt-keys'), save:$('#rt-save'), url:$('#rt-url') };
+
+    // FIX: bind by raw IDs (no '#')
+    S.els = {
+      gen:document.getElementById('rt-gen'),
+      clr:document.getElementById('rt-clr'),
+      print:document.getElementById('rt-print'),
+      keys:document.getElementById('rt-keys'),
+      save:document.getElementById('rt-save'),
+      url:document.getElementById('rt-url')
+    };
     if (S.els.keys) S.els.keys.value=S.keys.join(',');
-    if (S.els.gen)   S.els.gen.onclick=generateTrips;
-    if (S.els.clr)   S.els.clr.onclick=() => clearAll();
-    if (S.els.print) S.els.print.onclick=() => printReport();
-    if (S.els.save)  S.els.save.onclick=() => { const arr=(S.els.keys.value||'').split(',').map(s=>s.trim()).filter(Boolean); if(!arr.length) return popup('<b>Routing</b><br>Enter a key.'); S.keys=arr; saveKeys(arr); setIndex(0); popup('<b>Routing</b><br>Keys saved.'); };
-    if (S.els.url)   S.els.url.onclick=() => { const arr=parseUrlKeys(); if(!arr.length) return popup('<b>Routing</b><br>No <code>?orsKey=</code> in URL.'); S.keys=arr; setIndex(0); popup('<b>Routing</b><br>Using keys from URL.'); };
+
+    if (S.els.gen)   S.els.gen.onclick   = generateTrips;
+    if (S.els.clr)   S.els.clr.onclick   = () => clearAll();
+    if (S.els.print) S.els.print.onclick = () => printReport();
+    if (S.els.save)  S.els.save.onclick  = () => {
+      const arr=(S.els.keys.value||'').split(',').map(s=>s.trim()).filter(Boolean);
+      if(!arr.length) return popup('<b>Routing</b><br>Enter a key.');
+      S.keys=arr; saveKeys(arr); setIndex(0);
+      popup('<b>Routing</b><br>Keys saved.');
+    };
+    if (S.els.url)   S.els.url.onclick   = () => {
+      const arr=parseUrlKeys();
+      if(!arr.length) return popup('<b>Routing</b><br>No <code>?orsKey=</code> in URL.');
+      S.keys=arr; setIndex(0);
+      popup('<b>Routing</b><br>Using keys from URL.');
+    };
   }
-  function $(id){ return document.getElementById(id); }
 
   async function generateTrips(){
     try{
