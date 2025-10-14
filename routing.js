@@ -1,34 +1,30 @@
-/* routing.js — Directions (1x/PD) + Movements (NB/EB/SB/WB)
- * Names: ORS Snap v2 /road → Overpass fallback (1 call/PD).
- * Report uses cached results only (no extra API calls).
- * Smoothing:
- *  - SWITCH_CONFIRM_M: new street must persist before switching
- *  - REJOIN_WINDOW_M: if we switch then return to previous within this distance, merge back (no duplicate row)
- *  - BOUND_AVG_WINDOW_M: initial bound for a street is the average heading over this window
- *  - Repeats allowed later in route; only near-immediate backtracks are merged
+/* routing.js — ORS Directions + Snap v2 (street movements, no extra calls at print)
+ * Goals:
+ *  - Snap-only naming (no Overpass/centerlines)
+ *  - Collapse near-immediate zig-zags (no duplicate rows for tiny detours)
+ *  - Average initial heading for each street (stable NB/EB/SB/WB on curves)
+ *  - Normalize highway variants (401 Express/Collector -> Highway 401)
+ *  - Repeats ALLOWED when truly later/farther in the trip
  */
 (function (global) {
-  // ===== Config =====
-  const INLINE_DEFAULT_KEY =
-    'eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6Ijk5NWI5MTE5OTM2YTRmYjNhNDRiZTZjNDRjODhhNTRhIiwiaCI6Im11cm11cjY0In0=';
+  // ===== Tunables =====
+  const SWITCH_CONFIRM_M   = 180;  // must stay on a new street at least this to switch
+  const REJOIN_WINDOW_M    = 450;  // if we return to the SAME street within this, merge back (no extra row)
+  const MIN_FRAGMENT_M     = 60;   // drop tiny slivers
+  const SAMPLE_EVERY_M     = 50;   // sampling along polyline
+  const SNAP_BATCH_SIZE    = 200;  // Snap /road batch
+  const BOUND_AVG_WINDOW_M = 200;  // average heading for the first bound of a street
 
-  const PROFILE = 'driving-car';
+  const PROFILE    = 'driving-car';
   const PREFERENCE = 'fastest';
-  const THROTTLE_MS_DIRECTIONS = 1200;
-
-  const SAMPLE_EVERY_M      = 50;   // sampling distance along route
-  const SNAP_BATCH_SIZE     = 200;  // Snap batch size
-  const SWITCH_CONFIRM_M    = 150;  // require new street to persist ≥ this to switch
-  const REJOIN_WINDOW_M     = 200;  // if we return to previous within this, merge (avoid dup)
-  const MIN_FRAGMENT_M      = 60;   // drop tiny fragments
-  const MAX_WAY_SNAP_M      = 45;   // accept Overpass nearest only if within this
-  const BOUND_AVG_WINDOW_M  = 150;  // distance used to average initial bound
+  const ORS_BASE   = 'https://api.openrouteservice.org';
 
   const COLOR_FIRST  = '#0b3aa5';
   const COLOR_OTHERS = '#2166f3';
 
-  const ORS_BASE = 'https://api.openrouteservice.org';
-
+  // Inline fallback + key mgmt (URL ?orsKey=..., localStorage, fallback)
+  const INLINE_DEFAULT_KEY =
+    'eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6Ijk5NWI5MTE5OTM2YTRmYjNhNDRiZTZjNDRjODhhNTRhIiwiaCI6Im11cm11cjY0In0=';
   const LS_KEYS = 'ORS_KEYS';
   const LS_ACTIVE_INDEX = 'ORS_ACTIVE_INDEX';
 
@@ -41,8 +37,72 @@
     results: [],
     els: {}
   };
-
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  // ===== Utils =====
+  const toRad = d => d*Math.PI/180;
+  const toDeg = r => r*180/Math.PI;
+  function haversineMeters(a,b){
+    const R=6371000;
+    const [lng1,lat1]=a, [lng2,lat2]=b;
+    const dLat=toRad(lat2-lat1), dLng=toRad(lng2-lng1);
+    const s=Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLng/2)**2;
+    return 2*R*Math.asin(Math.sqrt(s));
+  }
+  function sampleLine(coords, stepM){
+    if (!coords || coords.length<2) return coords||[];
+    const pts=[coords[0]]; let acc=0;
+    for (let i=1;i<coords.length;i++){
+      const seg=haversineMeters(coords[i-1], coords[i]); acc+=seg;
+      if (acc>=stepM){ pts.push(coords[i]); acc=0; }
+    }
+    if (pts[pts.length-1]!==coords[coords.length-1]) pts.push(coords[coords.length-1]);
+    return pts;
+  }
+  function bearingDeg(a,b){
+    const [lng1,lat1]=[toRad(a[0]),toRad(a[1])], [lng2,lat2]=[toRad(b[0]),toRad(b[1])];
+    const y=Math.sin(lng2-lng1)*Math.cos(lat2);
+    const x=Math.cos(lat1)*Math.sin(lat2)-Math.sin(lat1)*Math.cos(lat2)*Math.cos(lng2-lng1);
+    return (toDeg(Math.atan2(y,x))+360)%360;
+  }
+  function cardinal4(deg){ if (deg>=315||deg<45) return "NB"; if (deg<135) return "EB"; if (deg<225) return "SB"; return "WB"; }
+  function avgHeading(sampled, iStart, windowM) {
+    let vx = 0, vy = 0, acc = 0;
+    for (let i=iStart; i<sampled.length-1 && acc < windowM; i++) {
+      const a = sampled[i], b = sampled[i+1];
+      const d = haversineMeters(a,b); if (d <= 0) continue;
+      const br = bearingDeg(a,b) * Math.PI/180;
+      vx += Math.cos(br) * d;
+      vy += Math.sin(br) * d;
+      acc += d;
+    }
+    if (vx === 0 && vy === 0) return cardinal4(bearingDeg(sampled[iStart], sampled[Math.min(sampled.length-1, iStart+1)]));
+    const deg = (Math.atan2(vy, vx) * 180/Math.PI + 360) % 360;
+    return cardinal4(deg);
+  }
+
+  // Name normalization to collapse obvious variants
+  function normalizeName(raw){
+    if (!raw) return '';
+    let s = String(raw).trim();
+    // Common highway variants → canonical
+    s = s.replace(/\b(?:Hwy|HWY|highway)\s*401(?:\s*(?:collector|express))?\b/ig, 'Highway 401');
+    s = s.replace(/\b(?:Hwy|HWY|highway)\s*404(?:\s*(?:collector|express))?\b/ig, 'Highway 404');
+    s = s.replace(/\b(?:Hwy|HWY|highway)\s*400(?:\s*(?:collector|express))?\b/ig, 'Highway 400');
+    // Abbrev expansions
+    s = s.replace(/\b(st)\b\.?/ig,'Street')
+         .replace(/\b(rd)\b\.?/ig,'Road')
+         .replace(/\b(ave)\b\.?/ig,'Avenue');
+    return s.replace(/\s+/g,' ').trim();
+  }
+  function pickFromSnapProps(props={}){
+    const k = ['name','street','road','way_name','label','ref','display_name','name:en'];
+    for (const key of k){ if (props[key]) return normalizeName(props[key]); }
+    const tags=props.tags||props.properties||{};
+    for (const key of k){ if (tags[key]) return normalizeName(tags[key]); }
+    if (props.ref) return normalizeName(`Highway ${props.ref}`);
+    return '';
+  }
 
   // ===== Keys =====
   const parseUrlKeys = () => {
@@ -84,7 +144,6 @@
     if (!res.ok) throw new Error(`ORS ${res.status}: ${await res.text().catch(() => res.statusText)}`);
     return res.json();
   }
-
   async function getRoute(originLonLat, destLonLat) {
     return orsFetch(`/v2/directions/${PROFILE}/geojson`, {
       method: 'POST',
@@ -98,8 +157,6 @@
       }
     });
   }
-
-  // ===== SNAP v2 =====
   async function snapRoad(points) {
     if (!points?.length) return [];
     const url = `${ORS_BASE}/v2/snap/road`;
@@ -109,150 +166,17 @@
       body: JSON.stringify({ points, locations: points }) // send both to be tenant-proof
     });
     if ([401,403,429].includes(res.status) && rotateKey()) return snapRoad(points);
-    if (!res.ok) return [];
+    if (!res.ok) return []; // treat as "no info" rather than failing
     const json = await res.json();
     return Array.isArray(json?.features) ? json.features : [];
   }
 
-  // ===== Overpass fallback =====
-  async function overpassFetchWays(bbox) {
-    const [s,w,n,e] = bbox;
-    const q = `
-      [out:json][timeout:25];
-      way["highway"](${s},${w},${n},${e});
-      (._;>;);
-      out body geom;`;
-    const res = await fetch('https://overpass-api.de/api/interpreter', {
-      method: 'POST',
-      headers: { 'Content-Type':'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ data: q })
-    });
-    if (!res.ok) throw new Error(`Overpass ${res.status}`);
-    const json = await res.json();
-    const nodes = new Map();
-    for (const el of json.elements || []) if (el.type === 'node') nodes.set(el.id, [el.lon, el.lat]);
-    const ways = [];
-    for (const el of json.elements || []) {
-      if (el.type !== 'way') continue;
-      const coords = el.geometry
-        ? el.geometry.map(p => [p.lon, p.lat])
-        : (el.nodes || []).map(id => nodes.get(id)).filter(Boolean);
-      const tags = el.tags || {};
-      ways.push({
-        coords,
-        name: tags['name:en'] || tags.name || '',
-        ref: tags.ref || ''
-      });
-    }
-    return ways;
-  }
-
-  // ===== Math / geometry =====
-  const toRad = d => d*Math.PI/180;
-  const toDeg = r => r*180/Math.PI;
-  function haversineMeters(a,b){
-    const R=6371000;
-    const [lng1,lat1]=a, [lng2,lat2]=b;
-    const dLat=toRad(lat2-lat1), dLng=toRad(lng2-lng1);
-    const s=Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLng/2)**2;
-    return 2*R*Math.asin(Math.sqrt(s));
-  }
-  function lengthFromCoordsKm(coords){
-    let km=0; for (let i=0;i<coords.length-1;i++) km += haversineMeters(coords[i], coords[i+1])/1000; return km;
-  }
-  function sampleLineWithIndex(coords, stepM){
-    if (!coords || coords.length<2) return { pts: coords||[], idx: coords?.map((_,i)=>i)||[] };
-    const pts=[coords[0]], idx=[0]; let acc=0;
-    for (let i=1;i<coords.length;i++){
-      const seg=haversineMeters(coords[i-1], coords[i]); acc+=seg;
-      if (acc>=stepM){ pts.push(coords[i]); idx.push(i); acc=0; }
-    }
-    if (pts[pts.length-1]!==coords[coords.length-1]) { pts.push(coords[coords.length-1]); idx.push(coords.length-1); }
-    return { pts, idx };
-  }
-  function bearingDeg(a,b){
-    const [lng1,lat1]=[toRad(a[0]),toRad(a[1])], [lng2,lat2]=[toRad(b[0]),toRad(b[1])];
-    const y=Math.sin(lng2-lng1)*Math.cos(lat2);
-    const x=Math.cos(lat1)*Math.sin(lat2)-Math.sin(lat1)*Math.cos(lat2)*Math.cos(lng2-lng1);
-    return (toDeg(Math.atan2(y,x))+360)%360;
-  }
-  function cardinal4(deg){ if (deg>=315||deg<45) return "NB"; if (deg<135) return "EB"; if (deg<225) return "SB"; return "WB"; }
-
-  // Average heading over distance window starting at index i
-  function avgHeading(sampled, iStart, windowM) {
-    let vx = 0, vy = 0, acc = 0;
-    for (let i=iStart; i<sampled.length-1 && acc < windowM; i++) {
-      const a = sampled[i], b = sampled[i+1];
-      const d = haversineMeters(a,b); if (d <= 0) continue;
-      const br = bearingDeg(a,b) * Math.PI/180;
-      vx += Math.cos(br) * d;
-      vy += Math.sin(br) * d;
-      acc += d;
-    }
-    if (vx === 0 && vy === 0) return cardinal4(bearingDeg(sampled[iStart], sampled[Math.min(sampled.length-1, iStart+1)]));
-    const deg = (Math.atan2(vy, vx) * 180/Math.PI + 360) % 360;
-    return cardinal4(deg);
-  }
-
-  // ===== Helpers =====
-  function bboxOfCoords(coords) {
-    let w= Infinity, s= Infinity, e=-Infinity, n=-Infinity;
-    for (const [x,y] of coords){ if (x<w) w=x; if (x>e) e=x; if (y<s) s=y; if (y>n) n=y; }
-    const pad = 0.002; // ~200m
-    return [s-pad, w-pad, n+pad, e+pad];
-  }
-
-  function normalizeName(s){
-    if (!s) return '';
-    return String(s)
-      .replace(/\b(hwy)\b/ig,'Highway')
-      .replace(/\b(hwy)\s*(\d+)\b/ig,'Highway $2')
-      .replace(/\b(st)\b\.?/ig,'Street')
-      .replace(/\b(rd)\b\.?/ig,'Road')
-      .replace(/\b(ave)\b\.?/ig,'Avenue')
-      .replace(/\s+/g,' ').trim();
-  }
-  function pickFromSnapProps(props={}){
-    const k = ['name','street','road','way_name','label','ref','display_name','name:en'];
-    for (const key of k){ if (props[key]) return normalizeName(props[key]); }
-    const tags=props.tags||props.properties||{};
-    for (const key of k){ if (tags[key]) return normalizeName(tags[key]); }
-    if (props.ref) return normalizeName(`Highway ${props.ref}`);
-    return '';
-  }
-
-  function nearestWayNameAndDist(point, ways){
-    let best=null, bestD=Infinity;
-    for (const w of ways){
-      const cs = w.coords;
-      for (let i=0;i<cs.length-1;i++){
-        const d = pointToSegmentMeters(point, cs[i], cs[i+1]);
-        if (d < bestD){ bestD = d; best = w; }
-      }
-    }
-    if (!best) return ['', Infinity];
-    const nm = normalizeName(best.name || (best.ref ? `Highway ${best.ref}` : ''));
-    return [nm, bestD];
-  }
-  function pointToSegmentMeters(p, a, b){
-    const k = Math.cos(toRad((a[1]+b[1])/2)) * 111320;
-    const ky = 110540;
-    const ax = (a[0])*k, ay = (a[1])*ky, bx=(b[0])*k, by=(b[1])*ky, px=(p[0])*k, py=(p[1])*ky;
-    const vx = bx-ax, vy=by-ay, wx=px-ax, wy=py-ay;
-    const c1 = vx*wx + vy*wy;
-    const c2 = vx*vx + vy*vy;
-    let t = c2 ? c1/c2 : 0; t = Math.max(0, Math.min(1,t));
-    const cx = ax + t*vx, cy = ay + t*vy;
-    const dx = px - cx, dy = py - cy;
-    return Math.sqrt(dx*dx + dy*dy);
-  }
-
-  // ===== Movements builder =====
+  // ===== Movements builder (Snap-only naming) =====
   async function buildMovements(coords, segForFallback) {
-    const { pts: sampled } = sampleLineWithIndex(coords, SAMPLE_EVERY_M);
+    const sampled = sampleLine(coords, SAMPLE_EVERY_M);
     if (sampled.length < 2) return [];
 
-    // Snap
+    // 1) Snap names at samples
     let snapFeatures = [];
     try { 
       for (let i=0;i<sampled.length;i+=SNAP_BATCH_SIZE){
@@ -265,120 +189,115 @@
     } catch { snapFeatures = []; }
 
     const snapNames = snapFeatures.map(f => pickFromSnapProps(f?.properties || {}));
-    const namedCount = snapNames.filter(Boolean).length;
-    let overpassWays = null;
-    if (namedCount < (sampled.length-1) * 0.3) {
-      const bbox = bboxOfCoords(coords);
-      try { overpassWays = await overpassFetchWays(bbox); }
-      catch (e) { console.warn('Overpass failed:', e); }
-    }
-
-    const nameAt = (i) => {
-      let nm = snapNames[i] || '';
-      if (!nm && overpassWays) {
-        const [n2, d2] = nearestWayNameAndDist(sampled[i], overpassWays);
-        if (d2 <= MAX_WAY_SNAP_M) nm = n2;
-      }
-      if (!nm && segForFallback?.steps?.length) {
-        const steps = segForFallback.steps;
-        const idx = Math.floor((i / (sampled.length-1)) * steps.length);
-        const st = steps[Math.max(0, Math.min(steps.length-1, idx))];
-        nm = normalizeName(st?.name || st?.instruction?.replace(/<[^>]*>/g,'') || '');
-      }
-      return nm || '(unnamed)';
+    // last-resort fallback to ORS steps (only for unnamed points)
+    const steps = segForFallback?.steps || [];
+    const fallbackName = (i) => {
+      if (!steps.length) return '';
+      const idx = Math.floor((i / (sampled.length-1)) * steps.length);
+      const st = steps[Math.max(0, Math.min(steps.length-1, idx))];
+      const raw = (st?.name || String(st?.instruction||'').replace(/<[^>]*>/g,'')).trim();
+      return normalizeName(raw);
     };
 
+    const nameAt = (i) => {
+      return normalizeName(snapNames[i]) || fallbackName(i) || '(unnamed)';
+    };
+
+    // 2) Build rows with switch-confirm & rejoin-window logic
     const rows = [];
 
-    // Current "appearance"
+    // current appearance
     let curName = nameAt(0);
     let curBound = avgHeading(sampled, 0, BOUND_AVG_WINDOW_M);
     let curDist  = 0;
 
-    // Pending switch candidate
+    // pending switch candidate
     let pendName = null;
     let pendDist = 0;
-    let pendBoundAvgStartIdx = 0; // index where pending started
-    let switchingHold = null; // hold previous segment until rejoin window passes
+    let pendFirstBound = null;
 
-    // Distance already traversed on the *new* street since switch confirm
-    let distOnNewSinceConfirm = 0;
+    // hold previous while we see if we rejoin it quickly
+    let holdPrev = null;            // {name,bound,dist}
+    let distOnNewSinceConfirm = 0;  // distance traveled on new street since confirm
 
     for (let i=0;i<sampled.length-1;i++){
       const segDist = haversineMeters(sampled[i], sampled[i+1]);
       if (segDist <= 0) continue;
 
-      const obsName = nameAt(i);
+      const observedName = nameAt(i);
+      const observedBound = cardinal4(bearingDeg(sampled[i], sampled[i+1])); // used only if we confirm a new street
 
-      // If a prior switch was confirmed but not yet finalized (rejoin window), check for rejoin
-      if (switchingHold) {
+      // If we confirmed a switch previously, see if we rejoin the old street within REJOIN_WINDOW_M
+      if (holdPrev) {
         distOnNewSinceConfirm += segDist;
-        if (obsName === switchingHold.name && distOnNewSinceConfirm < REJOIN_WINDOW_M) {
-          // Rejoin previous before window: cancel switch, continue previous segment
-          curName = switchingHold.name;
-          curBound = switchingHold.bound;
-          curDist  = switchingHold.dist + segDist;
-          switchingHold = null;
-          pendName = null; pendDist = 0;
+        if (observedName === holdPrev.name && distOnNewSinceConfirm < REJOIN_WINDOW_M) {
+          // Merge back: cancel switch; continue previous segment as if detour never happened
+          curName = holdPrev.name;
+          curBound = holdPrev.bound;      // keep original bound
+          curDist  = holdPrev.dist + segDist;
+          holdPrev = null;
+          pendName = null; pendDist = 0; pendFirstBound = null;
           continue;
         }
         if (distOnNewSinceConfirm >= REJOIN_WINDOW_M) {
-          // Finalize the previous row
-          if (switchingHold.dist >= MIN_FRAGMENT_M)
-            rows.push({ dir: switchingHold.bound, name: switchingHold.name, km: +(switchingHold.dist/1000).toFixed(2) });
-          switchingHold = null; // firm on new street now
+          // Rejoin window passed: finalize the previous row now
+          if (holdPrev.dist >= MIN_FRAGMENT_M)
+            rows.push({ dir: holdPrev.bound, name: holdPrev.name, km: +(holdPrev.dist/1000).toFixed(2) });
+          holdPrev = null; // now we are firmly on the new street
         }
       }
 
-      if (obsName === curName) {
+      // still on the same named street
+      if (observedName === curName) {
         curDist += segDist;
-        pendName = null; pendDist = 0;
+        pendName = null; pendDist = 0; pendFirstBound = null;
         continue;
       }
 
-      // Observe a candidate new street
-      if (pendName === obsName) {
+      // considering a new street
+      if (pendName === observedName) {
         pendDist += segDist;
         if (pendDist >= SWITCH_CONFIRM_M) {
-          // Confirm the switch: compute the bound for the new street by averaging ahead
-          const newBound = avgHeading(sampled, Math.max(0, i - Math.ceil(pendDist / SAMPLE_EVERY_M)), BOUND_AVG_WINDOW_M);
-          // Put current segment on hold (we might rejoin quickly)
-          switchingHold = { name: curName, bound: curBound, dist: curDist };
+          // confirm switch: average an initial bound for the new street
+          const backSamples = Math.max(0, Math.ceil(pendDist / SAMPLE_EVERY_M));
+          const startIdx = Math.max(0, i - backSamples);
+          const newBound = avgHeading(sampled, startIdx, BOUND_AVG_WINDOW_M);
+          // put current segment on hold until we know we won't rejoin quickly
+          holdPrev = { name: curName, bound: curBound, dist: curDist };
           distOnNewSinceConfirm = 0;
-          // Start new current
+          // start the new current
           curName = pendName;
           curBound = newBound;
           curDist  = pendDist;
-          pendName = null; pendDist = 0;
+          pendName = null; pendDist = 0; pendFirstBound = null;
         }
       } else {
-        // New candidate replaces old
-        pendName = obsName;
+        // new candidate replaces old candidate
+        pendName = observedName;
         pendDist = segDist;
-        pendBoundAvgStartIdx = i; // used by avgHeading upon confirm
+        pendFirstBound = observedBound;
       }
     }
 
-    // Finalize any pending switch (beyond rejoin window not reached)
-    if (switchingHold) {
-      // If we ended before REJOIN_WINDOW_M, merge back
+    // finalize after loop
+    if (holdPrev) {
       if (distOnNewSinceConfirm < REJOIN_WINDOW_M) {
-        curName = switchingHold.name;
-        curBound = switchingHold.bound;
-        curDist += switchingHold.dist;
+        // ended inside window: merge back to previous
+        curName = holdPrev.name;
+        curBound = holdPrev.bound;
+        curDist += holdPrev.dist;
       } else {
-        if (switchingHold.dist >= MIN_FRAGMENT_M)
-          rows.push({ dir: switchingHold.bound, name: switchingHold.name, km: +(switchingHold.dist/1000).toFixed(2) });
+        if (holdPrev.dist >= MIN_FRAGMENT_M)
+          rows.push({ dir: holdPrev.bound, name: holdPrev.name, km: +(holdPrev.dist/1000).toFixed(2) });
       }
     }
-
     if (curDist >= MIN_FRAGMENT_M)
       rows.push({ dir: curBound, name: curName, km: +(curDist/1000).toFixed(2) });
 
     return rows;
   }
 
-  // ===== Drawing =====
+  // ===== Drawing & Controls =====
   function drawRoute(geojson, color) {
     ensureGroup();
     const line = L.geoJSON(geojson, { style: { color, weight: 5, opacity: 0.9 } });
@@ -392,7 +311,6 @@
     return m;
   }
 
-  // ===== Controls =====
   const TripControl = L.Control.extend({
     options: { position: 'topleft' },
     onAdd() {
@@ -443,7 +361,7 @@
     if (b) b.disabled = !enabled;
   }
 
-  // ===== Init =====
+  // ===== Init / Generate / Print =====
   function init(map) {
     S.map = map;
     S.keys = loadKeys();
@@ -462,35 +380,34 @@
     };
     if (S.els.keys) S.els.keys.value = S.keys.join(',');
 
-    if (S.els.gen)   S.els.gen.onclick   = generateTrips;
-    if (S.els.clr)   S.els.clr.onclick   = () => clearAll();
-    if (S.els.print) S.els.print.onclick = () => printReport();
-    if (S.els.save)  S.els.save.onclick  = () => {
+    S.els.gen && (S.els.gen.onclick   = generateTrips);
+    S.els.clr && (S.els.clr.onclick   = () => clearAll());
+    S.els.print && (S.els.print.onclick = () => printReport());
+    S.els.save && (S.els.save.onclick  = () => {
       const arr = (S.els.keys.value || '').split(',').map(s => s.trim()).filter(Boolean);
       if (!arr.length) return popup('<b>Routing</b><br>Enter a key.');
       S.keys = arr; saveKeys(arr); setIndex(0);
       popup('<b>Routing</b><br>Keys saved.');
-    };
-    if (S.els.url)   S.els.url.onclick   = () => {
+    });
+    S.els.url && (S.els.url.onclick   = () => {
       const arr = parseUrlKeys();
       if (!arr.length) return popup('<b>Routing</b><br>No <code>?orsKey=</code> in URL.');
       S.keys = arr; setIndex(0);
       popup('<b>Routing</b><br>Using keys from URL.');
-    };
+    });
   }
 
-  // ===== Generate Trips =====
   async function generateTrips() {
     try {
       const origin = global.ROUTING_ORIGIN;
       if (!origin) return popup('<b>Routing</b><br>Search an address in the top bar and select a result first.');
 
+      if (!global.getSelectedPDTargets) return popup('<b>Routing</b><br>Zone/PD selection isn\'t ready.');
+      const targets = global.getSelectedPDTargets() || [];
+      if (!targets.length) return popup('<b>Routing</b><br>No PDs selected.');
+
       clearAll();
       addMarker(origin.lat, origin.lon, `<b>Origin</b><br>${origin.label}`, 6);
-
-      let targets = [];
-      if (typeof global.getSelectedPDTargets === 'function') targets = global.getSelectedPDTargets();
-      if (!targets.length) return popup('<b>Routing</b><br>No PDs selected.');
 
       try {
         const f = targets[0];
@@ -509,19 +426,19 @@
           seg  = feat?.properties?.segments?.[0];
 
           const coords = feat?.geometry?.coordinates || [];
-          const totalKm = (seg && seg.distance > 0) ? (seg.distance / 1000) : lengthFromCoordsKm(coords);
-          km  = totalKm.toFixed(1);
+          const distKm = seg?.distance ? seg.distance/1000 : coords.reduce((a,_,j,arr)=> j? a + haversineMeters(arr[j-1], arr[j])/1000 : 0, 0);
+          km  = distKm.toFixed(1);
           min = seg ? Math.round((seg.duration || 0) / 60) : '—';
 
           const assignments = await buildMovements(coords, seg);
 
-          const steps = (seg?.steps || []).map(s => {
+          const stepsTxt = (seg?.steps || []).map(s => {
             const txt = String(s.instruction || '').replace(/<[^>]+>/g, '');
-            const dist = ((s.distance || 0) / 1000).toFixed(2);
-            return `${txt} — ${dist} km`;
+            const d = ((s.distance || 0)/1000).toFixed(2);
+            return `${txt} — ${d} km`;
           });
 
-          S.results.push({ label, lat: dlat, lon: dlon, km, min, steps, assignments, gj });
+          S.results.push({ label, lat: dlat, lon: dlon, km, min, steps: stepsTxt, assignments, gj });
 
           const preview = assignments.slice(0,6).map(a=>`<li>${a.dir} ${a.name} — ${a.km.toFixed(2)} km</li>`).join('');
           const html = `
@@ -539,7 +456,7 @@
           popup(`<b>Routing</b><br>Route failed for ${label}<br><small>${e.message}</small>`);
         }
 
-        if (i < targets.length - 1) await sleep(THROTTLE_MS_DIRECTIONS);
+        if (i < targets.length - 1) await sleep(1200); // stay under 40/min
       }
 
       setReportEnabled(S.results.length > 0);
@@ -550,7 +467,6 @@
     }
   }
 
-  // ===== Print Report =====
   function printReport() {
     if (!S.results.length) return popup('<b>Routing</b><br>Generate trips first.');
     const w = window.open('', '_blank');
@@ -585,7 +501,7 @@
     w.document.close();
   }
 
-  // ===== Public API =====
+  // Public API
   const Routing = {
     init(map) { init(map); },
     clear() { clearAll(); },
@@ -593,5 +509,20 @@
   };
   global.Routing = Routing;
 
+  // Boot if map is ready
   document.addEventListener('DOMContentLoaded', () => { if (global.map) Routing.init(global.map); });
-})(window);
+
+  // Storage helpers
+  function saveKeys(arr) { localStorage.setItem(LS_KEYS, JSON.stringify(arr)); }
+  function setIndex(i) { S.keyIndex = Math.max(0, Math.min(i, S.keys.length - 1)); localStorage.setItem(LS_ACTIVE_INDEX, String(S.keyIndex)); }
+  function getIndex() { return Number(localStorage.getItem(LS_ACTIVE_INDEX) || 0); }
+  function loadKeysFromLS() {
+    try { const ls = JSON.parse(localStorage.getItem(LS_KEYS) || '[]'); if (Array.isArray(ls) && ls.length) return ls; } catch {}
+    return [];
+  }
+  function loadKeys() {
+    const u = parseUrlKeys(); if (u.length) return u;
+    const l = loadKeysFromLS(); if (l.length) return l;
+    return [INLINE_DEFAULT_KEY];
+  }
+})();
