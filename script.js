@@ -415,7 +415,6 @@
 
 const map = L.map('map').setView([43.6532, -79.3832], 11);
 window.map = map; // expose for routing.js
-Routing.init(map);
 
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
   maxZoom: 19,
