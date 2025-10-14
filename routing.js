@@ -1,8 +1,8 @@
 /* routing.js — ORS Directions + Snap v2
    - Street list (not maneuvers)
-   - No-ghost naming (prefer ORS steps, Snap fallback)
-   - Highway/expressway cutoff (properties- and name-based)
-   - Stable bounds per row (first ≤300 m of the row)
+   - Prefer ORS step names; Snap is fallback
+   - Highway/expressway cutoff (uses Snap props + name/ref)
+   - ✅ Correct NB/EB/SB/WB bounds: vector average from NORTH baseline
    - One Directions call per PD; Snap batched
    - Print Report uses cached results only
 */
@@ -14,7 +14,6 @@
   const SAMPLE_EVERY_M      = 50;   // route sampling spacing
   const SNAP_BATCH_SIZE     = 180;  // snap batch size
   const BOUND_LOCK_WINDOW_M = 300;  // meters used to compute row bound
-  const HEADING_TOLERANCE   = 45;   // (kept; placeholder in case we add snap heading later)
 
   const PROFILE    = 'driving-car';
   const PREFERENCE = 'fastest';
@@ -42,6 +41,7 @@
     return 2*R*Math.asin(Math.sqrt(s));
   }
   function bearingDeg(a,b){
+    // Initial bearing FROM a TO b, measured from NORTH, clockwise
     const [lng1,lat1]=[toRad(a[0]),toRad(a[1])], [lng2,lat2]=[toRad(b[0]),toRad(b[1])];
     const y=Math.sin(lng2-lng1)*Math.cos(lat2);
     const x=Math.cos(lat1)*Math.sin(lat2)-Math.sin(lat1)*Math.cos(lat2)*Math.cos(lng2-lng1);
@@ -60,20 +60,24 @@
     return pts;
   }
 
-  // Weighted-average heading between indices, capped by capM meters
+  // ✅ Correct vector averaging for bearings measured FROM NORTH (clockwise).
+  //   For each segment with bearing θ (from NORTH): east = sinθ, north = cosθ.
+  //   Resultant bearing = atan2(sum_east, sum_north), still from NORTH.
   function avgHeadingBetween(sampled, iStart, iEnd, capM=BOUND_LOCK_WINDOW_M){
-    let vx=0, vy=0, acc=0;
+    let sumEast=0, sumNorth=0, acc=0;
     for (let i=iStart; i<iEnd && i<sampled.length-1 && acc<capM; i++){
       const a=sampled[i], b=sampled[i+1];
       const d=haversineMeters(a,b); if (d<=0) continue;
-      const br=bearingDeg(a,b)*Math.PI/180;
-      vx += Math.cos(br)*d; vy += Math.sin(br)*d; acc += d;
+      const br=bearingDeg(a,b)*Math.PI/180; // radians, from NORTH
+      sumEast  += Math.sin(br)*d;  // x
+      sumNorth += Math.cos(br)*d;  // y
+      acc += d;
     }
-    if (!vx && !vy) {
+    if (!sumEast && !sumNorth) {
       const j=Math.min(sampled.length-1, iStart+1);
       return cardinal4(bearingDeg(sampled[iStart], sampled[j]));
     }
-    const deg=(Math.atan2(vy,vx)*180/Math.PI+360)%360;
+    const deg=(Math.atan2(sumEast, sumNorth)*180/Math.PI+360)%360; // from NORTH
     return cardinal4(deg);
   }
 
@@ -100,8 +104,6 @@
     if (tags.ref) return normalizeName(`Highway ${tags.ref}`);
     return '';
   }
-
-  // Highway detection (name + properties)
   function isHighwayName(s=''){
     return /\b(Highway\s?\d{2,3}|Expressway|Express\b|Collector\b|Gardiner|Don Valley Parkway|DVP|QEW)\b/i.test(s);
   }
@@ -190,9 +192,6 @@
     const sampled = sampleLine(coords, SAMPLE_EVERY_M);
     if (sampled.length < 2) return [];
 
-    const segHeading = i => bearingDeg(sampled[i], sampled[i+1]);
-
-    // ORS steps (primary naming)
     const steps = seg?.steps || [];
     const stepNameAt = (i) => {
       if (!steps.length) return '';
@@ -216,7 +215,10 @@
 
     const snapNameAt = (i) => pickFromSnapProps(snapFeats[i]?.properties || {});
     const snapIsHwy  = (i) => isHighwayByProps(snapFeats[i]?.properties || {});
-    const snapRefAt  = (i) => snapRef(snapFeats[i]?.properties || {});
+    const snapRefAt  = (i) => {
+      const p = snapFeats[i]?.properties || {};
+      return p.ref || p?.tags?.ref || p?.properties?.ref || '';
+    };
 
     // per-sample chosen name + highway flag
     const names = [];
@@ -264,7 +266,6 @@
       if (holdPrev) {
         distOnNew += d;
         if (observed === holdPrev.name && distOnNew < REJOIN_WINDOW_M) {
-          // snap back quickly → merge with previous
           curName = holdPrev.name;
           startIdx = holdPrev.i0;
           holdPrev = null; pendName = null; pendDist = 0;
@@ -283,12 +284,11 @@
         if (pendDist >= SWITCH_CONFIRM_M) {
           // close current
           rowsIdx.push({ name: curName, i0: startIdx, i1: i });
-          // set holdPrev in case we rejoin soon
+          // holdPrev for quick rejoin
           holdPrev = { name: curName, i0: startIdx };
           distOnNew = 0;
           // open new row
           curName = pendName;
-          // estimate start index for the new row slightly back in time
           startIdx = Math.max(0, i - Math.ceil(pendDist / SAMPLE_EVERY_M));
           pendName = null; pendDist = 0;
         }
@@ -313,6 +313,7 @@
       for (let i=r.i0; i<r.i1; i++) meters += distBetween(i);
       if (meters < MIN_FRAGMENT_M) continue;
 
+      // ✅ Bound from the first ≤300 m of THIS row (correct averaging)
       const dir = avgHeadingBetween(sampled, r.i0, r.i1, BOUND_LOCK_WINDOW_M);
       const nm  = normalizeName(r.name);
       if (!nm || nm==='(unnamed)') continue;
