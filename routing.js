@@ -1,17 +1,15 @@
-/* routing.js — Directions-only (no Snap v2), highway ref parser
-   - Street list from ORS steps only
-   - Parses highway names from instructions when step.name is "-" or blank
-   - Stable NB/EB/SB/WB per contiguous street segment
-   - Highway cutoff on first highway segment (Highway 401 / QEW / DVP / Gardiner …)
-   - One Directions request per PD; Print uses cached results
+/* routing.js — Directions-only with ORS extra_info highway detection
+   - One ORS Directions call per PD (no Snap)
+   - Uses extra_info (roadclass/waycategory) to find the FIRST highway span
+   - Forces a highway row even if step.name is "-" and then stops
+   - Names highways from nearby instruction text (DVP/QEW/Gardiner/ON-401/…)
+   - Bound labels (NB/EB/SB/WB) from first ≤300 m of each row’s geometry
 */
 (function (global) {
   // ===== Tunables ===========================================================
-  const SWITCH_CONFIRM_M    = 200;
-  const REJOIN_WINDOW_M     = 600;
-  const MIN_FRAGMENT_M      = 60;
-  const BOUND_LOCK_WINDOW_M = 300;
-  const SAMPLE_EVERY_M      = 50;
+  const MIN_FRAGMENT_M      = 60;   // drop tiny non-highway rows
+  const BOUND_LOCK_WINDOW_M = 300;  // meters used to compute a row's bound
+  const SAMPLE_EVERY_M      = 50;   // sampling spacing for heading calc
 
   const PROFILE    = 'driving-car';
   const PREFERENCE = 'fastest';
@@ -20,6 +18,7 @@
   const COLOR_FIRST  = '#0b3aa5';
   const COLOR_OTHERS = '#2166f3';
 
+  // Inline fallback key + localStorage slots
   const INLINE_DEFAULT_KEY =
     'eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6Ijk5NWI5MTE5OTM2YTRmYjNhNDRiZTZjNDRjODhhNTRhIiwiaCI6Im11cm11cjY0In0=';
   const LS_KEYS = 'ORS_KEYS';
@@ -38,6 +37,7 @@
     return 2*R*Math.asin(Math.sqrt(s));
   }
   function bearingDeg(a,b){
+    // Initial bearing FROM a TO b, measured from NORTH, clockwise
     const [lng1,lat1]=[toRad(a[0]),toRad(a[1])], [lng2,lat2]=[toRad(b[0]),toRad(b[1])];
     const y=Math.sin(lng2-lng1)*Math.cos(lat2);
     const x=Math.cos(lat1)*Math.sin(lat2)-Math.sin(lat1)*Math.cos(lat2)*Math.cos(lng2-lng1);
@@ -56,16 +56,16 @@
     return pts;
   }
 
-  // Correct averaging for bearings from NORTH (clockwise)
   function avgHeadingBetween(sampled, iStart, iEnd, capM=BOUND_LOCK_WINDOW_M){
+    // Correct vector average for bearings from NORTH
     let sumEast=0, sumNorth=0, acc=0;
     for (let i=iStart; i<iEnd && i<sampled.length-1 && acc<capM; i++){
       const a=sampled[i], b=sampled[i+1];
       const d=haversineMeters(a,b); if (d<=0) continue;
       const br=bearingDeg(a,b)*Math.PI/180;
-      sumEast  += Math.sin(br)*d;  // x
-      sumNorth += Math.cos(br)*d;  // y
-      acc += d;
+      sumEast  += Math.sin(br)*d;   // x
+      sumNorth += Math.cos(br)*d;   // y
+      acc      += d;
     }
     if (!sumEast && !sumNorth) {
       const j=Math.min(sampled.length-1, iStart+1);
@@ -75,15 +75,21 @@
     return cardinal4(deg);
   }
 
-  // ===== Naming / normalization ============================================
-  function cleanHtml(s){ return String(s||'').replace(/<[^>]*>/g,'').trim(); }
+  // ===== Name helpers =======================================================
+  const cleanHtml = (s) => String(s||'').replace(/<[^>]*>/g,' ').replace(/\s+/g,' ').trim();
 
   function normalizeName(raw){
     if (!raw) return '';
     let s=String(raw).trim();
     if (!s || /^unnamed\b/i.test(s) || /^[-–]+$/.test(s)) return '';
 
-    // Convert ON-401 / Hwy 401 / 401 Express → Highway 401
+    // Expand abbreviations first (Pkwy/Expwy/etc.)
+    s = s.replace(/\bPkwy\.?\b/ig,'Parkway')
+         .replace(/\bPkway\b/ig,'Parkway')
+         .replace(/\bExpwy\b/ig,'Expressway')
+         .replace(/\bExpy\b/ig,'Expressway');
+
+    // Convert highway variants → "Highway NNN"
     const canon = n => `Highway ${n}`;
     s = s.replace(/\b(?:ON|Ontario)?[-– ]?(?:Hwy|HWY|Highway|RTE|Route)?\s*401\b.*?/ig, canon(401));
     s = s.replace(/\b(?:ON|Ontario)?[-– ]?(?:Hwy|HWY|Highway|RTE|Route)?\s*400\b.*?/ig, canon(400));
@@ -91,60 +97,44 @@
     s = s.replace(/\b(?:ON|Ontario)?[-– ]?(?:Hwy|HWY|Highway|RTE|Route)?\s*427\b.*?/ig, canon(427));
     s = s.replace(/\b(?:ON|Ontario)?[-– ]?(?:Hwy|HWY|Highway|RTE|Route)?\s*409\b.*?/ig, canon(409));
 
-    // Expand common suffixes
+    // Expand common street suffixes
     s = s.replace(/\b(st)\b\.?/ig,'Street')
          .replace(/\b(rd)\b\.?/ig,'Road')
          .replace(/\b(ave)\b\.?/ig,'Avenue')
          .replace(/\b(ct)\b\.?/ig,'Court')
          .replace(/\b(blvd)\b\.?/ig,'Boulevard');
 
-    // Remove ramp suffixes
+    // Trim ramp wording
     s = s.replace(/\b(?:Onramp|Offramp|Ramp)\b.*$/i,'');
 
     return s.replace(/\s+/g,' ').trim();
   }
 
-  // Pull a highway name from instruction text when step.name is "-" or blank
-  function nameFromInstruction(instrHtml){
+  function nameHighwayFromInstruction(instrHtml){
     const t = cleanHtml(instrHtml);
+    // Named expressways
+    if (/\bGardiner\b/i.test(t)) return 'Gardiner Expressway';
+    if (/\b(?:Don Valley (?:Parkway|Pkwy)|\bDVP\b)/i.test(t)) return 'Don Valley Parkway';
+    if (/\bQEW\b/i.test(t)) return 'QEW';
+    // Highway number variants
+    const num = t.match(/\b(?:ON|Ontario)?[-– ]?(?:Hwy|HWY|Highway|RTE|Route)?\s*(\d{2,3})(?:\s*(?:Express|Collector))?\b/);
+    if (num && num[1]) return `Highway ${num[1]}`;
+    const toward = t.match(/\b(?:to|onto|toward|towards)\s*(\d{2,3})\b/);
+    if (toward && toward[1]) return `Highway ${toward[1]}`;
+    return 'Expressway';
+  }
 
-    // Direct named expressways first
-    const named = t.match(/\b(Gardiner(?:\s+Expressway)?|Don Valley Parkway|DVP|QEW)\b/i);
-    if (named){
-      const n = named[1].toLowerCase();
-      if (/gardiner/.test(n)) return 'Gardiner Expressway';
-      if (/don valley parkway|dvp/.test(n)) return 'Don Valley Parkway';
-      if (/qew/.test(n)) return 'QEW';
-    }
-
-    // Patterns like "onto ON-401 E", "merge onto Hwy 401", "ramp to 404 S/Express/Collector"
-    const num = t.match(/\b(?:ON|Ontario)?[-– ]?(?:Hwy|HWY|Highway|RTE|Route)?\s*(\d{2,3})(?:\s*(?:Express|Collector))?\b/ig);
-    if (num){
-      // pick first number, prefer 3-digit (401/404/427/409/407)
-      const first = (num.map(x=> (x.match(/(\d{2,3})/)||[])[1]).filter(Boolean)
-                    .sort((a,b)=> String(b).length - String(a).length))[0];
-      if (first) return `Highway ${first}`;
-    }
-
-    // Sometimes instructions say “toward 401 E / to 401”
-    const toward = t.match(/\b(?:to|onto|toward|towards)\s*(\d{2,3})\b/ig);
-    if (toward){
-      const first = (toward.map(x=> (x.match(/(\d{2,3})/)||[])[1]).filter(Boolean))[0];
-      if (first) return `Highway ${first}`;
-    }
-
-    // Fallback: try generic “onto <Name>” for streets
+  function streetFromInstruction(instrHtml){
+    const t = cleanHtml(instrHtml);
     const m = t.match(/\b(?:onto|to|toward|towards)\s+([A-Za-z0-9 .'\-\/&]+)$/i);
-    if (m) return normalizeName(m[1]);
-
-    return '';
+    return m ? normalizeName(m[1]) : '';
   }
 
   function isHighwayName(s=''){
-    return /\b(Highway\s?\d{2,3}|Gardiner(?:\s+Expressway)?|Don Valley Parkway|DVP|QEW|Expressway|Express\b|Collector\b)\b/i.test(s);
+    return /\b(Highway\s?\d{2,3}|Gardiner(?:\s+Expressway)?|Don Valley Parkway|QEW|Expressway)\b/i.test(s);
   }
 
-  // ===== Key management =====================================================
+  // ===== ORS helpers ========================================================
   const parseUrlKeys = () => {
     const raw=new URLSearchParams(location.search).get('orsKey');
     return raw ? raw.split(',').map(s=>s.trim()).filter(Boolean) : [];
@@ -160,16 +150,6 @@
   const currentKey = () => S.keys[S.keyIndex];
   const rotateKey  = () => (S.keys.length>1 ? (setIndex((S.keyIndex+1)%S.keys.length), true) : false);
 
-  // ===== Map helpers ========================================================
-  const ensureGroup = () => { if (!S.group) S.group = L.layerGroup().addTo(S.map); };
-  const clearAll = () => { if (S.group) S.group.clearLayers(); S.results=[]; setReportEnabled(false); };
-  const popup = (html, at) => {
-    const ll = at || (S.map ? S.map.getCenter() : null);
-    if (ll) L.popup().setLatLng(ll).setContent(html).openOn(S.map);
-    else alert(html.replace(/<[^>]+>/g,''));
-  };
-
-  // ===== ORS fetchers =======================================================
   async function orsFetch(path, { method='GET', body, query } = {}) {
     const url = new URL(ORS_BASE + path);
     if (query) Object.entries(query).forEach(([k,v]) => url.searchParams.set(k,v));
@@ -182,6 +162,8 @@
     if (!res.ok) throw new Error(`ORS ${res.status}: ${await res.text().catch(()=>res.statusText)}`);
     return res.json();
   }
+
+  // Include extra_info to annotate geometry by road class/categories
   async function getRoute(originLonLat, destLonLat){
     return orsFetch(`/v2/directions/${PROFILE}/geojson`, {
       method:'POST',
@@ -191,12 +173,34 @@
         instructions:true,
         instructions_format:'html',
         language:'en',
-        units:'km'
+        units:'km',
+        extra_info:['roadclass','waycategory']  // << key part
       }
     });
   }
 
-  // ===== Directions-only movement builder ==================================
+  // ===== Extra_info: locate the first highway span =========================
+  // ORS roadclass codes (typical): 0=motorway, 1=trunk, 2=primary, ...
+  function firstHighwayInterval(feature){
+    const extras = feature?.properties?.extras || {};
+    const rcVals = extras?.roadclass?.values || []; // [[fromIdx, toIdx, classCode], ...]
+    let best = null;
+    for (const [from, to, code] of rcVals){
+      if (code === 0 || code === 1){ // motorway or trunk
+        if (!best || from < best.from) best = { from, to, code };
+      }
+    }
+    return best; // {from, to, code} or null
+  }
+
+  function distanceOnRangeCoords(coords, i0, i1){
+    let m=0;
+    const s = Math.max(0, i0), e = Math.min(i1, coords.length-1);
+    for (let i=Math.max(1,s); i<=e; i++) m += haversineMeters(coords[i-1], coords[i]);
+    return m;
+  }
+
+  // ===== Movement builder ===================================================
   function sliceCoords(fullCoords, i0, i1){
     const s = Math.max(0, Math.min(i0, fullCoords.length-1));
     const e = Math.max(0, Math.min(i1, fullCoords.length-1));
@@ -204,30 +208,19 @@
     return fullCoords.slice(s, e+1);
   }
 
-  function stepName(step){
-    // 1) step.name (treat "-" or "Unnamed" as empty)
-    const primary = normalizeName(step?.name || '');
-    if (primary) return primary;
-
-    // 2) try to parse a highway/street from instruction
-    const parsed = nameFromInstruction(step?.instruction || '');
-    if (parsed) return normalizeName(parsed);
-
-    return '';
-  }
-
-  function buildMovementsFromDirections(coords, steps){
+  function buildMovementsFromDirections(coords, steps, feature){
     if (!coords?.length || !steps?.length) return [];
 
     const rows = [];
-    const pushRow = (name, i0, i1) => {
+    function pushRow(name, i0, i1, {force=false} = {}){
       const nm = normalizeName(name);
       if (!nm) return;
       const seg = sliceCoords(coords, i0, i1);
       if (seg.length < 2) return;
 
-      let meters = 0; for (let i=1;i<seg.length;i++) meters += haversineMeters(seg[i-1], seg[i]);
-      if (meters < MIN_FRAGMENT_M) return;
+      const meters = distanceOnRangeCoords(seg, 0, seg.length-1);
+      const isHwy = isHighwayName(nm);
+      if (!isHwy && !force && meters < MIN_FRAGMENT_M) return;
 
       const sampled = sampleLine(seg, SAMPLE_EVERY_M);
       const dir = avgHeadingBetween(sampled, 0, sampled.length-1, BOUND_LOCK_WINDOW_M);
@@ -238,25 +231,49 @@
       } else {
         rows.push({ dir, name: nm, km: +(meters/1000).toFixed(2) });
       }
-    };
+    }
 
+    // 1) Find first highway span by geometry index
+    const hwy = firstHighwayInterval(feature); // {from, to, code} or null
+
+    // 2) Walk steps until we reach/overlap the highway; emit highway row and stop.
     for (let si=0; si<steps.length; si++){
       const st = steps[si];
       const [i0, i1] = st?.way_points || [0,0];
-      let nm = stepName(st);
 
-      if (!nm) continue;
+      // Highway entry reached?
+      if (hwy && i1 >= hwy.from){
+        // Merge a bit forward so the row isn't just a short ramp
+        let endIdx = Math.max(i1, hwy.to);
+        const next = steps[si+1];
+        if (next){
+          const [ni0, ni1] = next.way_points || [0,0];
+          // if the next step starts around/after the span begin, extend to it
+          if (ni0 <= hwy.to + 1) endIdx = Math.max(endIdx, ni1);
+        }
 
-      // Highway cutoff: if this step is a highway, emit and stop
-      if (isHighwayName(nm)){
-        pushRow(nm, i0, i1);
+        // Choose a highway name from this step’s instruction (or next)
+        let hwyName = nameHighwayFromInstruction(st?.instruction || '');
+        if ((!hwyName || hwyName === 'Expressway') && next) {
+          const guess = nameHighwayFromInstruction(next?.instruction || '');
+          if (guess) hwyName = guess;
+        }
+
+        // Force-push the highway row and stop after adding it
+        pushRow(hwyName, Math.max(i0, hwy.from), endIdx, {force:true});
         break;
       }
 
-      pushRow(nm, i0, i1);
+      // Not yet on highway: regular named streets (skip blank/"-")
+      let nm = normalizeName(st?.name || '');
+      if (!nm) {
+        const guess = streetFromInstruction(st?.instruction || '');
+        if (guess && !isHighwayName(guess)) nm = guess;
+      }
+      if (nm) pushRow(nm, i0, i1);
     }
 
-    // Light rejoin pass
+    // (Optional) merge consecutive same-name/same-dir rows
     if (rows.length > 2){
       const merged = [rows[0]];
       for (let i=1;i<rows.length;i++){
@@ -274,6 +291,7 @@
   }
 
   // ===== Drawing & Controls ================================================
+  function ensureGroup(){ if (!S.group) S.group = L.layerGroup().addTo(S.map); }
   function drawRoute(geojson, color){ ensureGroup(); const line=L.geoJSON(geojson,{style:{color,weight:5,opacity:0.9}}); S.group.addLayer(line); return line; }
   function addMarker(lat, lon, html, radius=6){ ensureGroup(); const m=L.circleMarker([lat,lon],{radius}).bindPopup(html); S.group.addLayer(m); return m; }
 
@@ -338,7 +356,7 @@
     if (S.els.keys) S.els.keys.value=S.keys.join(',');
 
     if (S.els.gen)   S.els.gen.onclick   = generateTrips;
-    if (S.els.clr)   S.els.clr.onclick   = () => clearAll();
+    if (S.els.clr)   S.els.clr.onclick   = () => { if (S.group) S.group.clearLayers(); S.results=[]; setReportEnabled(false); };
     if (S.els.print) S.els.print.onclick = () => printReport();
     if (S.els.save)  S.els.save.onclick  = () => {
       const arr=(S.els.keys.value||'').split(',').map(s=>s.trim()).filter(Boolean);
@@ -362,7 +380,9 @@
       const targets = global.getSelectedPDTargets() || [];
       if (!targets.length) return popup('<b>Routing</b><br>No PDs selected.');
 
-      clearAll();
+      // Reset & mark origin
+      if (S.group) S.group.clearLayers();
+      S.results=[]; setReportEnabled(false);
       addMarker(origin.lat, origin.lon, `<b>Origin</b><br>${origin.label}`, 6);
 
       try { const f=targets[0]; S.map.fitBounds(L.latLngBounds([[origin.lat,origin.lon],[f[1],f[0]]]), { padding:[24,24] }); } catch {}
@@ -383,7 +403,8 @@
           const km  = distKm.toFixed(1);
           const min = seg ? Math.round((seg.duration||0)/60) : '—';
 
-          const assignments = buildMovementsFromDirections(coords, steps);
+          // Build movements with feature (has extra_info)
+          const assignments = buildMovementsFromDirections(coords, steps, feat);
 
           const stepsTxt = steps.map(s=>{
             const txt = cleanHtml(s.instruction||'');
@@ -406,7 +427,7 @@
           console.error(e);
           popup(`<b>Routing</b><br>Route failed for ${label}<br><small>${e.message}</small>`);
         }
-        if (i<targets.length-1) await sleep(1200);
+        if (i<targets.length-1) await sleep(1200); // 40/min cap
       }
 
       setReportEnabled(S.results.length>0);
@@ -445,12 +466,15 @@
         </div>`;
     }).join('');
     w.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>Trip Report</title>${css}</head>
-    <body><h1>Trip Report — Street Assignments (Directions-only)</h1>${cards}
+    <body><h1>Trip Report — Street Assignments (Directions-only + highway via extra_info)</h1>${cards}
     <script>window.onload=()=>window.print();</script></body></html>`);
     w.document.close();
   }
 
-  const Routing = { init(map){ init(map); }, clear(){ clearAll(); }, setApiKeys(arr){ S.keys=Array.isArray(arr)?[...arr]:[]; saveKeys(S.keys); setIndex(0); } };
+  // Public API + boot
+  const Routing = { init(map){ init(map); }, clear(){ if(S.group) S.group.clearLayers(); S.results=[]; setReportEnabled(false); }, setApiKeys(arr){ S.keys=Array.isArray(arr)?[...arr]:[]; saveKeys(S.keys); setIndex(0); } };
   global.Routing = Routing;
+
+  // Auto-init if the map already exists
   document.addEventListener('DOMContentLoaded', ()=>{ if (global.map) Routing.init(global.map); });
 })(window);
