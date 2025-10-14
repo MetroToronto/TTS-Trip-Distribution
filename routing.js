@@ -1,4 +1,4 @@
-/* routing.js — ORS Directions + Snap v2 (ghost-resistant + highway cutoff) */
+/* routing.js — ORS Directions + Snap v2 (no-ghosts + reliable highway cutoff) */
 (function (global) {
   // -------- Tunables --------
   const SWITCH_CONFIRM_M    = 200;
@@ -7,8 +7,7 @@
   const SAMPLE_EVERY_M      = 50;
   const SNAP_BATCH_SIZE     = 180;
   const BOUND_LOCK_WINDOW_M = 300;
-  const HEADING_TOLERANCE   = 45;
-  const HIGHWAY_CUTOFF      = /(Highway\s?\d{2,3}|Expressway|Express\b|Collector\b|Gardiner|Don Valley Parkway|DVP\b|QEW\b)/i;
+  const HEADING_TOLERANCE   = 45;   // heading gate for accepting Snap name
 
   const PROFILE    = 'driving-car';
   const PREFERENCE = 'fastest';
@@ -69,7 +68,7 @@
     return cardinal4(deg);
   }
 
-  // ---- Naming ----
+  // ---- Naming / highway detection ----
   function normalizeName(raw){
     if (!raw) return '';
     let s=String(raw).trim();
@@ -91,6 +90,24 @@
     for (const k of flat) if (tags[k]) return normalizeName(tags[k]);
     if (tags.ref) return normalizeName(`Highway ${tags.ref}`);
     return '';
+  }
+  function snapRef(props={}) {
+    return props.ref || (props.tags && props.tags.ref) || (props.properties && props.properties.ref) || '';
+  }
+  function isHighwayByProps(props={}) {
+    const p = { ...props, ...(props.tags||{}), ...(props.properties||{}) };
+    const vals = [
+      p.highway, p.class, p.road_class, p.category, p.fclass, p.type, p.kind
+    ].map(v => String(v||'').toLowerCase());
+    const joined = vals.join('|');
+    // motorway, trunk, freeway/expressway, collectors
+    if (/(motorway|trunk|freeway|express|expressway|motorway_link|trunk_link)/.test(joined)) return true;
+    // speed hint
+    const maxs = Number(p.maxspeed || p.max_speed || 0);
+    if (maxs >= 80) return true;
+    // explicit ref like 401
+    if (/^\d{2,3}$/.test(String(snapRef(p)))) return true;
+    return false;
   }
 
   // ---- Keys ----
@@ -157,13 +174,14 @@
     return Array.isArray(json?.features) ? json.features : [];
   }
 
-  // ---- Movements (no-ghosts + cutoff) ----
+  // ---- Movements (no-ghosts + highway cutoff) ----
   async function buildMovements(coords, seg) {
     const sampled = sampleLine(coords, SAMPLE_EVERY_M);
     if (sampled.length < 2) return [];
 
     const segHeading = i => bearingDeg(sampled[i], sampled[i+1]);
 
+    // 1) ORS steps (primary names)
     const steps = seg?.steps || [];
     const stepNameAt = (i) => {
       if (!steps.length) return '';
@@ -173,6 +191,7 @@
       return normalizeName(raw);
     };
 
+    // 2) Snap (fallback) + highway flags
     let snapFeats = [];
     try {
       for (let i=0;i<sampled.length;i+=SNAP_BATCH_SIZE){
@@ -184,28 +203,43 @@
       }
     } catch { snapFeats = []; }
     const snapNameAt = (i) => pickFromSnapProps(snapFeats[i]?.properties || {});
+    const snapIsHwy  = (i) => isHighwayByProps(snapFeats[i]?.properties || {});
 
+    // 3) Per-sample chosen name + highway flag
     const names = [];
+    const isHwy = [];
     for (let i=0;i<sampled.length-1;i++){
       const fromStep = stepNameAt(i);
-      if (fromStep) { names[i] = fromStep; continue; }
+      if (fromStep) {
+        names[i] = fromStep;
+        isHwy[i]  = /Highway|Expressway|Express\b|Collector\b|Gardiner|Don Valley Parkway|DVP\b|QEW\b/i.test(fromStep) || snapIsHwy(i);
+        continue;
+      }
       const fromSnap = snapNameAt(i);
-      if (fromSnap) {
-        const h = segHeading(i);
-        const ok = smallestAngleDiff(h, h) <= HEADING_TOLERANCE; // placeholder gate
-        names[i] = ok ? fromSnap : '';
+      const h = segHeading(i);
+      const ok = fromSnap ? smallestAngleDiff(h, h) <= HEADING_TOLERANCE : false; // accept (we don't have snap heading)
+      if (ok && fromSnap) {
+        names[i] = fromSnap;
+      } else if (snapIsHwy(i)) {
+        // synthesize a highway name if class indicates highway
+        const ref = snapRef(snapFeats[i]?.properties || {});
+        names[i] = ref ? `Highway ${ref}` : 'Highway';
       } else {
         names[i] = '';
       }
+      isHwy[i] = snapIsHwy(i) || /Highway|Expressway|Express\b|Collector\b|Gardiner|Don Valley Parkway|DVP\b|QEW\b/i.test(names[i]);
     }
     names[names.length-1] ||= names[names.length-2] || '';
+    isHwy[isHwy.length-1] = isHwy[isHwy.length-2] || false;
 
+    // 4) Build rows. On first highway touch → close current, add Highway row, stop.
     const rows = [];
     let curName = names[0] || '(unnamed)';
     let curDist = 0;
     let curBound = avgHeadingFrom(sampled, 0, BOUND_LOCK_WINDOW_M);
     let pendName=null, pendDist=0;
     let holdPrev=null, distOnNew=0;
+    let hitHighway = false;
 
     const pushRow = (dir,name,meters) => {
       const nm = normalizeName(name);
@@ -218,8 +252,22 @@
       if (segDist <= 0) continue;
 
       const observed = names[i] || curName;
+      const observeIsHwy = isHwy[i];
 
-      if (HIGHWAY_CUTOFF.test(curName)) { curDist += segDist; continue; }
+      // If already in a highway row, just accumulate to end and stop
+      if (hitHighway) { curDist += segDist; continue; }
+
+      // If we see highway coming and we're not on it yet → finish local row, start highway row, then we'll stop at end
+      if (observeIsHwy && curName && !/Highway|Expressway|Express\b|Collector\b|Gardiner|Don Valley Parkway|DVP\b|QEW\b/i.test(curName)) {
+        // finish local
+        if (curDist >= MIN_FRAGMENT_M) pushRow(curBound, curName, curDist);
+        // start highway row
+        curName  = observed || 'Highway';
+        curBound = avgHeadingFrom(sampled, Math.max(0, i-1), BOUND_LOCK_WINDOW_M);
+        curDist  = segDist;
+        hitHighway = true;
+        continue;
+      }
 
       if (holdPrev) {
         distOnNew += segDist;
@@ -255,17 +303,10 @@
       }
     }
 
-    if (holdPrev) {
-      if (distOnNew < REJOIN_WINDOW_M) {
-        curName = holdPrev.name; curBound = holdPrev.bound; curDist += holdPrev.dist;
-      } else {
-        if (holdPrev.dist >= MIN_FRAGMENT_M) pushRow(holdPrev.bound, holdPrev.name, holdPrev.dist);
-      }
-    }
+    // finalize
     if (curDist >= MIN_FRAGMENT_M) pushRow(curBound, curName, curDist);
-
-    const idx = rows.findIndex(r => HIGHWAY_CUTOFF.test(r.name));
-    return idx >= 0 ? rows.slice(0, idx+1) : rows;
+    // If we started a highway row, we’re done; nothing after it is emitted
+    return rows;
   }
 
   // ---- Drawing & Controls ----
@@ -322,7 +363,6 @@
     S.map=map; S.keys=loadKeys(); setIndex(getIndex());
     S.map.addControl(new TripControl()); S.map.addControl(new ReportControl());
 
-    // FIX: bind by raw IDs (no '#')
     S.els = {
       gen:document.getElementById('rt-gen'),
       clr:document.getElementById('rt-clr'),
