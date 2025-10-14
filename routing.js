@@ -1,13 +1,20 @@
-/* routing.js — ORS Directions + Snap v2 (no-ghosts + reliable highway cutoff) */
+/* routing.js — ORS Directions + Snap v2
+   - Street list (not maneuvers)
+   - No-ghost naming (prefer ORS steps, Snap fallback)
+   - Highway/expressway cutoff (properties- and name-based)
+   - Stable bounds per row (first ≤300 m of the row)
+   - One Directions call per PD; Snap batched
+   - Print Report uses cached results only
+*/
 (function (global) {
-  // -------- Tunables --------
-  const SWITCH_CONFIRM_M    = 200;
-  const REJOIN_WINDOW_M     = 600;
-  const MIN_FRAGMENT_M      = 60;
-  const SAMPLE_EVERY_M      = 50;
-  const SNAP_BATCH_SIZE     = 180;
-  const BOUND_LOCK_WINDOW_M = 300;
-  const HEADING_TOLERANCE   = 45;   // heading gate for accepting Snap name
+  // ===== Tunables ===========================================================
+  const SWITCH_CONFIRM_M    = 200;  // name must persist this far to switch
+  const REJOIN_WINDOW_M     = 600;  // if we rejoin old name within this, merge
+  const MIN_FRAGMENT_M      = 60;   // drop tiny fragments
+  const SAMPLE_EVERY_M      = 50;   // route sampling spacing
+  const SNAP_BATCH_SIZE     = 180;  // snap batch size
+  const BOUND_LOCK_WINDOW_M = 300;  // meters used to compute row bound
+  const HEADING_TOLERANCE   = 45;   // (kept; placeholder in case we add snap heading later)
 
   const PROFILE    = 'driving-car';
   const PREFERENCE = 'fastest';
@@ -16,17 +23,17 @@
   const COLOR_FIRST  = '#0b3aa5';
   const COLOR_OTHERS = '#2166f3';
 
-  // Keys
+  // Inline fallback key + localStorage slots
   const INLINE_DEFAULT_KEY =
     'eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6Ijk5NWI5MTE5OTM2YTRmYjNhNDRiZTZjNDRjODhhNTRhIiwiaCI6Im11cm11cjY0In0=';
   const LS_KEYS = 'ORS_KEYS';
   const LS_ACTIVE_INDEX = 'ORS_ACTIVE_INDEX';
 
-  // State
+  // ===== State ==============================================================
   const S = { map:null, group:null, keys:[], keyIndex:0, results:[], els:{} };
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-  // ---- Math/helpers ----
+  // ===== Geometry / math helpers ===========================================
   const toRad = d => d*Math.PI/180;
   function haversineMeters(a,b){
     const R=6371000; const [x1,y1]=a,[x2,y2]=b;
@@ -40,8 +47,8 @@
     const x=Math.cos(lat1)*Math.sin(lat2)-Math.sin(lat1)*Math.cos(lat2)*Math.cos(lng2-lng1);
     return (Math.atan2(y,x)*180/Math.PI+360)%360;
   }
-  function smallestAngleDiff(a,b){ let d=((a-b+540)%360)-180; return Math.abs(d); }
   function cardinal4(deg){ if (deg>=315||deg<45) return 'NB'; if (deg<135) return 'EB'; if (deg<225) return 'SB'; return 'WB'; }
+
   function sampleLine(coords, stepM){
     if (!coords || coords.length<2) return coords||[];
     const pts=[coords[0]]; let acc=0;
@@ -52,9 +59,11 @@
     if (pts[pts.length-1]!==coords[coords.length-1]) pts.push(coords[coords.length-1]);
     return pts;
   }
-  function avgHeadingFrom(sampled, iStart, windowM) {
+
+  // Weighted-average heading between indices, capped by capM meters
+  function avgHeadingBetween(sampled, iStart, iEnd, capM=BOUND_LOCK_WINDOW_M){
     let vx=0, vy=0, acc=0;
-    for (let i=iStart; i<sampled.length-1 && acc<windowM; i++){
+    for (let i=iStart; i<iEnd && i<sampled.length-1 && acc<capM; i++){
       const a=sampled[i], b=sampled[i+1];
       const d=haversineMeters(a,b); if (d<=0) continue;
       const br=bearingDeg(a,b)*Math.PI/180;
@@ -68,7 +77,7 @@
     return cardinal4(deg);
   }
 
-  // ---- Naming / highway detection ----
+  // ===== Naming helpers =====================================================
   function normalizeName(raw){
     if (!raw) return '';
     let s=String(raw).trim();
@@ -91,26 +100,28 @@
     if (tags.ref) return normalizeName(`Highway ${tags.ref}`);
     return '';
   }
+
+  // Highway detection (name + properties)
+  function isHighwayName(s=''){
+    return /\b(Highway\s?\d{2,3}|Expressway|Express\b|Collector\b|Gardiner|Don Valley Parkway|DVP|QEW)\b/i.test(s);
+  }
   function snapRef(props={}) {
-    return props.ref || (props.tags && props.tags.ref) || (props.properties && props.properties.ref) || '';
+    const p = props || {};
+    return p.ref || p?.tags?.ref || p?.properties?.ref || '';
   }
   function isHighwayByProps(props={}) {
     const p = { ...props, ...(props.tags||{}), ...(props.properties||{}) };
     const vals = [
       p.highway, p.class, p.road_class, p.category, p.fclass, p.type, p.kind
-    ].map(v => String(v||'').toLowerCase());
-    const joined = vals.join('|');
-    // motorway, trunk, freeway/expressway, collectors
-    if (/(motorway|trunk|freeway|express|expressway|motorway_link|trunk_link)/.test(joined)) return true;
-    // speed hint
+    ].map(v => String(v||'').toLowerCase()).join('|');
+    if (/(motorway|trunk|freeway|express|expressway|motorway_link|trunk_link)/.test(vals)) return true;
     const maxs = Number(p.maxspeed || p.max_speed || 0);
     if (maxs >= 80) return true;
-    // explicit ref like 401
-    if (/^\d{2,3}$/.test(String(snapRef(p)))) return true;
+    if (/^\d{2,3}$/.test(String(snapRef(p)))) return true; // e.g., ref=401
     return false;
   }
 
-  // ---- Keys ----
+  // ===== Key management =====================================================
   const parseUrlKeys = () => {
     const raw=new URLSearchParams(location.search).get('orsKey');
     return raw ? raw.split(',').map(s=>s.trim()).filter(Boolean) : [];
@@ -126,7 +137,7 @@
   const currentKey = () => S.keys[S.keyIndex];
   const rotateKey  = () => (S.keys.length>1 ? (setIndex((S.keyIndex+1)%S.keys.length), true) : false);
 
-  // ---- Map helpers ----
+  // ===== Map helpers ========================================================
   const ensureGroup = () => { if (!S.group) S.group = L.layerGroup().addTo(S.map); };
   const clearAll = () => { if (S.group) S.group.clearLayers(); S.results=[]; setReportEnabled(false); };
   const popup = (html, at) => {
@@ -135,7 +146,7 @@
     else alert(html.replace(/<[^>]+>/g,''));
   };
 
-  // ---- ORS fetch ----
+  // ===== ORS fetchers =======================================================
   async function orsFetch(path, { method='GET', body, query } = {}) {
     const url = new URL(ORS_BASE + path);
     if (query) Object.entries(query).forEach(([k,v]) => url.searchParams.set(k,v));
@@ -174,24 +185,24 @@
     return Array.isArray(json?.features) ? json.features : [];
   }
 
-  // ---- Movements (no-ghosts + highway cutoff) ----
+  // ===== Movement builder ===================================================
   async function buildMovements(coords, seg) {
     const sampled = sampleLine(coords, SAMPLE_EVERY_M);
     if (sampled.length < 2) return [];
 
     const segHeading = i => bearingDeg(sampled[i], sampled[i+1]);
 
-    // 1) ORS steps (primary names)
+    // ORS steps (primary naming)
     const steps = seg?.steps || [];
     const stepNameAt = (i) => {
       if (!steps.length) return '';
       const idx = Math.floor((i / (sampled.length-1)) * steps.length);
-      const st = steps[Math.max(0, Math.min(steps.length-1, idx))];
+      const st  = steps[Math.max(0, Math.min(steps.length-1, idx))];
       const raw = (st?.name || String(st?.instruction||'').replace(/<[^>]*>/g,'')).trim();
       return normalizeName(raw);
     };
 
-    // 2) Snap (fallback) + highway flags
+    // Snap fallback (batched)
     let snapFeats = [];
     try {
       for (let i=0;i<sampled.length;i+=SNAP_BATCH_SIZE){
@@ -202,114 +213,117 @@
         snapFeats.push(...got);
       }
     } catch { snapFeats = []; }
+
     const snapNameAt = (i) => pickFromSnapProps(snapFeats[i]?.properties || {});
     const snapIsHwy  = (i) => isHighwayByProps(snapFeats[i]?.properties || {});
+    const snapRefAt  = (i) => snapRef(snapFeats[i]?.properties || {});
 
-    // 3) Per-sample chosen name + highway flag
+    // per-sample chosen name + highway flag
     const names = [];
     const isHwy = [];
     for (let i=0;i<sampled.length-1;i++){
-      const fromStep = stepNameAt(i);
-      if (fromStep) {
-        names[i] = fromStep;
-        isHwy[i]  = /Highway|Expressway|Express\b|Collector\b|Gardiner|Don Valley Parkway|DVP\b|QEW\b/i.test(fromStep) || snapIsHwy(i);
+      const stepNm = stepNameAt(i);
+      if (stepNm) {
+        names[i] = stepNm;
+        isHwy[i]  = isHighwayName(stepNm) || snapIsHwy(i);
         continue;
       }
-      const fromSnap = snapNameAt(i);
-      const h = segHeading(i);
-      const ok = fromSnap ? smallestAngleDiff(h, h) <= HEADING_TOLERANCE : false; // accept (we don't have snap heading)
-      if (ok && fromSnap) {
-        names[i] = fromSnap;
+      const nm = snapNameAt(i);
+      if (nm) {
+        names[i] = nm;
       } else if (snapIsHwy(i)) {
-        // synthesize a highway name if class indicates highway
-        const ref = snapRef(snapFeats[i]?.properties || {});
-        names[i] = ref ? `Highway ${ref}` : 'Highway';
+        const r = snapRefAt(i);
+        names[i] = r ? `Highway ${r}` : 'Highway';  // synthesize name on highway
       } else {
         names[i] = '';
       }
-      isHwy[i] = snapIsHwy(i) || /Highway|Expressway|Express\b|Collector\b|Gardiner|Don Valley Parkway|DVP\b|QEW\b/i.test(names[i]);
+      isHwy[i] = snapIsHwy(i) || isHighwayName(names[i]);
     }
     names[names.length-1] ||= names[names.length-2] || '';
     isHwy[isHwy.length-1] = isHwy[isHwy.length-2] || false;
 
-    // 4) Build rows. On first highway touch → close current, add Highway row, stop.
-    const rows = [];
-    let curName = names[0] || '(unnamed)';
-    let curDist = 0;
-    let curBound = avgHeadingFrom(sampled, 0, BOUND_LOCK_WINDOW_M);
-    let pendName=null, pendDist=0;
-    let holdPrev=null, distOnNew=0;
-    let hitHighway = false;
+    const distBetween = (i) => haversineMeters(sampled[i], sampled[i+1]);
 
-    const pushRow = (dir,name,meters) => {
-      const nm = normalizeName(name);
-      if (!nm || nm==='(unnamed)') return;
-      rows.push({ dir, name: nm, km: +(meters/1000).toFixed(2) });
-    };
+    // Find first highway sample → cutoff point
+    const firstHwyIdx = isHwy.findIndex(Boolean);
+    const lastIdx = (firstHwyIdx > -1 ? firstHwyIdx : sampled.length-1);
 
-    for (let i=0;i<sampled.length-1;i++){
-      const segDist = haversineMeters(sampled[i], sampled[i+1]);
-      if (segDist <= 0) continue;
+    // Build row index ranges with switch-confirm + rejoin merging
+    const rowsIdx = [];
+    let curName   = names[0] || '(unnamed)';
+    let startIdx  = 0;
+    let pendName  = null;
+    let pendDist  = 0;
+    let holdPrev  = null;
+    let distOnNew = 0;
 
+    for (let i=0;i<lastIdx;i++){
+      const d = distBetween(i);
       const observed = names[i] || curName;
-      const observeIsHwy = isHwy[i];
-
-      // If already in a highway row, just accumulate to end and stop
-      if (hitHighway) { curDist += segDist; continue; }
-
-      // If we see highway coming and we're not on it yet → finish local row, start highway row, then we'll stop at end
-      if (observeIsHwy && curName && !/Highway|Expressway|Express\b|Collector\b|Gardiner|Don Valley Parkway|DVP\b|QEW\b/i.test(curName)) {
-        // finish local
-        if (curDist >= MIN_FRAGMENT_M) pushRow(curBound, curName, curDist);
-        // start highway row
-        curName  = observed || 'Highway';
-        curBound = avgHeadingFrom(sampled, Math.max(0, i-1), BOUND_LOCK_WINDOW_M);
-        curDist  = segDist;
-        hitHighway = true;
-        continue;
-      }
 
       if (holdPrev) {
-        distOnNew += segDist;
+        distOnNew += d;
         if (observed === holdPrev.name && distOnNew < REJOIN_WINDOW_M) {
-          curName = holdPrev.name; curBound = holdPrev.bound; curDist = holdPrev.dist + segDist;
-          holdPrev=null; pendName=null; pendDist=0; continue;
+          // snap back quickly → merge with previous
+          curName = holdPrev.name;
+          startIdx = holdPrev.i0;
+          holdPrev = null; pendName = null; pendDist = 0;
+          continue;
         }
         if (distOnNew >= REJOIN_WINDOW_M) {
-          if (holdPrev.dist >= MIN_FRAGMENT_M) pushRow(holdPrev.bound, holdPrev.name, holdPrev.dist);
-          holdPrev=null;
+          rowsIdx.push({ name: holdPrev.name, i0: holdPrev.i0, i1: i });
+          holdPrev = null;
         }
       }
 
-      if (observed === curName || !observed) {
-        curDist += segDist;
-        pendName=null; pendDist=0;
-        continue;
-      }
+      if (observed === curName || !observed) continue;
 
       if (pendName === observed) {
-        pendDist += segDist;
+        pendDist += d;
         if (pendDist >= SWITCH_CONFIRM_M) {
-          const backSamples = Math.max(0, Math.ceil(pendDist / SAMPLE_EVERY_M));
-          const startIdx = Math.max(0, i - backSamples);
-          const newBound = avgHeadingFrom(sampled, startIdx, BOUND_LOCK_WINDOW_M);
-          holdPrev = { name: curName, bound: curBound, dist: curDist };
+          // close current
+          rowsIdx.push({ name: curName, i0: startIdx, i1: i });
+          // set holdPrev in case we rejoin soon
+          holdPrev = { name: curName, i0: startIdx };
           distOnNew = 0;
-          curName = observed; curBound = newBound; curDist = pendDist;
-          pendName=null; pendDist=0;
+          // open new row
+          curName = pendName;
+          // estimate start index for the new row slightly back in time
+          startIdx = Math.max(0, i - Math.ceil(pendDist / SAMPLE_EVERY_M));
+          pendName = null; pendDist = 0;
         }
       } else {
-        pendName = observed; pendDist = segDist;
+        pendName = observed; pendDist = d;
       }
     }
+    // push final local row up to cutoff/end
+    rowsIdx.push({ name: curName, i0: startIdx, i1: lastIdx });
 
-    // finalize
-    if (curDist >= MIN_FRAGMENT_M) pushRow(curBound, curName, curDist);
-    // If we started a highway row, we’re done; nothing after it is emitted
+    // If cutoff happened on highway, append one final highway row
+    if (firstHwyIdx > -1) {
+      const r = snapRefAt(firstHwyIdx);
+      const hwyName = isHighwayName(names[firstHwyIdx]) ? names[firstHwyIdx] : (r ? `Highway ${r}` : 'Highway');
+      rowsIdx.push({ name: hwyName, i0: firstHwyIdx, i1: sampled.length-1, isHighway:true });
+    }
+
+    // Convert indices → rows with distance + bound; drop slivers/unnamed
+    const rows = [];
+    for (const r of rowsIdx) {
+      let meters = 0;
+      for (let i=r.i0; i<r.i1; i++) meters += distBetween(i);
+      if (meters < MIN_FRAGMENT_M) continue;
+
+      const dir = avgHeadingBetween(sampled, r.i0, r.i1, BOUND_LOCK_WINDOW_M);
+      const nm  = normalizeName(r.name);
+      if (!nm || nm==='(unnamed)') continue;
+
+      rows.push({ dir, name: nm, km: +(meters/1000).toFixed(2) });
+      if (r.isHighway) break; // stop after highway row
+    }
     return rows;
   }
 
-  // ---- Drawing & Controls ----
+  // ===== Drawing & Controls ================================================
   function drawRoute(geojson, color){ ensureGroup(); const line=L.geoJSON(geojson,{style:{color,weight:5,opacity:0.9}}); S.group.addLayer(line); return line; }
   function addMarker(lat, lon, html, radius=6){ ensureGroup(); const m=L.circleMarker([lat,lon],{radius}).bindPopup(html); S.group.addLayer(m); return m; }
 
@@ -358,7 +372,7 @@
 
   function setReportEnabled(enabled){ const b=document.getElementById('rt-print'); if (b) b.disabled=!enabled; }
 
-  // ---- Init / Generate / Print ----
+  // ===== Init / Generate / Print ===========================================
   function init(map){
     S.map=map; S.keys=loadKeys(); setIndex(getIndex());
     S.map.addControl(new TripControl()); S.map.addControl(new ReportControl());
@@ -441,7 +455,7 @@
           console.error(e);
           popup(`<b>Routing</b><br>Route failed for ${label}<br><small>${e.message}</small>`);
         }
-        if (i<targets.length-1) await sleep(1200);
+        if (i<targets.length-1) await sleep(1200); // 40/min
       }
 
       setReportEnabled(S.results.length>0);
@@ -485,6 +499,7 @@
     w.document.close();
   }
 
+  // Public API + boot
   const Routing = { init(map){ init(map); }, clear(){ clearAll(); }, setApiKeys(arr){ S.keys=Array.isArray(arr)?[...arr]:[]; saveKeys(S.keys); setIndex(0); } };
   global.Routing = Routing;
   document.addEventListener('DOMContentLoaded', ()=>{ if (global.map) Routing.init(global.map); });
