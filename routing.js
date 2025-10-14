@@ -1,7 +1,7 @@
-/* routing.js — natural step listing (no highway rules), robust coords, stable UI */
+/* routing.js — natural names, zero filtering, and a Debug Steps report */
 (function (global) {
   // ===== Tunables ===========================================================
-  const MIN_FRAGMENT_M      = 20;   // drop only very tiny noise segments
+  const MIN_FRAGMENT_M      = 0;    // keep everything (even tiny ramps)
   const BOUND_LOCK_WINDOW_M = 300;  // meters to stabilize heading labels
   const SAMPLE_EVERY_M      = 50;   // resampling interval for heading
   const PER_REQUEST_DELAY   = 80;   // ms between PD requests
@@ -26,7 +26,7 @@
     group: null,
     keys: [],
     keyIndex: 0,
-    results: [],
+    results: [], // { dest, route:{coords,steps} }
   };
 
   // ===== Small helpers ======================================================
@@ -44,15 +44,8 @@
     let arr = Array.isArray(input) ? input : [undefined, undefined];
     let x = num(arr[0]);
     let y = num(arr[1]);
-
-    // If swapped (|x|<=90, |y|>90) then swap back
-    if (isFiniteNum(x) && isFiniteNum(y) && Math.abs(x) <= 90 && Math.abs(y) > 90){
-      const t = x; x = y; y = t;
-    }
-
-    if (!isFiniteNum(x) || !isFiniteNum(y)){
-      throw new Error(`Invalid coordinate (NaN). Raw: ${JSON.stringify(input)}`);
-    }
+    if (isFiniteNum(x) && isFiniteNum(y) && Math.abs(x) <= 90 && Math.abs(y) > 90){ const t = x; x = y; y = t; }
+    if (!isFiniteNum(x) || !isFiniteNum(y)) throw new Error(`Invalid coordinate (NaN). Raw: ${JSON.stringify(input)}`);
     x = clamp(x, -180, 180);
     y = clamp(y,  -85,  85);
     return [x, y];
@@ -62,35 +55,29 @@
   function getOriginLonLat(){
     const o = global.ROUTING_ORIGIN;
     if (!o) throw new Error('Origin not set');
-
     if (Array.isArray(o) && o.length >= 2) return sanitizeLonLat([o[0], o[1]]);
     if (typeof o.getLatLng === 'function') { const ll = o.getLatLng(); return sanitizeLonLat([ll.lng, ll.lat]); }
     if (isFiniteNum(num(o.lng)) && isFiniteNum(num(o.lat))) return sanitizeLonLat([o.lng, o.lat]);
     if (o.latlng && isFiniteNum(num(o.latlng.lng)) && isFiniteNum(num(o.latlng.lat))) return sanitizeLonLat([o.latlng.lng, o.latlng.lat]);
-
     if (o.center) {
       if (Array.isArray(o.center) && o.center.length >= 2) return sanitizeLonLat([o.center[0], o.center[1]]);
       if (isFiniteNum(num(o.center.lng)) && isFiniteNum(num(o.center.lat))) return sanitizeLonLat([o.center.lng, o.center.lat]);
     }
     if (o.geometry && Array.isArray(o.geometry.coordinates) && o.geometry.coordinates.length >= 2)
       return sanitizeLonLat([o.geometry.coordinates[0], o.geometry.coordinates[1]]);
-
     const x = o.lon ?? o.x; const y = o.lat ?? o.y;
     if (isFiniteNum(num(x)) && isFiniteNum(num(y))) return sanitizeLonLat([x, y]);
-
     if (typeof o === 'string' && o.includes(',')) {
       const [a,b] = o.split(',').map(s => s.trim());
       try { return sanitizeLonLat([a,b]); } catch {}
       return sanitizeLonLat([b,a]);
     }
-
     throw new Error(`Origin shape unsupported: ${JSON.stringify(o)}`);
   }
 
   // Normalize possible outputs from getSelectedPDTargets()
   function normalizeTargets(rawList){
-    const out = [];
-    const bad = [];
+    const out = [], bad = [];
     (rawList || []).forEach((t, i) => {
       let lon, lat, label;
       if (Array.isArray(t)) { lon = t[0]; lat = t[1]; label = t[2] ?? `PD ${i+1}`; }
@@ -106,8 +93,7 @@
   function haversineMeters(a, b) {
     const R = 6371000;
     const [lon1, lat1] = a, [lon2, lat2] = b;
-    const dLat = toRad(lat2 - lat1);
-    const dLon = toRad(lon2 - lon1);
+    const dLat = toRad(lat2 - lat1), dLon = toRad(lon2 - lon1);
     const s = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon/2)**2;
     return 2 * R * Math.asin(Math.sqrt(s));
   }
@@ -149,19 +135,28 @@
     if (!s || /^unnamed\b/i.test(s) || /^[-–]+$/.test(s)) return '';
     return s;
   }
+
+  // Keep ORS step.name raw; if missing, try to pull *any* token; else show full instruction.
   function stepName(step) {
-    // 1) Prefer ORS-provided name exactly as-is (trimmed)
     const field = normalizeName(step?.name || step?.road || '');
     if (field) return field;
 
-    // 2) Fallback: extract trailing place from instruction without rewriting tokens
-    //    e.g., "Take the ramp onto ON-401 E" -> "ON-401 E"
     const t = cleanHtml(step?.instruction || '');
+    if (!t) return '';
+
+    // Try to extract common motorway tokens WITHOUT rewriting (debug-friendly)
+    // Examples we want to surface as-is: "ON-401 E", "Hwy 404 N", "QEW", "DVP", "Gardiner Expressway"
+    const token =
+      t.match(/\b(?:ON[- ]?)?(?:HWY|Hwy|Highway)?[- ]?\d{2,3}\b(?:\s*[ENSW][BW]?)?/i) ||  // ON-401 E / Hwy 404 N / 427 S
+      t.match(/\b(QEW|DVP|Gardiner(?:\s+Expressway)?|Don Valley Parkway|Allen Road|Black Creek Drive)\b/i);
+    if (token) return normalizeName(token[0]);
+
+    // Fallback: show the whole instruction tail after 'onto/on/to/toward'
     const m = t.match(/\b(?:onto|on|to|toward|towards)\s+([A-Za-z0-9 .,'\-\/&()]+)$/i);
     if (m) return normalizeName(m[1]);
 
-    // 3) Nothing usable
-    return '';
+    // Last resort: show the entire instruction so we can see what ORS said
+    return normalizeName(t);
   }
 
   // ===== ORS keys & fetch with retry =======================================
@@ -239,7 +234,7 @@
     }
   }
 
-  // ===== Movement list (no highway special-casing) ==========================
+  // ===== Movement list (no special casing) =================================
   function sliceCoords(full, i0, i1){
     const s = Math.max(0, Math.min(i0, full.length - 1));
     const e = Math.max(0, Math.min(i1, full.length - 1));
@@ -251,7 +246,6 @@
     const s = Math.max(0, Math.min(w0, fullCoords.length - 1));
     const e = Math.max(0, Math.min(w1, fullCoords.length - 1));
     if (e <= s + 1) return '';
-
     let acc = 0, cut = s + 1;
     for (let i = s + 1; i <= e; i++){
       acc += haversineMeters(fullCoords[i-1], fullCoords[i]);
@@ -260,7 +254,6 @@
     const seg = fullCoords.slice(s, Math.max(cut, s + 1) + 1);
     const samples = resample(seg, SAMPLE_EVERY_M);
     if (samples.length < 2) return '';
-
     const bearings = [];
     for (let i = 1; i < samples.length; i++) bearings.push(bearingDeg(samples[i-1], samples[i]));
     const mean = circularMean(bearings);
@@ -270,16 +263,13 @@
   function buildMovementsFromDirections(coords, steps){
     if (!coords?.length || !steps?.length) return [];
     const rows = [];
-
     const pushRow = (name, i0, i1, waypoints) => {
       const nm = normalizeName(name);
       if (!nm) return;
       const seg = sliceCoords(coords, i0, i1);
       if (seg.length < 2) return;
-
       let meters = 0; for (let i = 1; i < seg.length; i++) meters += haversineMeters(seg[i-1], seg[i]);
-      if (meters < MIN_FRAGMENT_M) return;
-
+      if (meters < MIN_FRAGMENT_M) return; // currently zero → no drops
       const dir = stableBoundForStep(coords, waypoints, BOUND_LOCK_WINDOW_M) || '';
       const last = rows[rows.length - 1];
       if (last && last.name === nm && last.dir === dir){
@@ -288,16 +278,13 @@
         rows.push({ dir, name: nm, km: +(meters / 1000).toFixed(2) });
       }
     };
-
     for (const step of steps){
       const nm = stepName(step);
       const wp = step.way_points || step.wayPoints || step.waypoints || [0, 0];
       const [i0, i1] = wp;
       pushRow(nm, i0, i1, [i0, i1]);
     }
-
-    // Keep everything except near-zero noise; no highway detection/filtering.
-    return rows.filter(r => r.km >= 0.02);
+    return rows; // no final filter
   }
 
   // ===== Map drawing & orchestration =======================================
@@ -305,6 +292,7 @@
     S.results = [];
     if (S.group) S.group.clearLayers();
     const btn = byId('rt-print'); if (btn) btn.disabled = true;
+    const db = byId('rt-debug'); if (db) db.disabled = true;
   }
   function drawRoute(coords, color){
     if (!coords?.length) return;
@@ -313,17 +301,10 @@
   }
 
   async function generate(){
-    // 1) Origin
     let originLonLat;
-    try {
-      originLonLat = getOriginLonLat();
-    } catch (e) {
-      console.error('Origin invalid:', global.ROUTING_ORIGIN, e);
-      alert('Origin has invalid coordinates. Please re-select the address.');
-      return;
-    }
+    try { originLonLat = getOriginLonLat(); }
+    catch (e) { console.error('Origin invalid:', global.ROUTING_ORIGIN, e); alert('Origin has invalid coordinates. Please re-select the address.'); return; }
 
-    // 2) Targets
     const rawTargets = (global.getSelectedPDTargets && global.getSelectedPDTargets()) || [];
     const { good: targets, bad } = normalizeTargets(rawTargets);
     if (bad.length){
@@ -331,9 +312,7 @@
       const list = bad.slice(0,5).map(b => `#${b.index+1}: ${b.reason}`).join('\n');
       alert(`Some PDs have invalid coordinates and were skipped:\n${list}${bad.length>5?'\n…':''}`);
     }
-    if (!targets.length){
-      alert('Select at least one PD with valid coordinates.'); return;
-    }
+    if (!targets.length){ alert('Select at least one PD with valid coordinates.'); return; }
 
     setBusy(true); clearAll();
 
@@ -354,6 +333,7 @@
       }
 
       const printBtn = byId('rt-print'); if (printBtn) printBtn.disabled = false;
+      const debugBtn = byId('rt-debug'); if (debugBtn) debugBtn.disabled = false;
     } catch (e) {
       console.error(e);
       alert('Routing error: ' + e.message);
@@ -367,13 +347,15 @@
     if (g){ g.disabled = b; g.textContent = b ? 'Generating…' : 'Generate Trips'; }
   }
 
-  // ===== Print Report =======================================================
+  // ===== Reports ============================================================
+  function km2(n){ return (n || 0).toFixed(2); }
+
   function printReport(){
     if (!S.results.length) { alert('No trips generated yet.'); return; }
 
     const rowsHtml = S.results.map((r) => {
       const mov = buildMovementsFromDirections(r.route.coords, r.route.steps);
-      const lines = mov.map(m => `<tr><td>${m.dir || ''}</td><td>${m.name}</td><td style="text-align:right">${(m.km||0).toFixed(2)}</td></tr>`).join('');
+      const lines = mov.map(m => `<tr><td>${m.dir || ''}</td><td>${m.name}</td><td style="text-align:right">${km2(m.km)}</td></tr>`).join('');
       return `
         <div class="card">
           <h2>Destination: ${r.dest.label || (r.dest.lon+','+r.dest.lat)}</h2>
@@ -400,6 +382,58 @@
     w.document.close();
   }
 
+  // NEW: Debug steps report (raw view for screenshots)
+  function printDebugSteps(){
+    if (!S.results.length) { alert('No trips generated yet.'); return; }
+
+    const cards = S.results.map((r) => {
+      const steps = r.route.steps || [];
+      const rows = steps.map((st, i) => {
+        const nameField = normalizeName(st?.name || st?.road || '');
+        const chosen = stepName(st);
+        const instr = cleanHtml(st?.instruction || '');
+        const distKm = ((st?.distance || 0) / 1000).toFixed(3);
+        return `<tr>
+          <td style="text-align:right">${i}</td>
+          <td style="text-align:right">${distKm}</td>
+          <td>${nameField}</td>
+          <td>${chosen}</td>
+          <td>${instr}</td>
+        </tr>`;
+      }).join('');
+      return `
+        <div class="card">
+          <h2>Debug — ${r.dest.label || (r.dest.lon+','+r.dest.lat)}</h2>
+          <table>
+            <thead><tr>
+              <th style="text-align:right">#</th>
+              <th style="text-align:right">km</th>
+              <th>step.name</th>
+              <th>chosen name</th>
+              <th>instruction (raw)</th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>`;
+    }).join('');
+
+    const css = `
+      <style>
+        body{font:13px/1.45 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;}
+        h1{font-size:18px;margin:16px 0;}
+        h2{font-size:15px;margin:12px 0 8px;}
+        table{width:100%;border-collapse:collapse;margin-bottom:18px;}
+        th,td{border:1px solid #ddd;padding:4px 6px;vertical-align:top;}
+        thead th{background:#f7f7f7;}
+        .card{page-break-inside:avoid;margin-bottom:22px;}
+        td:nth-child(3), td:nth-child(4) {white-space:nowrap;}
+      </style>
+    `;
+    const w = window.open('', '_blank');
+    w.document.write(`<!doctype html><meta charset="utf-8"><title>Debug Steps</title>${css}<h1>OpenRouteService — Raw Steps</h1>${cards}<script>onload=()=>print();</script>`);
+    w.document.close();
+  }
+
   // ===== Controls ===========================================================
   const GeneratorControl = L.Control.extend({
     options: { position: 'topleft' },
@@ -411,6 +445,7 @@
           <button id="rt-generate">Generate Trips</button>
           <button id="rt-clear" class="ghost">Clear</button>
           <button id="rt-print" disabled>Print Report</button>
+          <button id="rt-debug" class="ghost" disabled>Debug Steps</button>
         </div>
         <details>
           <summary><strong>Keys</strong></summary>
@@ -433,6 +468,7 @@
     const g = byId('rt-generate');
     const c = byId('rt-clear');
     const p = byId('rt-print');
+    const d = byId('rt-debug');
     const s = byId('rt-save');
     const u = byId('rt-url');
     const inp = byId('rt-keys');
@@ -440,16 +476,18 @@
     if (g) g.onclick = () => generate();
     if (c) c.onclick = () => clearAll();
     if (p) p.onclick = () => printReport();
+    if (d) d.onclick = () => printDebugSteps();
 
     if (s && inp) s.onclick = () => {
       const arr = inp.value.split(',').map(x => x.trim()).filter(Boolean);
-      saveKeys(arr); hydrateKeys();
+      localStorage.setItem(LS_KEYS, JSON.stringify(arr));
+      hydrateKeys();
       alert(`Saved ${S.keys.length} key(s).`);
     };
     if (u) u.onclick = () => {
       const k = qParam('orsKey');
       if (!k) alert('Add ?orsKey=YOUR_KEY to the URL query.');
-      else { saveKeys([k]); hydrateKeys(); alert('Using orsKey from URL.'); }
+      else { localStorage.setItem(LS_KEYS, JSON.stringify([k])); hydrateKeys(); alert('Using orsKey from URL.'); }
     };
   }
 
