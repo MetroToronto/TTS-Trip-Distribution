@@ -214,7 +214,6 @@
     // pending switch candidate
     let pendName = null;
     let pendDist = 0;
-    let pendFirstBound = null;
 
     // hold previous while we see if we rejoin it quickly
     let holdPrev = null;            // {name,bound,dist}
@@ -225,7 +224,6 @@
       if (segDist <= 0) continue;
 
       const observedName = nameAt(i);
-      const observedBound = cardinal4(bearingDeg(sampled[i], sampled[i+1])); // used only if we confirm a new street
 
       // If we confirmed a switch previously, see if we rejoin the old street within REJOIN_WINDOW_M
       if (holdPrev) {
@@ -236,7 +234,7 @@
           curBound = holdPrev.bound;      // keep original bound
           curDist  = holdPrev.dist + segDist;
           holdPrev = null;
-          pendName = null; pendDist = 0; pendFirstBound = null;
+          pendName = null; pendDist = 0;
           continue;
         }
         if (distOnNewSinceConfirm >= REJOIN_WINDOW_M) {
@@ -250,7 +248,7 @@
       // still on the same named street
       if (observedName === curName) {
         curDist += segDist;
-        pendName = null; pendDist = 0; pendFirstBound = null;
+        pendName = null; pendDist = 0;
         continue;
       }
 
@@ -269,20 +267,18 @@
           curName = pendName;
           curBound = newBound;
           curDist  = pendDist;
-          pendName = null; pendDist = 0; pendFirstBound = null;
+          pendName = null; pendDist = 0;
         }
       } else {
         // new candidate replaces old candidate
         pendName = observedName;
         pendDist = segDist;
-        pendFirstBound = observedBound;
       }
     }
 
     // finalize after loop
     if (holdPrev) {
       if (distOnNewSinceConfirm < REJOIN_WINDOW_M) {
-        // ended inside window: merge back to previous
         curName = holdPrev.name;
         curBound = holdPrev.bound;
         curDist += holdPrev.dist;
@@ -511,18 +507,4 @@
 
   // Boot if map is ready
   document.addEventListener('DOMContentLoaded', () => { if (global.map) Routing.init(global.map); });
-
-  // Storage helpers
-  function saveKeys(arr) { localStorage.setItem(LS_KEYS, JSON.stringify(arr)); }
-  function setIndex(i) { S.keyIndex = Math.max(0, Math.min(i, S.keys.length - 1)); localStorage.setItem(LS_ACTIVE_INDEX, String(S.keyIndex)); }
-  function getIndex() { return Number(localStorage.getItem(LS_ACTIVE_INDEX) || 0); }
-  function loadKeysFromLS() {
-    try { const ls = JSON.parse(localStorage.getItem(LS_KEYS) || '[]'); if (Array.isArray(ls) && ls.length) return ls; } catch {}
-    return [];
-  }
-  function loadKeys() {
-    const u = parseUrlKeys(); if (u.length) return u;
-    const l = loadKeysFromLS(); if (l.length) return l;
-    return [INLINE_DEFAULT_KEY];
-  }
-})();
+})(window);
