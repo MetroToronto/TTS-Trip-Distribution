@@ -1,9 +1,9 @@
-/* routing.js — simplified naming, robust coord validation, reliable highways */
+/* routing.js — simplified naming, robust origin/target parsing, reliable highways */
 (function (global) {
   // ===== Tunables ===========================================================
   const MIN_FRAGMENT_M      = 60;   // keep tiny fragments only if highway
-  const BOUND_LOCK_WINDOW_M = 300;  // meters used to stabilize heading
-  const SAMPLE_EVERY_M      = 50;   // resampling for heading
+  const BOUND_LOCK_WINDOW_M = 300;  // meters window for stable heading
+  const SAMPLE_EVERY_M      = 50;   // resampling step for heading
   const PER_REQUEST_DELAY   = 80;   // ms between PD requests
 
   const PROFILE    = 'driving-car';
@@ -42,7 +42,6 @@
   // Accepts anything-ish; returns [lon, lat] or throws with context
   function sanitizeLonLat(input){
     let arr = Array.isArray(input) ? input : [undefined, undefined];
-    // Many sources provide strings—coerce
     let x = num(arr[0]);
     let y = num(arr[1]);
 
@@ -59,9 +58,66 @@
     return [x, y];
   }
 
+  // Robust origin extractor -> [lon, lat]
+  function getOriginLonLat(){
+    const o = global.ROUTING_ORIGIN;
+    if (!o) throw new Error('Origin not set');
+
+    // 1) Array-like [lon,lat] or [lat,lon]
+    if (Array.isArray(o) && o.length >= 2) {
+      return sanitizeLonLat([o[0], o[1]]);
+    }
+
+    // 2) Leaflet marker/obj with getLatLng()
+    if (typeof o.getLatLng === 'function') {
+      const ll = o.getLatLng();
+      return sanitizeLonLat([ll.lng, ll.lat]);
+    }
+
+    // 3) {lat,lng}
+    if (isFiniteNum(num(o.lng)) && isFiniteNum(num(o.lat))) {
+      return sanitizeLonLat([o.lng, o.lat]);
+    }
+
+    // 4) {latlng:{lat,lng}}
+    if (o.latlng && isFiniteNum(num(o.latlng.lng)) && isFiniteNum(num(o.latlng.lat))) {
+      return sanitizeLonLat([o.latlng.lng, o.latlng.lat]);
+    }
+
+    // 5) {center:[lon,lat]} or {center:{lng,lat}}
+    if (o.center) {
+      if (Array.isArray(o.center) && o.center.length >= 2) {
+        return sanitizeLonLat([o.center[0], o.center[1]]);
+      }
+      if (isFiniteNum(num(o.center.lng)) && isFiniteNum(num(o.center.lat))) {
+        return sanitizeLonLat([o.center.lng, o.center.lat]);
+      }
+    }
+
+    // 6) {geometry:{coordinates:[lon,lat]}}
+    if (o.geometry && Array.isArray(o.geometry.coordinates) && o.geometry.coordinates.length >= 2) {
+      return sanitizeLonLat([o.geometry.coordinates[0], o.geometry.coordinates[1]]);
+    }
+
+    // 7) Generic {x,y} or {lon,lat}
+    const x = o.lon ?? o.x; const y = o.lat ?? o.y;
+    if (isFiniteNum(num(x)) && isFiniteNum(num(y))) {
+      return sanitizeLonLat([x, y]);
+    }
+
+    // 8) Last resort: strings "lat,lon" or "lon,lat"
+    if (typeof o === 'string' && o.includes(',')) {
+      const [a,b] = o.split(',').map(s => s.trim());
+      // Try both orders
+      try { return sanitizeLonLat([a,b]); } catch {}
+      return sanitizeLonLat([b,a]);
+    }
+
+    throw new Error(`Origin shape unsupported: ${JSON.stringify(o)}`);
+  }
+
   // Normalize possible outputs from getSelectedPDTargets()
-  // Expected shapes:
-  //   [lon, lat, label]  OR  {lon,lat,label}  OR strings of those
+  // Accepts [lon,lat,label], {lon,lat,label}, strings, etc.
   function normalizeTargets(rawList){
     const out = [];
     const bad = [];
@@ -73,6 +129,9 @@
         lon = t.lon ?? t.lng ?? t.x;
         lat = t.lat ?? t.y;
         label = t.label ?? t.name ?? `PD ${i+1}`;
+      } else if (typeof t === 'string' && t.includes(',')) {
+        const [a,b] = t.split(',').map(s => s.trim());
+        lon = a; lat = b; label = `PD ${i+1}`;
       }
       try {
         const pair = sanitizeLonLat([lon, lat]);
@@ -183,7 +242,6 @@
       body: method === 'GET' ? undefined : JSON.stringify(body)
     });
 
-    // Rotate on auth/quota, retry on one transient 500
     if ([401,403,429].includes(res.status) && rotateKey()){
       await sleep(150);
       return orsFetch(path, { method, body, query }, attempt + 1);
@@ -289,7 +347,7 @@
       if (isHwy) break; // stop after first highway row appears
     }
 
-    // Keep all highway rows; for non-highways, drop near-zero totals
+    // Keep all highway rows; drop tiny non-highways
     return rows.filter(r => r.km >= (isHighwayName(r.name) ? 0 : 0.05));
   }
 
@@ -307,13 +365,11 @@
 
   async function generate(){
     // 1) Origin
-    const origin = global.ROUTING_ORIGIN; // set by script.js geocoder
-    if (!origin) { alert('Pick an origin address first.'); return; }
     let originLonLat;
     try {
-      originLonLat = sanitizeLonLat([origin.lng, origin.lat]);
+      originLonLat = getOriginLonLat();
     } catch (e) {
-      console.error('Origin invalid:', origin, e);
+      console.error('Origin invalid:', global.ROUTING_ORIGIN, e);
       alert('Origin has invalid coordinates. Please re-select the address.');
       return;
     }
