@@ -1,9 +1,13 @@
-/* routing.js — Directions-only with robust highway extraction + hardened bootstrap
-   NOTE: In your script.js (right after creating the map), set:  window.map = map;
+/* routing.js — Directions-only (no Snap v2), highway-safe
+   - Street list from ORS steps only
+   - Robust highway parsing from instructions (handles Pkwy/Pkway/Expwy/Expy, DVP/QEW/Gardiner, ON-401, etc.)
+   - Merges ramp+first highway step; never drops a highway row due to min-length
+   - Stable NB/EB/SB/WB per contiguous street segment
+   - Highway cutoff on first highway segment
 */
 (function (global) {
   // ===== Tunables ===========================================================
-  const MIN_FRAGMENT_M      = 60;   // drop tiny rows
+  const MIN_FRAGMENT_M      = 60;   // drop tiny non-highway rows
   const BOUND_LOCK_WINDOW_M = 300;  // meters used to compute a row's bound
   const SAMPLE_EVERY_M      = 50;   // sampling spacing for heading calc
 
@@ -32,7 +36,6 @@
     return 2*R*Math.asin(Math.sqrt(s));
   }
   function bearingDeg(a,b){
-    // Initial bearing FROM a TO b, from NORTH clockwise
     const [lng1,lat1]=[toRad(a[0]),toRad(a[1])], [lng2,lat2]=[toRad(b[0]),toRad(b[1])];
     const y=Math.sin(lng2-lng1)*Math.cos(lat2);
     const x=Math.cos(lat1)*Math.sin(lat2)-Math.sin(lat1)*Math.cos(lat2)*Math.cos(lng2-lng1);
@@ -51,16 +54,16 @@
     return pts;
   }
 
+  // Correct averaging for bearings from NORTH (clockwise)
   function avgHeadingBetween(sampled, iStart, iEnd, capM=BOUND_LOCK_WINDOW_M){
-    // Correct vector average for bearings from NORTH
     let sumEast=0, sumNorth=0, acc=0;
     for (let i=iStart; i<iEnd && i<sampled.length-1 && acc<capM; i++){
       const a=sampled[i], b=sampled[i+1];
       const d=haversineMeters(a,b); if (d<=0) continue;
       const br=bearingDeg(a,b)*Math.PI/180;
-      sumEast  += Math.sin(br)*d;   // x
-      sumNorth += Math.cos(br)*d;   // y
-      acc      += d;
+      sumEast  += Math.sin(br)*d;  // x
+      sumNorth += Math.cos(br)*d;  // y
+      acc += d;
     }
     if (!sumEast && !sumNorth) {
       const j=Math.min(sampled.length-1, iStart+1);
@@ -70,21 +73,21 @@
     return cardinal4(deg);
   }
 
-  // ===== Name helpers =======================================================
-  const cleanHtml = (s) => String(s||'').replace(/<[^>]*>/g,'').trim();
+  // ===== Naming / normalization ============================================
+  const cleanHtml = s => String(s||'').replace(/<[^>]*>/g,'').trim();
 
   function normalizeName(raw){
     if (!raw) return '';
     let s=String(raw).trim();
     if (!s || /^unnamed\b/i.test(s) || /^[-–]+$/.test(s)) return '';
 
-    // Expand abbreviations first
+    // Expand common highway/expressway abbreviations first
     s = s.replace(/\bPkwy\.?\b/ig,'Parkway')
          .replace(/\bPkway\b/ig,'Parkway')
          .replace(/\bExpwy\b/ig,'Expressway')
          .replace(/\bExpy\b/ig,'Expressway');
 
-    // Convert highway variants → "Highway NNN"
+    // Convert ON-401 / Hwy 401 / 401 Express → Highway 401
     const canon = n => `Highway ${n}`;
     s = s.replace(/\b(?:ON|Ontario)?[-– ]?(?:Hwy|HWY|Highway|RTE|Route)?\s*401\b.*?/ig, canon(401));
     s = s.replace(/\b(?:ON|Ontario)?[-– ]?(?:Hwy|HWY|Highway|RTE|Route)?\s*400\b.*?/ig, canon(400));
@@ -99,13 +102,13 @@
          .replace(/\b(ct)\b\.?/ig,'Court')
          .replace(/\b(blvd)\b\.?/ig,'Boulevard');
 
-    // Trim ramp wording
+    // Remove ramp suffixes
     s = s.replace(/\b(?:Onramp|Offramp|Ramp)\b.*$/i,'');
 
     return s.replace(/\s+/g,' ').trim();
   }
 
-  // Extract a HIGHWAY/EXPRESSWAY from instruction text only
+  // Pull a highway name from instruction text when step.name is "-" or blank
   function highwayFromInstruction(instrHtml){
     const t = cleanHtml(instrHtml);
 
@@ -118,9 +121,13 @@
       if (/qew/.test(n)) return 'QEW';
     }
 
-    // Highway numbers: "ON-401", "Hwy 404", "to 427", "ramp to 401 Express"
+    // Highway numbers: "ON-401", "Hwy 404", "to 427", "ramp to 401 Express/Collector"
     const num = t.match(/\b(?:ON|Ontario)?[-– ]?(?:Hwy|HWY|Highway|RTE|Route)?\s*(\d{2,3})(?:\s*(?:Express|Collector))?\b/);
     if (num && num[1]) return `Highway ${num[1]}`;
+
+    // toward NNN pattern
+    const toward = t.match(/\b(?:to|onto|toward|towards)\s*(\d{2,3})\b/);
+    if (toward && toward[1]) return `Highway ${toward[1]}`;
 
     return '';
   }
@@ -200,14 +207,18 @@
     if (!coords?.length || !steps?.length) return [];
 
     const rows = [];
-    const pushRow = (name, i0, i1) => {
+
+    const pushRow = (name, i0, i1, {force=false} = {}) => {
       const nm = normalizeName(name);
       if (!nm) return;
       const seg = sliceCoords(coords, i0, i1);
       if (seg.length < 2) return;
 
+      // Highways must not be dropped for being short
+      const isHwy = isHighwayName(nm);
+
       let meters = 0; for (let i=1;i<seg.length;i++) meters += haversineMeters(seg[i-1], seg[i]);
-      if (meters < MIN_FRAGMENT_M) return;
+      if (!isHwy && !force && meters < MIN_FRAGMENT_M) return;
 
       const sampled = sampleLine(seg, SAMPLE_EVERY_M);
       const dir = avgHeadingBetween(sampled, 0, sampled.length-1, BOUND_LOCK_WINDOW_M);
@@ -224,45 +235,42 @@
       const st = steps[si];
       const [i0, i1] = st?.way_points || [0,0];
 
-      // 1) prefer step.name if present & normalized
+      // Prefer provided name; if blank/"-", try to derive
       let nm = normalizeName(st?.name || '');
 
-      // 2) if name missing/“-”, try to extract a HIGHWAY
-      let hw = '';
-      if (!nm) hw = highwayFromInstruction(st?.instruction || '');
+      let highwayName = '';
+      if (!nm) highwayName = highwayFromInstruction(st?.instruction || '');
 
-      // 3) still nothing? try a generic street from instruction
-      if (!nm && !hw) nm = streetFromInstruction(st?.instruction || '');
+      // If we detected a highway (either from name or from instruction),
+      // emit it and stop; also merge the immediate next step if it’s part of the highway.
+      if ((nm && isHighwayName(nm)) || highwayName){
+        let outName = nm && isHighwayName(nm) ? nm : highwayName;
 
-      // If we detected a highway (either from name or instruction), emit and stop.
-      // Also try to MERGE the immediate next step if it’s also a highway
-      if ( (nm && isHighwayName(nm)) || hw ){
-        let highwayName = nm && isHighwayName(nm) ? nm : hw;
-
-        // Look ahead one step (common ramp → highway split)
+        // Merge ramp + first highway step (common pattern)
         let endIdx = i1;
         const next = steps[si+1];
         if (next){
-          const nName = normalizeName(next?.name || '');
-          const nHigh = nName && isHighwayName(nName) ? nName : highwayFromInstruction(next?.instruction||'');
+          const nn = normalizeName(next?.name || '');
+          const nHigh = (nn && isHighwayName(nn)) ? nn : highwayFromInstruction(next?.instruction || '');
           if (nHigh){
-            const wpn = next.way_points || [0,0];
-            endIdx = Math.max(endIdx, wpn[1]);
-            highwayName = normalizeName(highwayName) || normalizeName(nHigh);
-            si += 1; // consume the next step
+            const wp = next.way_points || [0,0];
+            endIdx = Math.max(endIdx, wp[1]);
+            outName = normalizeName(outName) || normalizeName(nHigh);
+            si += 1; // consume next step
           }
         }
 
-        pushRow(highwayName, i0, endIdx);
+        // Force-push so short merge segments are kept
+        pushRow(outName, i0, endIdx, {force:true});
         break; // cutoff after first highway
       }
 
-      // Normal named street (non-highway)
+      // Non-highway: if no name yet, try a generic street from instruction
+      if (!nm) nm = streetFromInstruction(st?.instruction || '');
       if (nm) pushRow(nm, i0, i1);
-      // unnamed non-highway step → skip
     }
 
-    // Merge immediate duplicates created by short connector steps
+    // Merge immediate duplicates created by short connectors
     if (rows.length > 2){
       const merged = [rows[0]];
       for (let i=1;i<rows.length;i++){
@@ -300,7 +308,7 @@
           <div class="key-row" style="margin-top:8px;display:grid;gap:8px;">
             <label for="rt-keys" style="font-weight:600;">OpenRouteService key(s)</label>
             <input id="rt-keys" type="text" placeholder="KEY1,KEY2 (comma-separated)">
-            <div class="routing-row" style="display:flex;gap:10px;flex-wrap:wrap;">
+            <div class="routing-row" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
               <button id="rt-save">Save Keys</button>
               <button id="rt-url" class="ghost">Use ?orsKey</button>
             </div>
@@ -331,7 +339,7 @@
 
   // ===== Init / Generate / Print ===========================================
   function init(map){
-    S.map=map; S.keys=loadKeys(); setIndex(Number(localStorage.getItem(LS_ACTIVE_INDEX) || 0));
+    S.map=map; S.keys=loadKeys(); setIndex(getIndex());
     S.map.addControl(new TripControl()); S.map.addControl(new ReportControl());
 
     S.els = {
@@ -359,9 +367,6 @@
       S.keys=arr; setIndex(0);
       popup('<b>Routing</b><br>Using keys from URL.');
     };
-
-    // expose state for fallback
-    global.Routing.__state = S;
   }
 
   async function generateTrips(){
@@ -374,6 +379,7 @@
 
       clearAll();
       addMarker(origin.lat, origin.lon, `<b>Origin</b><br>${origin.label}`, 6);
+
       try { const f=targets[0]; S.map.fitBounds(L.latLngBounds([[origin.lat,origin.lon],[f[1],f[0]]]), { padding:[24,24] }); } catch {}
 
       for (let i=0;i<targets.length;i++){
@@ -459,110 +465,7 @@
     w.document.close();
   }
 
-  // Public API + boot
-  const Routing = {
-    init(map){ init(map); },
-    clear(){ clearAll(); },
-    setApiKeys(arr){ S.keys=Array.isArray(arr)?[...arr]:[]; saveKeys(S.keys); setIndex(0); },
-    getResults(){ return S.results; },
-
-    // expose internal actions for fallback panel
-    __generateTrips: generateTrips,
-    __printReport : printReport,
-    __state: S
-  };
+  const Routing = { init(map){ init(map); }, clear(){ clearAll(); }, setApiKeys(arr){ S.keys=Array.isArray(arr)?[...arr]:[]; saveKeys(S.keys); setIndex(0); } };
   global.Routing = Routing;
-
   document.addEventListener('DOMContentLoaded', ()=>{ if (global.map) Routing.init(global.map); });
 })(window);
-
-/* ---- HARDENED BOOTSTRAP (append stays at end) --------------------------- */
-(function ensureRoutingBoot() {
-  // safety CSS: ensure controls are on top
-  try {
-    const css = `
-      .leaflet-top.leaflet-left { z-index: 10000 !important; }
-      .routing-fallback { position:absolute; top:8px; left:8px; z-index:10001;
-        background:#fff; border:1px solid #ddd; border-radius:12px; padding:10px;
-        box-shadow:0 2px 8px rgba(0,0,0,0.08); font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,Arial;
-      }
-      .routing-fallback h4{ margin:0 0 6px; font-size:14px; }
-      .routing-fallback .row{ display:flex; gap:8px; flex-wrap:wrap; }
-      .routing-fallback button{ padding:6px 10px; border-radius:8px; border:1px solid #ccc; background:#f8f8f8; cursor:pointer; }
-      .routing-fallback button:disabled{ opacity:.5; cursor:not-allowed; }
-    `;
-    const style = document.createElement('style');
-    style.id = 'routing-boot-style';
-    style.textContent = css;
-    document.head.appendChild(style);
-  } catch {}
-
-  function alreadyMounted() {
-    return !!(document.querySelector('.trip-card') && document.querySelector('.report-card'));
-  }
-
-  function mountFallbackPanel() {
-    const mapEl = document.querySelector('.leaflet-container') || document.getElementById('map');
-    if (!mapEl || document.getElementById('routing-fallback')) return;
-
-    const box = document.createElement('div');
-    box.id = 'routing-fallback';
-    box.className = 'routing-fallback';
-    box.innerHTML = `
-      <h4>Routing</h4>
-      <div class="row">
-        <button id="fb-gen">Generate Trips</button>
-        <button id="fb-clr">Clear</button>
-        <button id="fb-print" disabled>Print Report</button>
-      </div>
-    `;
-    if (!mapEl.style.position) mapEl.style.position = 'relative';
-    mapEl.appendChild(box);
-
-    const gen = document.getElementById('fb-gen');
-    const clr = document.getElementById('fb-clr');
-    const prn = document.getElementById('fb-print');
-
-    gen.onclick = () => {
-      const real = document.getElementById('rt-gen');
-      if (real) real.click();
-      else if (window.Routing && window.Routing.__generateTrips) window.Routing.__generateTrips();
-    };
-    clr.onclick = () => window.Routing && window.Routing.clear && window.Routing.clear();
-    prn.onclick = () => {
-      const real = document.getElementById('rt-print');
-      if (real) real.click();
-      else if (window.Routing && window.Routing.__printReport) window.Routing.__printReport();
-    };
-
-    // keep print enabled state in sync
-    setInterval(() => {
-      try {
-        const has = (window.Routing && window.Routing.getResults && window.Routing.getResults().length>0);
-        prn.disabled = !has;
-      } catch {}
-    }, 800);
-  }
-
-  function tryInit() {
-    if (window.Routing && window.Routing.__booted) return true;
-    if (window.map && typeof window.map.addControl === 'function' &&
-        window.Routing && typeof window.Routing.init === 'function') {
-      try { window.Routing.init(window.map); window.Routing.__booted = true; } catch (e) { console.error('Routing init error:', e); }
-      return true;
-    }
-    return false;
-  }
-
-  if (!tryInit()) {
-    let tries = 0;
-    const timer = setInterval(() => {
-      if (tryInit() || ++tries > 40) {
-        clearInterval(timer);
-        setTimeout(() => { if (!alreadyMounted()) mountFallbackPanel(); }, 300);
-      }
-    }, 500);
-  } else {
-    setTimeout(() => { if (!alreadyMounted()) mountFallbackPanel(); }, 300);
-  }
-})();
