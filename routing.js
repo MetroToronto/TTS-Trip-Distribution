@@ -1,27 +1,19 @@
-/* routing.js — ORS Directions + Snap v2 (street movements)
- * Focus:
- *  • Snap-only naming (no Overpass / no centerlines)
- *  • Highway-401 (and similar) normalization (handles ref-only, Express/Collector, ON-401, etc.)
- *  • Rows collapse small zig-zags (rejoin window)
- *  • Direction (NB/EB/SB/WB) is the AVERAGE HEADING over the FIRST N METERS of that street’s appearance
- *  • End-of-trip name repair so last segments aren’t unnamed
- *
- * Tunables:
- *  - SWITCH_CONFIRM_M: how long a “new street” must persist before switching
- *  - REJOIN_WINDOW_M: if we leave a street then return within this distance, merge (avoid duplicate rows)
- *  - BOUND_LOCK_WINDOW_M: meters to average for the FIRST PART of a street to lock the bound
- *  - SAMPLE_EVERY_M: sampling interval for Snap
- *  - MIN_FRAGMENT_M: drop tiny slivers
+/* routing.js — ORS Directions + Snap v2 street movements
+ * - One Directions request per PD
+ * - Naming from ORS Snap v2 (/v2/snap/road) with highway normalization
+ * - Collapse tiny detours (rejoin window), allow real repeats later
+ * - Street bound locked from the FIRST N meters of that street's appearance
+ * - Print Report uses cached results only (no extra API calls)
  */
-
 (function (global) {
-  // ===== Tunables =====
-  const SWITCH_CONFIRM_M    = 180;
-  const REJOIN_WINDOW_M     = 450;
-  const BOUND_LOCK_WINDOW_M = 250; // << lock NB/EB/SB/WB using ONLY the first 250 m on a new street
-  const SAMPLE_EVERY_M      = 50;
-  const SNAP_BATCH_SIZE     = 200;
-  const MIN_FRAGMENT_M      = 60;
+  // ==== Tunables ============================================================
+  const SWITCH_CONFIRM_M    = 200;  // new street must persist >= this to switch
+  const REJOIN_WINDOW_M     = 600;  // if we rejoin previous within this, merge (no duplicate row)
+  const MIN_FRAGMENT_M      = 60;   // drop tiny slivers
+  const SAMPLE_EVERY_M      = 50;   // polyline sampling for Snap
+  const SNAP_BATCH_SIZE     = 200;  // Snap batch size
+  const BOUND_LOCK_WINDOW_M = 300;  // average heading over FIRST N meters to lock NB/EB/SB/WB
+  const TAIL_REPAIR_MAX_GAP = 3;    // max unnamed samples to fill at the end
 
   const PROFILE    = 'driving-car';
   const PREFERENCE = 'fastest';
@@ -36,24 +28,17 @@
   const LS_KEYS = 'ORS_KEYS';
   const LS_ACTIVE_INDEX = 'ORS_ACTIVE_INDEX';
 
-  // ===== State =====
-  const S = {
-    map: null,
-    group: null,
-    keys: [],
-    keyIndex: 0,
-    results: [],
-    els: {}
-  };
+  // ==== State ===============================================================
+  const S = { map:null, group:null, keys:[], keyIndex:0, results:[], els:{} };
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-  // ===== Math / utils =====
+  // ==== Math helpers ========================================================
   const toRad = d => d*Math.PI/180;
   function haversineMeters(a,b){
     const R=6371000;
-    const [lng1,lat1]=a, [lng2,lat2]=b;
-    const dLat=toRad(lat2-lat1), dLng=toRad(lng2-lng1);
-    const s=Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLng/2)**2;
+    const [x1,y1]=a,[x2,y2]=b;
+    const dLat=toRad(y2-y1), dLng=toRad(x2-x1);
+    const s=Math.sin(dLat/2)**2 + Math.cos(toRad(y1))*Math.cos(toRad(y2))*Math.sin(dLng/2)**2;
     return 2*R*Math.asin(Math.sqrt(s));
   }
   function bearingDeg(a,b){
@@ -62,8 +47,7 @@
     const x=Math.cos(lat1)*Math.sin(lat2)-Math.sin(lat1)*Math.cos(lat2)*Math.cos(lng2-lng1);
     return (Math.atan2(y,x)*180/Math.PI+360)%360;
   }
-  function cardinal4(deg){ if (deg>=315||deg<45) return "NB"; if (deg<135) return "EB"; if (deg<225) return "SB"; return "WB"; }
-
+  function cardinal4(deg){ if (deg>=315||deg<45) return 'NB'; if (deg<135) return 'EB'; if (deg<225) return 'SB'; return 'WB'; }
   function sampleLine(coords, stepM){
     if (!coords || coords.length<2) return coords||[];
     const pts=[coords[0]]; let acc=0;
@@ -74,243 +58,226 @@
     if (pts[pts.length-1]!==coords[coords.length-1]) pts.push(coords[coords.length-1]);
     return pts;
   }
-
-  // Average heading from index i forward, over at most windowM meters
+  // Average heading from index forward, up to windowM meters
   function avgHeadingFrom(sampled, iStart, windowM) {
-    let vx = 0, vy = 0, acc = 0;
-    for (let i=iStart; i<sampled.length-1 && acc < windowM; i++) {
-      const a = sampled[i], b = sampled[i+1];
-      const d = haversineMeters(a,b); if (d <= 0) continue;
-      const br = bearingDeg(a,b) * Math.PI/180;
-      vx += Math.cos(br) * d;
-      vy += Math.sin(br) * d;
-      acc += d;
+    let vx=0, vy=0, acc=0;
+    for (let i=iStart; i<sampled.length-1 && acc<windowM; i++){
+      const a=sampled[i], b=sampled[i+1];
+      const d=haversineMeters(a,b); if (d<=0) continue;
+      const br=bearingDeg(a,b)*Math.PI/180;
+      vx += Math.cos(br)*d; vy += Math.sin(br)*d; acc += d;
     }
-    if (vx === 0 && vy === 0) {
-      const j = Math.min(sampled.length-1, iStart+1);
+    if (!vx && !vy) {
+      const j=Math.min(sampled.length-1, iStart+1);
       return cardinal4(bearingDeg(sampled[iStart], sampled[j]));
     }
-    const deg = (Math.atan2(vy, vx) * 180/Math.PI + 360) % 360;
+    const deg=(Math.atan2(vy,vx)*180/Math.PI+360)%360;
     return cardinal4(deg);
   }
 
-  // ===== Name normalization / extraction (Snap) =====
+  // ==== Name handling (Snap) ===============================================
   function normalizeName(raw){
     if (!raw) return '';
-    let s = String(raw).trim();
+    let s=String(raw).trim();
 
-    // Canonicalize Ontario 400-series variants → “Highway NNN”
-    s = s.replace(/\b(?:ON|Ontario)?\s*[-–]?\s*(?:Hwy|HWY|Highway|RTE|Route)?\s*401\b.*?/ig, 'Highway 401');
-    s = s.replace(/\b(?:ON|Ontario)?\s*[-–]?\s*(?:Hwy|HWY|Highway|RTE|Route)?\s*400\b.*?/ig, 'Highway 400');
-    s = s.replace(/\b(?:ON|Ontario)?\s*[-–]?\s*(?:Hwy|HWY|Highway|RTE|Route)?\s*404\b.*?/ig, 'Highway 404');
-    s = s.replace(/\b(?:ON|Ontario)?\s*[-–]?\s*(?:Hwy|HWY|Highway|RTE|Route)?\s*427\b.*?/ig, 'Highway 427');
-    s = s.replace(/\b(?:ON|Ontario)?\s*[-–]?\s*(?:Hwy|HWY|Highway|RTE|Route)?\s*409\b.*?/ig, 'Highway 409');
+    // Ontario 400-series → canonical Highway NNN (handles ON-401, 401 Express/Collector, ref=401, etc.)
+    const canon = n => `Highway ${n}`;
+    s = s.replace(/\b(?:ON|Ontario)?\s*[-–]?\s*(?:Hwy|HWY|Highway|RTE|Route)?\s*401\b.*?/ig, canon(401));
+    s = s.replace(/\b(?:ON|Ontario)?\s*[-–]?\s*(?:Hwy|HWY|Highway|RTE|Route)?\s*400\b.*?/ig, canon(400));
+    s = s.replace(/\b(?:ON|Ontario)?\s*[-–]?\s*(?:Hwy|HWY|Highway|RTE|Route)?\s*404\b.*?/ig, canon(404));
+    s = s.replace(/\b(?:ON|Ontario)?\s*[-–]?\s*(?:Hwy|HWY|Highway|RTE|Route)?\s*427\b.*?/ig, canon(427));
+    s = s.replace(/\b(?:ON|Ontario)?\s*[-–]?\s*(?:Hwy|HWY|Highway|RTE|Route)?\s*409\b.*?/ig, canon(409));
 
-    // Abbrev expansions
+    // Common abbrevs
     s = s.replace(/\b(st)\b\.?/ig,'Street')
          .replace(/\b(rd)\b\.?/ig,'Road')
          .replace(/\b(ave)\b\.?/ig,'Avenue');
 
-    // Remove ramp-only noise like “Ramp to …”/“Collector/Express” suffixes already collapsed above
+    // Strip ramp fluff
     s = s.replace(/\b(?:Onramp|Offramp|Ramp)\b.*$/i,'');
 
     return s.replace(/\s+/g,' ').trim();
   }
-
   function pickFromSnapProps(props={}){
-    // Try typical flat props first
-    const k1 = ['name','street','road','way_name','label','display_name','name:en'];
-    for (const k of k1) if (props[k]) return normalizeName(props[k]);
-    // If only a ref is present (common for highways)
+    const flatKeys = ['name','street','road','way_name','label','display_name','name:en'];
+    for (const k of flatKeys) if (props[k]) return normalizeName(props[k]);
     if (props.ref) return normalizeName(`Highway ${props.ref}`);
-    // Nested variants
     const tags = props.tags || props.properties || {};
-    const k2 = ['name','street','road','way_name','label','display_name','name:en'];
-    for (const k of k2) if (tags[k]) return normalizeName(tags[k]);
+    for (const k of flatKeys) if (tags[k]) return normalizeName(tags[k]);
     if (tags.ref) return normalizeName(`Highway ${tags.ref}`);
     return '';
   }
-
-  // Minor majority/repair so tails don’t go unnamed
-  function repairNames(seq) {
-    const out = seq.slice();
-    // forward fill one step if missing
-    for (let i=0;i<out.length;i++){
-      if (!out[i] || out[i]==='(unnamed)') {
-        if (i>0 && out[i-1] && out[i-1] !== '(unnamed)') out[i] = out[i-1];
-      }
+  // Repair small end gaps so tail isn't unnamed
+  function repairTail(names){
+    const out = names.slice();
+    // forward fill single gaps
+    for (let i=1;i<out.length;i++){
+      if ((!out[i] || out[i]==='(unnamed)') && out[i-1] && out[i-1] !== '(unnamed)') out[i]=out[i-1];
     }
-    // backward fill last stretch if still missing
-    for (let i=out.length-2;i>=0;i--){
-      if ((!out[i] || out[i]==='(unnamed)') && out[i+1] && out[i+1] !== '(unnamed)') out[i] = out[i+1];
+    // backfill tail if small gap
+    let trailing=0;
+    for (let i=out.length-1;i>=0;i--){
+      if (!out[i] || out[i]==='(unnamed)') trailing++; else break;
+    }
+    if (trailing>0 && trailing<=TAIL_REPAIR_MAX_GAP){
+      const lastNamed = out[out.length-1-trailing-1];
+      if (lastNamed) for (let j=out.length-trailing;j<out.length;j++) out[j]=lastNamed;
     }
     return out;
   }
 
-  // ===== Keys =====
+  // ==== Keys ================================================================
   const parseUrlKeys = () => {
-    const raw = new URLSearchParams(location.search).get('orsKey');
-    return raw ? raw.split(',').map(s => s.trim()).filter(Boolean) : [];
+    const raw=new URLSearchParams(location.search).get('orsKey');
+    return raw ? raw.split(',').map(s=>s.trim()).filter(Boolean) : [];
   };
   const loadKeys = () => {
-    const u = parseUrlKeys(); if (u.length) return u;
-    try { const ls = JSON.parse(localStorage.getItem(LS_KEYS) || '[]'); if (Array.isArray(ls) && ls.length) return ls; } catch {}
+    const u=parseUrlKeys(); if (u.length) return u;
+    try { const ls=JSON.parse(localStorage.getItem(LS_KEYS) || '[]'); if (Array.isArray(ls)&&ls.length) return ls; } catch {}
     return [INLINE_DEFAULT_KEY];
   };
-  const saveKeys = (arr) => localStorage.setItem(LS_KEYS, JSON.stringify(arr));
-  const setIndex = (i) => { S.keyIndex = Math.max(0, Math.min(i, S.keys.length - 1)); localStorage.setItem(LS_ACTIVE_INDEX, String(S.keyIndex)); };
+  const saveKeys = arr => localStorage.setItem(LS_KEYS, JSON.stringify(arr));
+  const setIndex = i => { S.keyIndex=Math.max(0, Math.min(i, S.keys.length-1)); localStorage.setItem(LS_ACTIVE_INDEX, String(S.keyIndex)); };
   const getIndex = () => Number(localStorage.getItem(LS_ACTIVE_INDEX) || 0);
   const currentKey = () => S.keys[S.keyIndex];
-  const rotateKey   = () => (S.keys.length > 1 ? (setIndex((S.keyIndex + 1) % S.keys.length), true) : false);
+  const rotateKey  = () => (S.keys.length>1 ? (setIndex((S.keyIndex+1)%S.keys.length), true) : false);
 
-  // ===== Map helpers =====
+  // ==== Map helpers =========================================================
   const ensureGroup = () => { if (!S.group) S.group = L.layerGroup().addTo(S.map); };
-  const clearAll = () => { if (S.group) S.group.clearLayers(); S.results = []; setReportEnabled(false); };
+  const clearAll = () => { if (S.group) S.group.clearLayers(); S.results=[]; setReportEnabled(false); };
   const popup = (html, at) => {
     const ll = at || (S.map ? S.map.getCenter() : null);
     if (ll) L.popup().setLatLng(ll).setContent(html).openOn(S.map);
-    else alert(html.replace(/<[^>]+>/g, ''));
+    else alert(html.replace(/<[^>]+>/g,''));
   };
 
-  // ===== ORS =====
-  async function orsFetch(path, { method = 'GET', body, query } = {}) {
+  // ==== ORS fetch ===========================================================
+  async function orsFetch(path, { method='GET', body, query } = {}) {
     const url = new URL(ORS_BASE + path);
-    if (query) Object.entries(query).forEach(([k,v]) => url.searchParams.set(k, v));
+    if (query) Object.entries(query).forEach(([k,v]) => url.searchParams.set(k,v));
     const res = await fetch(url.toString(), {
       method,
-      headers: { Authorization: currentKey(), ...(method !== 'GET' && { 'Content-Type': 'application/json' }) },
-      body: method === 'GET' ? undefined : JSON.stringify(body)
+      headers: { Authorization: currentKey(), ...(method!=='GET' && {'Content-Type':'application/json'}) },
+      body: method==='GET' ? undefined : JSON.stringify(body)
     });
-    if ([401,403,429].includes(res.status)) {
-      if (rotateKey()) return orsFetch(path, { method, body, query });
+    if ([401,403,429].includes(res.status) && rotateKey()) {
+      return orsFetch(path, { method, body, query });
     }
-    if (!res.ok) throw new Error(`ORS ${res.status}: ${await res.text().catch(() => res.statusText)}`);
+    if (!res.ok) throw new Error(`ORS ${res.status}: ${await res.text().catch(()=>res.statusText)}`);
     return res.json();
   }
-  async function getRoute(originLonLat, destLonLat) {
+  async function getRoute(originLonLat, destLonLat){
     return orsFetch(`/v2/directions/${PROFILE}/geojson`, {
-      method: 'POST',
-      body: {
-        coordinates: [originLonLat, destLonLat],
-        preference: PREFERENCE,
-        instructions: true,
-        instructions_format: 'html',
-        language: 'en',
-        units: 'km'
+      method:'POST',
+      body:{
+        coordinates:[originLonLat, destLonLat],
+        preference:PREFERENCE,
+        instructions:true,
+        instructions_format:'html',
+        language:'en',
+        units:'km'
       }
     });
   }
-  async function snapRoad(points) {
+  async function snapRoad(points){
     if (!points?.length) return [];
     const url = `${ORS_BASE}/v2/snap/road`;
     const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Authorization': currentKey(), 'Content-Type': 'application/json' },
+      method:'POST',
+      headers:{ 'Authorization': currentKey(), 'Content-Type':'application/json' },
       body: JSON.stringify({ points, locations: points })
     });
     if ([401,403,429].includes(res.status) && rotateKey()) return snapRoad(points);
-    if (!res.ok) return []; // treat as "no info"
+    if (!res.ok) return []; // treat as missing info
     const json = await res.json();
     return Array.isArray(json?.features) ? json.features : [];
   }
 
-  // ===== Movements (Snap-only naming + bound lock on first N meters) =====
-  async function buildMovements(coords, segForFallback) {
+  // ==== Movements (Snap-only + bound lock on first N meters) ===============
+  async function buildMovements(coords, segForFallback){
     const sampled = sampleLine(coords, SAMPLE_EVERY_M);
     if (sampled.length < 2) return [];
 
-    // Snap names at samples
-    let snapFeatures = [];
+    // Snap names
+    let feats = [];
     try {
       for (let i=0;i<sampled.length;i+=SNAP_BATCH_SIZE){
         const chunk = sampled.slice(i, i+SNAP_BATCH_SIZE);
-        const feats = await snapRoad(chunk);
-        if (feats.length < chunk.length) for (let k=feats.length;k<chunk.length;k++) feats.push({});
-        else if (feats.length > chunk.length) feats.length = chunk.length;
-        snapFeatures.push(...feats);
+        const got = await snapRoad(chunk);
+        if (got.length < chunk.length) for (let k=got.length;k<chunk.length;k++) got.push({});
+        else if (got.length > chunk.length) got.length = chunk.length;
+        feats.push(...got);
       }
-    } catch { snapFeatures = []; }
+    } catch { feats = []; }
 
-    // Extract + normalize names
-    let snapNames = snapFeatures.map(f => pickFromSnapProps(f?.properties || {}));
-    // As a last resort, use ORS steps only for unnamed samples (helps at trip tail)
+    // Extract names; fallback to ORS steps only for unnamed samples
     const steps = segForFallback?.steps || [];
-    const fallbackName = (i) => {
+    const stepNameAt = (i) => {
       if (!steps.length) return '';
       const idx = Math.floor((i / (sampled.length-1)) * steps.length);
       const st = steps[Math.max(0, Math.min(steps.length-1, idx))];
       const raw = (st?.name || String(st?.instruction||'').replace(/<[^>]*>/g,'')).trim();
       return normalizeName(raw);
     };
-    snapNames = snapNames.map((n,i) => n || fallbackName(i) || '(unnamed)');
 
-    // Repair end / small gaps to avoid unnamed tails
-    snapNames = repairNames(snapNames);
+    let names = feats.map(f => pickFromSnapProps(f?.properties || ''));
+    names = names.map((n,i)=> n || stepNameAt(i) || '(unnamed)');
+    names = repairTail(names);
 
-    // State machine with:
-    //  • switch-confirm,
-    //  • rejoin-window (merge tiny detours),
-    //  • bound lock based on FIRST BOUND_LOCK_WINDOW_M meters on a new street
+    // Build rows (switch-confirm + rejoin-window + bound lock from FIRST N m)
     const rows = [];
-    let curName = snapNames[0];
-    let curDist = 0;
+    let curName  = names[0];
+    let curDist  = 0;
     let curBound = avgHeadingFrom(sampled, 0, BOUND_LOCK_WINDOW_M);
 
     let pendName = null;
     let pendDist = 0;
 
     let holdPrev = null;           // { name, bound, dist }
-    let distOnNewSinceConfirm = 0; // meters since confirming switch
+    let distOnNewSinceConfirm = 0; // meters after confirming switch
 
     for (let i=0;i<sampled.length-1;i++){
       const segDist = haversineMeters(sampled[i], sampled[i+1]);
       if (segDist <= 0) continue;
 
-      const observedName = snapNames[i];
+      const observedName = names[i];
 
-      // If we confirmed a switch earlier, check for quick rejoin
       if (holdPrev) {
         distOnNewSinceConfirm += segDist;
         if (observedName === holdPrev.name && distOnNewSinceConfirm < REJOIN_WINDOW_M) {
-          // merge back: cancel switch; continue previous
+          // Snap back quickly → merge
           curName = holdPrev.name;
           curBound = holdPrev.bound;
           curDist  = holdPrev.dist + segDist;
-          holdPrev = null;
-          pendName = null; pendDist = 0;
+          holdPrev = null; pendName = null; pendDist = 0;
           continue;
         }
         if (distOnNewSinceConfirm >= REJOIN_WINDOW_M) {
-          // finalize previous
           if (holdPrev.dist >= MIN_FRAGMENT_M)
             rows.push({ dir: holdPrev.bound, name: holdPrev.name, km: +(holdPrev.dist/1000).toFixed(2) });
           holdPrev = null;
         }
       }
 
-      // still on same street
       if (observedName === curName) {
         curDist += segDist;
         pendName = null; pendDist = 0;
         continue;
       }
 
-      // consider switching
       if (pendName === observedName) {
         pendDist += segDist;
         if (pendDist >= SWITCH_CONFIRM_M) {
-          // confirm: lock bound from the FIRST N meters of this new appearance
+          // Confirm switch → lock new bound from first N meters of NEW appearance
           const backSamples = Math.max(0, Math.ceil(pendDist / SAMPLE_EVERY_M));
-          const switchIdxStart = Math.max(0, i - backSamples);
-          const newBound = avgHeadingFrom(sampled, switchIdxStart, BOUND_LOCK_WINDOW_M);
+          const startIdx = Math.max(0, i - backSamples);
+          const newBound = avgHeadingFrom(sampled, startIdx, BOUND_LOCK_WINDOW_M);
 
-          // put current on hold until rejoin window passes
           holdPrev = { name: curName, bound: curBound, dist: curDist };
           distOnNewSinceConfirm = 0;
 
-          // start new current
-          curName = pendName;
-          curBound = newBound;   // << lock using first N meters
+          curName  = pendName;
+          curBound = newBound;
           curDist  = pendDist;
           pendName = null; pendDist = 0;
         }
@@ -321,7 +288,6 @@
       }
     }
 
-    // finalize at end
     if (holdPrev) {
       if (distOnNewSinceConfirm < REJOIN_WINDOW_M) {
         curName  = holdPrev.name;
@@ -338,14 +304,14 @@
     return rows;
   }
 
-  // ===== Drawing & Controls =====
+  // ==== Drawing & Controls ==================================================
   function drawRoute(geojson, color) {
     ensureGroup();
-    const line = L.geoJSON(geojson, { style: { color, weight: 5, opacity: 0.9 } });
+    const line = L.geoJSON(geojson, { style: { color, weight:5, opacity:0.9 } });
     S.group.addLayer(line);
     return line;
   }
-  function addMarker(lat, lon, html, radius = 6) {
+  function addMarker(lat, lon, html, radius=6){
     ensureGroup();
     const m = L.circleMarker([lat, lon], { radius }).bindPopup(html);
     S.group.addLayer(m);
@@ -353,9 +319,9 @@
   }
 
   const TripControl = L.Control.extend({
-    options: { position: 'topleft' },
-    onAdd() {
-      const el = L.DomUtil.create('div', 'routing-control trip-card');
+    options:{ position:'topleft' },
+    onAdd(){
+      const el = L.DomUtil.create('div','routing-control trip-card');
       el.innerHTML = `
         <div class="routing-header"><strong>Trip Generator</strong></div>
         <div class="routing-actions" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
@@ -374,36 +340,34 @@
             </div>
             <small class="routing-hint">Priority: ?orsKey → saved → inline fallback. Keys auto-rotate on 401/429.</small>
           </div>
-        </details>
-      `;
+        </details>`;
       L.DomEvent.disableClickPropagation(el);
       return el;
     }
   });
 
   const ReportControl = L.Control.extend({
-    options: { position: 'topleft' },
-    onAdd() {
-      const el = L.DomUtil.create('div', 'routing-control report-card');
+    options:{ position:'topleft' },
+    onAdd(){
+      const el = L.DomUtil.create('div','routing-control report-card');
       el.innerHTML = `
         <div class="routing-header"><strong>Report</strong></div>
         <div class="routing-actions" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
           <button id="rt-print" disabled>Print Report</button>
         </div>
-        <small class="routing-hint">Prints the directions already generated — no new API calls.</small>
-      `;
+        <small class="routing-hint">Prints the directions already generated — no new API calls.</small>`;
       L.DomEvent.disableClickPropagation(el);
       return el;
     }
   });
 
-  function setReportEnabled(enabled) {
-    const b = document.getElementById('rt-print');
+  function setReportEnabled(enabled){
+    const b=document.getElementById('rt-print');
     if (b) b.disabled = !enabled;
   }
 
-  // ===== Init / Generate / Print =====
-  function init(map) {
+  // ==== Init / Generate / Print ============================================
+  function init(map){
     S.map = map;
     S.keys = loadKeys();
     setIndex(getIndex());
@@ -412,12 +376,12 @@
     S.map.addControl(new ReportControl());
 
     S.els = {
-      gen: document.getElementById('rt-gen'),
-      clr: document.getElementById('rt-clr'),
-      print: document.getElementById('rt-print'),
-      keys: document.getElementById('rt-keys'),
-      save: document.getElementById('rt-save'),
-      url: document.getElementById('rt-url')
+      gen:document.getElementById('rt-gen'),
+      clr:document.getElementById('rt-clr'),
+      print:document.getElementById('rt-print'),
+      keys:document.getElementById('rt-keys'),
+      save:document.getElementById('rt-save'),
+      url:document.getElementById('rt-url')
     };
     if (S.els.keys) S.els.keys.value = S.keys.join(',');
 
@@ -425,24 +389,23 @@
     S.els.clr && (S.els.clr.onclick   = () => clearAll());
     S.els.print && (S.els.print.onclick = () => printReport());
     S.els.save && (S.els.save.onclick  = () => {
-      const arr = (S.els.keys.value || '').split(',').map(s => s.trim()).filter(Boolean);
+      const arr=(S.els.keys.value||'').split(',').map(s=>s.trim()).filter(Boolean);
       if (!arr.length) return popup('<b>Routing</b><br>Enter a key.');
-      S.keys = arr; saveKeys(arr); setIndex(0);
+      S.keys=arr; saveKeys(arr); setIndex(0);
       popup('<b>Routing</b><br>Keys saved.');
     });
     S.els.url && (S.els.url.onclick   = () => {
-      const arr = parseUrlKeys();
+      const arr=parseUrlKeys();
       if (!arr.length) return popup('<b>Routing</b><br>No <code>?orsKey=</code> in URL.');
-      S.keys = arr; setIndex(0);
+      S.keys=arr; setIndex(0);
       popup('<b>Routing</b><br>Using keys from URL.');
     });
   }
 
-  async function generateTrips() {
-    try {
+  async function generateTrips(){
+    try{
       const origin = global.ROUTING_ORIGIN;
       if (!origin) return popup('<b>Routing</b><br>Search an address in the top bar and select a result first.');
-
       if (!global.getSelectedPDTargets) return popup('<b>Routing</b><br>Zone/PD selection isn\'t ready.');
       const targets = global.getSelectedPDTargets() || [];
       if (!targets.length) return popup('<b>Routing</b><br>No PDs selected.');
@@ -451,35 +414,34 @@
       addMarker(origin.lat, origin.lon, `<b>Origin</b><br>${origin.label}`, 6);
 
       try {
-        const f = targets[0];
-        S.map.fitBounds(L.latLngBounds([[origin.lat, origin.lon], [f[1], f[0]]]), { padding: [24, 24] });
+        const f=targets[0];
+        S.map.fitBounds(L.latLngBounds([[origin.lat,origin.lon],[f[1],f[0]]]), { padding:[24,24] });
       } catch {}
 
-      for (let i = 0; i < targets.length; i++) {
-        const [dlon, dlat, label] = targets[i];
+      for (let i=0;i<targets.length;i++){
+        const [dlon,dlat,label] = targets[i];
+        try{
+          const gj = await getRoute([origin.lon,origin.lat],[dlon,dlat]);
+          drawRoute(gj, i===0 ? COLOR_FIRST : COLOR_OTHERS);
 
-        let gj = null, feat = null, seg = null, km = '—', min = '—';
-        try {
-          gj = await getRoute([origin.lon, origin.lat], [dlon, dlat]);
-          drawRoute(gj, i === 0 ? COLOR_FIRST : COLOR_OTHERS);
-
-          feat = gj?.features?.[0];
-          seg  = feat?.properties?.segments?.[0];
-
+          const feat = gj?.features?.[0];
+          const seg  = feat?.properties?.segments?.[0];
           const coords = feat?.geometry?.coordinates || [];
-          const distKm = seg?.distance ? seg.distance/1000 : coords.reduce((a,_,j,arr)=> j? a + haversineMeters(arr[j-1], arr[j])/1000 : 0, 0);
-          km  = distKm.toFixed(1);
-          min = seg ? Math.round((seg.duration || 0) / 60) : '—';
+
+          const distKm = seg?.distance ? seg.distance/1000
+            : coords.reduce((a,_,j,arr)=> j? a + haversineMeters(arr[j-1],arr[j])/1000 : 0, 0);
+          const km  = distKm.toFixed(1);
+          const min = seg ? Math.round((seg.duration||0)/60) : '—';
 
           const assignments = await buildMovements(coords, seg);
 
-          const stepsTxt = (seg?.steps || []).map(s => {
-            const txt = String(s.instruction || '').replace(/<[^>]+>/g, '');
-            const d = ((s.distance || 0)/1000).toFixed(2);
+          const stepsTxt = (seg?.steps||[]).map(s=>{
+            const txt = String(s.instruction||'').replace(/<[^>]+>/g,'');
+            const d = ((s.distance||0)/1000).toFixed(2);
             return `${txt} — ${d} km`;
           });
 
-          S.results.push({ label, lat: dlat, lon: dlon, km, min, steps: stepsTxt, assignments, gj });
+          S.results.push({ label, lat:dlat, lon:dlon, km, min, steps:stepsTxt, assignments, gj });
 
           const preview = assignments.slice(0,6).map(a=>`<li>${a.dir} ${a.name} — ${a.km.toFixed(2)} km</li>`).join('');
           const html = `
@@ -496,21 +458,20 @@
           console.error(e);
           popup(`<b>Routing</b><br>Route failed for ${label}<br><small>${e.message}</small>`);
         }
-
-        if (i < targets.length - 1) await sleep(1200); // stay under 40/min
+        if (i<targets.length-1) await sleep(1200); // rate limit 40/min
       }
 
-      setReportEnabled(S.results.length > 0);
+      setReportEnabled(S.results.length>0);
       if (S.results.length) popup('<b>Routing</b><br>All routes processed. Popups added at each destination.');
     } catch (e) {
       console.error(e);
-      popup(`<b>Routing</b><br>${e.message || 'Unknown error.'}`);
+      popup(`<b>Routing</b><br>${e.message||'Unknown error.'}`);
     }
   }
 
-  function printReport() {
+  function printReport(){
     if (!S.results.length) return popup('<b>Routing</b><br>Generate trips first.');
-    const w = window.open('', '_blank');
+    const w = window.open('','_blank');
     const css = `
       <style>
         body { font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; padding:16px; }
@@ -522,9 +483,9 @@
         th { font-weight:700; background:#fafafa; }
         .right { text-align:right; white-space:nowrap; }
       </style>`;
-    const rows = S.results.map((r,i) => {
+    const cards = S.results.map((r,i)=>{
       const lines = (r.assignments && r.assignments.length)
-        ? r.assignments.map(a => `<tr><td>${a.dir}</td><td>${a.name}</td><td class="right">${a.km.toFixed(2)} km</td></tr>`).join('')
+        ? r.assignments.map(a=>`<tr><td>${a.dir}</td><td>${a.name}</td><td class="right">${a.km.toFixed(2)} km</td></tr>`).join('')
         : `<tr><td colspan="3"><em>No named streets on route</em></td></tr>`;
       return `
         <div class="card">
@@ -537,18 +498,13 @@
         </div>`;
     }).join('');
     w.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>Trip Report</title>${css}</head>
-    <body><h1>Trip Report — Street Assignments</h1>${rows}
+    <body><h1>Trip Report — Street Assignments</h1>${cards}
     <script>window.onload=()=>window.print();</script></body></html>`);
     w.document.close();
   }
 
-  // Public API
-  const Routing = {
-    init(map) { init(map); },
-    clear() { clearAll(); },
-    setApiKeys(arr) { S.keys = Array.isArray(arr) ? [...arr] : []; saveKeys(S.keys); setIndex(0); }
-  };
+  // Public API + boot
+  const Routing = { init(map){ init(map); }, clear(){ clearAll(); }, setApiKeys(arr){ S.keys=Array.isArray(arr)?[...arr]:[]; saveKeys(S.keys); setIndex(0); } };
   global.Routing = Routing;
-
   document.addEventListener('DOMContentLoaded', () => { if (global.map) Routing.init(global.map); });
 })(window);
