@@ -1,9 +1,9 @@
-/* routing.js — simplified naming, robust origin/target parsing, reliable highways */
+/* routing.js — natural step listing (no highway special-casing), robust coords, stable UI */
 (function (global) {
   // ===== Tunables ===========================================================
-  const MIN_FRAGMENT_M      = 60;   // keep tiny fragments only if highway
-  const BOUND_LOCK_WINDOW_M = 300;  // meters window for stable heading
-  const SAMPLE_EVERY_M      = 50;   // resampling step for heading
+  const MIN_FRAGMENT_M      = 20;   // drop only *very* tiny noise segments
+  const BOUND_LOCK_WINDOW_M = 300;  // meters used to stabilize heading
+  const SAMPLE_EVERY_M      = 50;   // resample polyline for heading
   const PER_REQUEST_DELAY   = 80;   // ms between PD requests
 
   const PROFILE    = 'driving-car';
@@ -63,52 +63,23 @@
     const o = global.ROUTING_ORIGIN;
     if (!o) throw new Error('Origin not set');
 
-    // 1) Array-like [lon,lat] or [lat,lon]
-    if (Array.isArray(o) && o.length >= 2) {
-      return sanitizeLonLat([o[0], o[1]]);
-    }
+    if (Array.isArray(o) && o.length >= 2) return sanitizeLonLat([o[0], o[1]]);
+    if (typeof o.getLatLng === 'function') { const ll = o.getLatLng(); return sanitizeLonLat([ll.lng, ll.lat]); }
+    if (isFiniteNum(num(o.lng)) && isFiniteNum(num(o.lat))) return sanitizeLonLat([o.lng, o.lat]);
+    if (o.latlng && isFiniteNum(num(o.latlng.lng)) && isFiniteNum(num(o.latlng.lat))) return sanitizeLonLat([o.latlng.lng, o.latlng.lat]);
 
-    // 2) Leaflet marker/obj with getLatLng()
-    if (typeof o.getLatLng === 'function') {
-      const ll = o.getLatLng();
-      return sanitizeLonLat([ll.lng, ll.lat]);
-    }
-
-    // 3) {lat,lng}
-    if (isFiniteNum(num(o.lng)) && isFiniteNum(num(o.lat))) {
-      return sanitizeLonLat([o.lng, o.lat]);
-    }
-
-    // 4) {latlng:{lat,lng}}
-    if (o.latlng && isFiniteNum(num(o.latlng.lng)) && isFiniteNum(num(o.latlng.lat))) {
-      return sanitizeLonLat([o.latlng.lng, o.latlng.lat]);
-    }
-
-    // 5) {center:[lon,lat]} or {center:{lng,lat}}
     if (o.center) {
-      if (Array.isArray(o.center) && o.center.length >= 2) {
-        return sanitizeLonLat([o.center[0], o.center[1]]);
-      }
-      if (isFiniteNum(num(o.center.lng)) && isFiniteNum(num(o.center.lat))) {
-        return sanitizeLonLat([o.center.lng, o.center.lat]);
-      }
+      if (Array.isArray(o.center) && o.center.length >= 2) return sanitizeLonLat([o.center[0], o.center[1]]);
+      if (isFiniteNum(num(o.center.lng)) && isFiniteNum(num(o.center.lat))) return sanitizeLonLat([o.center.lng, o.center.lat]);
     }
-
-    // 6) {geometry:{coordinates:[lon,lat]}}
-    if (o.geometry && Array.isArray(o.geometry.coordinates) && o.geometry.coordinates.length >= 2) {
+    if (o.geometry && Array.isArray(o.geometry.coordinates) && o.geometry.coordinates.length >= 2)
       return sanitizeLonLat([o.geometry.coordinates[0], o.geometry.coordinates[1]]);
-    }
 
-    // 7) Generic {x,y} or {lon,lat}
     const x = o.lon ?? o.x; const y = o.lat ?? o.y;
-    if (isFiniteNum(num(x)) && isFiniteNum(num(y))) {
-      return sanitizeLonLat([x, y]);
-    }
+    if (isFiniteNum(num(x)) && isFiniteNum(num(y))) return sanitizeLonLat([x, y]);
 
-    // 8) Last resort: strings "lat,lon" or "lon,lat"
     if (typeof o === 'string' && o.includes(',')) {
       const [a,b] = o.split(',').map(s => s.trim());
-      // Try both orders
       try { return sanitizeLonLat([a,b]); } catch {}
       return sanitizeLonLat([b,a]);
     }
@@ -117,28 +88,16 @@
   }
 
   // Normalize possible outputs from getSelectedPDTargets()
-  // Accepts [lon,lat,label], {lon,lat,label}, strings, etc.
   function normalizeTargets(rawList){
     const out = [];
     const bad = [];
     (rawList || []).forEach((t, i) => {
       let lon, lat, label;
-      if (Array.isArray(t)) {
-        lon = t[0]; lat = t[1]; label = t[2] ?? `PD ${i+1}`;
-      } else if (t && typeof t === 'object') {
-        lon = t.lon ?? t.lng ?? t.x;
-        lat = t.lat ?? t.y;
-        label = t.label ?? t.name ?? `PD ${i+1}`;
-      } else if (typeof t === 'string' && t.includes(',')) {
-        const [a,b] = t.split(',').map(s => s.trim());
-        lon = a; lat = b; label = `PD ${i+1}`;
-      }
-      try {
-        const pair = sanitizeLonLat([lon, lat]);
-        out.push([pair[0], pair[1], label]);
-      } catch (e) {
-        bad.push({ index: i, value: t, reason: String(e.message || e) });
-      }
+      if (Array.isArray(t)) { lon = t[0]; lat = t[1]; label = t[2] ?? `PD ${i+1}`; }
+      else if (t && typeof t === 'object') { lon = t.lon ?? t.lng ?? t.x; lat = t.lat ?? t.y; label = t.label ?? t.name ?? `PD ${i+1}`; }
+      else if (typeof t === 'string' && t.includes(',')) { const [a,b]=t.split(',').map(s=>s.trim()); lon=a; lat=b; label=`PD ${i+1}`; }
+      try { const pair = sanitizeLonLat([lon, lat]); out.push([pair[0], pair[1], label]); }
+      catch (e) { bad.push({ index:i, value:t, reason:String(e.message||e) }); }
     });
     return { good: out, bad };
   }
@@ -195,25 +154,15 @@
     if (field) return field;
 
     const t = cleanHtml(step?.instruction || '');
-    // Named expressways
-    const named = t.match(/\b(Gardiner(?:\s+Expressway)?|Don Valley Parkway|QEW|DVP|Allen Road|Black Creek Drive)\b/i);
-    if (named) return normalizeName(named[1]);
-    // Highway numbers like ON-401 / Hwy 404 / 427
-    const hnum = t.match(/\b(?:ON|Ontario)?[-– ]?(?:Hwy|HWY|Highway|RTE|Route)?\s*(\d{2,3})\b/);
-    if (hnum) return normalizeName(`Highway ${hnum[1]}`);
-    // Fallback: "onto X" / "on X"
+    // Fallback: “onto/on X …”
     const m = t.match(/\b(?:onto|on|to|toward|towards)\s+([A-Za-z0-9 .'\-\/&]+)$/i);
     if (m) return normalizeName(m[1]);
+
     return '';
-  }
-  function isHighwayName(name='') {
-    return /\b(Highway\s?\d{2,3}|Gardiner\s+Expressway|Don Valley Parkway|QEW|DVP|Allen Road|Black Creek Drive)\b/i.test(name);
   }
 
   // ===== ORS keys & fetch with retry =======================================
-  function savedKeys() {
-    try { return JSON.parse(localStorage.getItem(LS_KEYS) || '[]'); } catch { return []; }
-  }
+  function savedKeys() { try { return JSON.parse(localStorage.getItem(LS_KEYS) || '[]'); } catch { return []; } }
   function saveKeys(arr) { localStorage.setItem(LS_KEYS, JSON.stringify(Array.isArray(arr) ? arr : [])); }
   function getIndex() { return +(localStorage.getItem(LS_ACTIVE_INDEX) || 0) || 0; }
   function setIndex(i) { localStorage.setItem(LS_ACTIVE_INDEX, String(i)); }
@@ -287,7 +236,7 @@
     }
   }
 
-  // ===== Movement list ======================================================
+  // ===== Movement list (no highway cutoff) =================================
   function sliceCoords(full, i0, i1){
     const s = Math.max(0, Math.min(i0, full.length - 1));
     const e = Math.max(0, Math.min(i1, full.length - 1));
@@ -319,15 +268,14 @@
     if (!coords?.length || !steps?.length) return [];
     const rows = [];
 
-    const pushRow = (name, i0, i1, waypoints, isHwy) => {
+    const pushRow = (name, i0, i1, waypoints) => {
       const nm = normalizeName(name);
       if (!nm) return;
       const seg = sliceCoords(coords, i0, i1);
       if (seg.length < 2) return;
 
-      // Distance
       let meters = 0; for (let i = 1; i < seg.length; i++) meters += haversineMeters(seg[i-1], seg[i]);
-      if (meters < MIN_FRAGMENT_M && !isHwy) return;
+      if (meters < MIN_FRAGMENT_M) return;
 
       const dir = stableBoundForStep(coords, waypoints, BOUND_LOCK_WINDOW_M) || '';
       const last = rows[rows.length - 1];
@@ -340,15 +288,13 @@
 
     for (const step of steps){
       const nm = stepName(step);
-      const isHwy = isHighwayName(nm);
       const wp = step.way_points || step.wayPoints || step.waypoints || [0, 0];
       const [i0, i1] = wp;
-      pushRow(nm, i0, i1, [i0, i1], isHwy);
-      if (isHwy) break; // stop after first highway row appears
+      pushRow(nm, i0, i1, [i0, i1]);
     }
 
-    // Keep all highway rows; drop tiny non-highways
-    return rows.filter(r => r.km >= (isHighwayName(r.name) ? 0 : 0.05));
+    // Drop near-zero totals; keep everything else (no highway logic)
+    return rows.filter(r => r.km >= 0.02);
   }
 
   // ===== Map drawing & orchestration =======================================
