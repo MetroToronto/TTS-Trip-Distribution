@@ -259,6 +259,8 @@
 
   // ===== Init / Generate / Print ===========================================
   function init(map){
+     if (window.__ROUTING_MOUNTED) return;   // prevent duplicates
+     window.__ROUTING_MOUNTED = true;
     S.map=map; S.keys=loadKeys(); S.keyIndex=Number(localStorage.getItem(LS_ACTIVE_INDEX)||0);
     S.map.addControl(new TripControl()); S.map.addControl(new ReportControl());
 
