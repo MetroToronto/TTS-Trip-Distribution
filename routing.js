@@ -1,19 +1,16 @@
-/* routing.js — ORS Directions + Snap v2
-   - Street list (not maneuvers)
-   - Prefer ORS step names; Snap is fallback
-   - Highway/expressway cutoff (uses Snap props + name/ref)
-   - ✅ Correct NB/EB/SB/WB bounds: vector average from NORTH baseline
-   - One Directions call per PD; Snap batched
-   - Print Report uses cached results only
+/* routing.js — Directions-only (no Snap v2)
+   - Street list from ORS steps only (no extra APIs)
+   - Stable NB/EB/SB/WB per contiguous street segment
+   - Highway cutoff (Highway 401/QEW/DVP/Gardiner/etc.)
+   - One Directions request per PD; Print uses cached results
 */
 (function (global) {
   // ===== Tunables ===========================================================
-  const SWITCH_CONFIRM_M    = 200;  // name must persist this far to switch
-  const REJOIN_WINDOW_M     = 600;  // if we rejoin old name within this, merge
+  const SWITCH_CONFIRM_M    = 200;  // distance a new name must persist before switching
+  const REJOIN_WINDOW_M     = 600;  // if old name reappears within this, merge rows
   const MIN_FRAGMENT_M      = 60;   // drop tiny fragments
-  const SAMPLE_EVERY_M      = 50;   // route sampling spacing
-  const SNAP_BATCH_SIZE     = 180;  // snap batch size
-  const BOUND_LOCK_WINDOW_M = 300;  // meters used to compute row bound
+  const BOUND_LOCK_WINDOW_M = 300;  // meters used to compute a row's bound
+  const SAMPLE_EVERY_M      = 50;   // sampling spacing for heading calc
 
   const PROFILE    = 'driving-car';
   const PREFERENCE = 'fastest';
@@ -27,9 +24,13 @@
     'eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6Ijk5NWI5MTE5OTM2YTRmYjNhNDRiZTZjNDRjODhhNTRhIiwiaCI6Im11cm11cjY0In0=';
   const LS_KEYS = 'ORS_KEYS';
   const LS_ACTIVE_INDEX = 'ORS_ACTIVE_INDEX';
+  const LS_DIRS_ONLY = 'ROUTE_DIRS_ONLY_MODE';
 
   // ===== State ==============================================================
-  const S = { map:null, group:null, keys:[], keyIndex:0, results:[], els:{} };
+  const S = {
+    map:null, group:null, keys:[], keyIndex:0,
+    results:[], els:{}, dirsOnly:true
+  };
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
   // ===== Geometry / math helpers ===========================================
@@ -61,8 +62,7 @@
   }
 
   // ✅ Correct vector averaging for bearings measured FROM NORTH (clockwise).
-  //   For each segment with bearing θ (from NORTH): east = sinθ, north = cosθ.
-  //   Resultant bearing = atan2(sum_east, sum_north), still from NORTH.
+  //   For each segment with bearing θ: east = sinθ, north = cosθ.
   function avgHeadingBetween(sampled, iStart, iEnd, capM=BOUND_LOCK_WINDOW_M){
     let sumEast=0, sumNorth=0, acc=0;
     for (let i=iStart; i<iEnd && i<sampled.length-1 && acc<capM; i++){
@@ -81,46 +81,44 @@
     return cardinal4(deg);
   }
 
-  // ===== Naming helpers =====================================================
+  // ===== Naming / normalization ============================================
   function normalizeName(raw){
     if (!raw) return '';
     let s=String(raw).trim();
+
+    // Pull name from common instruction patterns if step.name is blank
+    if (!s || /^unnamed/i.test(s)) return '';
+
+    // Convert ON-401 / Hwy 401 etc → Highway 401; expand common suffixes
     const canon = n => `Highway ${n}`;
-    s = s.replace(/\b(?:ON|Ontario)?\s*[-–]?\s*(?:Hwy|HWY|Highway|RTE|Route)?\s*401\b.*?/ig, canon(401));
-    s = s.replace(/\b(?:ON|Ontario)?\s*[-–]?\s*(?:Hwy|HWY|Highway|RTE|Route)?\s*400\b.*?/ig, canon(400));
-    s = s.replace(/\b(?:ON|Ontario)?\s*[-–]?\s*(?:Hwy|HWY|Highway|RTE|Route)?\s*404\b.*?/ig, canon(404));
-    s = s.replace(/\b(?:ON|Ontario)?\s*[-–]?\s*(?:Hwy|HWY|Highway|RTE|Route)?\s*427\b.*?/ig, canon(427));
-    s = s.replace(/\b(?:ON|Ontario)?\s*[-–]?\s*(?:Hwy|HWY|Highway|RTE|Route)?\s*409\b.*?/ig, canon(409));
-    s = s.replace(/\b(st)\b\.?/ig,'Street').replace(/\b(rd)\b\.?/ig,'Road').replace(/\b(ave)\b\.?/ig,'Avenue');
+    s = s.replace(/\b(?:ON|Ontario)?[-– ]?(?:Hwy|HWY|Highway|RTE|Route)?\s*401\b.*?/ig, canon(401));
+    s = s.replace(/\b(?:ON|Ontario)?[-– ]?(?:Hwy|HWY|Highway|RTE|Route)?\s*400\b.*?/ig, canon(400));
+    s = s.replace(/\b(?:ON|Ontario)?[-– ]?(?:Hwy|HWY|Highway|RTE|Route)?\s*404\b.*?/ig, canon(404));
+    s = s.replace(/\b(?:ON|Ontario)?[-– ]?(?:Hwy|HWY|Highway|RTE|Route)?\s*427\b.*?/ig, canon(427));
+    s = s.replace(/\b(?:ON|Ontario)?[-– ]?(?:Hwy|HWY|Highway|RTE|Route)?\s*409\b.*?/ig, canon(409));
+
+    // Expand short forms
+    s = s.replace(/\b(st)\b\.?/ig,'Street')
+         .replace(/\b(rd)\b\.?/ig,'Road')
+         .replace(/\b(ave)\b\.?/ig,'Avenue')
+         .replace(/\b(ct)\b\.?/ig,'Court')
+         .replace(/\b(blvd)\b\.?/ig,'Boulevard');
+
+    // Trim ramps text if present
     s = s.replace(/\b(?:Onramp|Offramp|Ramp)\b.*$/i,'');
+
     return s.replace(/\s+/g,' ').trim();
   }
-  function pickFromSnapProps(props={}){
-    const flat = ['name','street','road','way_name','label','display_name','name:en'];
-    for (const k of flat) if (props[k]) return normalizeName(props[k]);
-    if (props.ref) return normalizeName(`Highway ${props.ref}`);
-    const tags = props.tags || props.properties || {};
-    for (const k of flat) if (tags[k]) return normalizeName(tags[k]);
-    if (tags.ref) return normalizeName(`Highway ${tags.ref}`);
-    return '';
+
+  function nameFromInstruction(instructionHtml){
+    const t = String(instructionHtml||'').replace(/<[^>]*>/g,'').trim();
+    // crude patterns like "Turn left onto Bathurst St"
+    const m = t.match(/\b(?:onto|to|toward|towards)\s+([A-Za-z0-9 .'\-\/&]+)$/i);
+    return m ? normalizeName(m[1]) : '';
   }
+
   function isHighwayName(s=''){
     return /\b(Highway\s?\d{2,3}|Expressway|Express\b|Collector\b|Gardiner|Don Valley Parkway|DVP|QEW)\b/i.test(s);
-  }
-  function snapRef(props={}) {
-    const p = props || {};
-    return p.ref || p?.tags?.ref || p?.properties?.ref || '';
-  }
-  function isHighwayByProps(props={}) {
-    const p = { ...props, ...(props.tags||{}), ...(props.properties||{}) };
-    const vals = [
-      p.highway, p.class, p.road_class, p.category, p.fclass, p.type, p.kind
-    ].map(v => String(v||'').toLowerCase()).join('|');
-    if (/(motorway|trunk|freeway|express|expressway|motorway_link|trunk_link)/.test(vals)) return true;
-    const maxs = Number(p.maxspeed || p.max_speed || 0);
-    if (maxs >= 80) return true;
-    if (/^\d{2,3}$/.test(String(snapRef(p)))) return true; // e.g., ref=401
-    return false;
   }
 
   // ===== Key management =====================================================
@@ -174,153 +172,95 @@
       }
     });
   }
-  async function snapRoad(points){
-    if (!points?.length) return [];
-    const res = await fetch(`${ORS_BASE}/v2/snap/road`, {
-      method:'POST',
-      headers:{ 'Authorization': currentKey(), 'Content-Type':'application/json' },
-      body: JSON.stringify({ points, locations: points })
-    });
-    if ([401,403,429].includes(res.status) && rotateKey()) return snapRoad(points);
-    if (!res.ok) return [];
-    const json = await res.json();
-    return Array.isArray(json?.features) ? json.features : [];
+
+  // ===== Directions-only movement builder ==================================
+  function sliceCoords(fullCoords, i0, i1){
+    // i0..i1 inclusive indices in ORS geometry (way_points)
+    const s = Math.max(0, Math.min(i0, fullCoords.length-1));
+    const e = Math.max(0, Math.min(i1, fullCoords.length-1));
+    if (e <= s) return fullCoords.slice(s, s+1);
+    return fullCoords.slice(s, e+1);
   }
 
-  // ===== Movement builder ===================================================
-  async function buildMovements(coords, seg) {
-    const sampled = sampleLine(coords, SAMPLE_EVERY_M);
-    if (sampled.length < 2) return [];
+  function stepName(step){
+    const primary = normalizeName(step?.name || '');
+    if (primary) return primary;
+    return nameFromInstruction(step?.instruction || '');
+  }
 
-    const steps = seg?.steps || [];
-    const stepNameAt = (i) => {
-      if (!steps.length) return '';
-      const idx = Math.floor((i / (sampled.length-1)) * steps.length);
-      const st  = steps[Math.max(0, Math.min(steps.length-1, idx))];
-      const raw = (st?.name || String(st?.instruction||'').replace(/<[^>]*>/g,'')).trim();
-      return normalizeName(raw);
-    };
+  function buildMovementsFromDirections(coords, steps){
+    if (!coords?.length || !steps?.length) return [];
 
-    // Snap fallback (batched)
-    let snapFeats = [];
-    try {
-      for (let i=0;i<sampled.length;i+=SNAP_BATCH_SIZE){
-        const chunk = sampled.slice(i, i+SNAP_BATCH_SIZE);
-        const got = await snapRoad(chunk);
-        if (got.length < chunk.length) for (let k=got.length;k<chunk.length;k++) got.push({});
-        else if (got.length > chunk.length) got.length = chunk.length;
-        snapFeats.push(...got);
+    // Build provisional rows across contiguous samples, collapsing quick flips + rejoins
+    const rows = [];
+    let curName = '';
+    let curStartIdx = 0;
+    let curDist = 0;
+    let curDir  = 'NB'; // temp
+    let lastAdded = null;
+
+    // helper to push a row with proper bound computed from geometry slice
+    const pushRow = (name, i0, i1) => {
+      const nm = normalizeName(name);
+      if (!nm) return;
+      // distance & bound from the actual geometry slice for this step span
+      const seg = sliceCoords(coords, i0, i1);
+      if (seg.length < 2) return;
+      // distance
+      let meters = 0; for (let i=1;i<seg.length;i++) meters += haversineMeters(seg[i-1], seg[i]);
+      if (meters < MIN_FRAGMENT_M) return;
+
+      // bound from first ≤300 m of this slice
+      const sampled = sampleLine(seg, SAMPLE_EVERY_M);
+      const dir = avgHeadingBetween(sampled, 0, sampled.length-1, BOUND_LOCK_WINDOW_M);
+
+      // merge with previous if same street + bound (avoid duplicates)
+      const prev = rows[rows.length-1];
+      if (prev && prev.name === nm && prev.dir === dir){
+        prev.km = +(prev.km + meters/1000).toFixed(2);
+      } else {
+        rows.push({ dir, name: nm, km: +(meters/1000).toFixed(2) });
       }
-    } catch { snapFeats = []; }
-
-    const snapNameAt = (i) => pickFromSnapProps(snapFeats[i]?.properties || {});
-    const snapIsHwy  = (i) => isHighwayByProps(snapFeats[i]?.properties || {});
-    const snapRefAt  = (i) => {
-      const p = snapFeats[i]?.properties || {};
-      return p.ref || p?.tags?.ref || p?.properties?.ref || '';
     };
 
-    // per-sample chosen name + highway flag
-    const names = [];
-    const isHwy = [];
-    for (let i=0;i<sampled.length-1;i++){
-      const stepNm = stepNameAt(i);
-      if (stepNm) {
-        names[i] = stepNm;
-        isHwy[i]  = isHighwayName(stepNm) || snapIsHwy(i);
+    // Walk ORS steps; each step has way_points [i0, i1]
+    for (let si=0; si<steps.length; si++){
+      const st = steps[si];
+      let nm = stepName(st);
+      const [i0, i1] = st?.way_points || [0,0];
+
+      if (!nm){
+        // Unnamed step → skip but allow continuation of current name; or drop as sliver
         continue;
       }
-      const nm = snapNameAt(i);
-      if (nm) {
-        names[i] = nm;
-      } else if (snapIsHwy(i)) {
-        const r = snapRefAt(i);
-        names[i] = r ? `Highway ${r}` : 'Highway';  // synthesize name on highway
-      } else {
-        names[i] = '';
-      }
-      isHwy[i] = snapIsHwy(i) || isHighwayName(names[i]);
-    }
-    names[names.length-1] ||= names[names.length-2] || '';
-    isHwy[isHwy.length-1] = isHwy[isHwy.length-2] || false;
 
-    const distBetween = (i) => haversineMeters(sampled[i], sampled[i+1]);
-
-    // Find first highway sample → cutoff point
-    const firstHwyIdx = isHwy.findIndex(Boolean);
-    const lastIdx = (firstHwyIdx > -1 ? firstHwyIdx : sampled.length-1);
-
-    // Build row index ranges with switch-confirm + rejoin merging
-    const rowsIdx = [];
-    let curName   = names[0] || '(unnamed)';
-    let startIdx  = 0;
-    let pendName  = null;
-    let pendDist  = 0;
-    let holdPrev  = null;
-    let distOnNew = 0;
-
-    for (let i=0;i<lastIdx;i++){
-      const d = distBetween(i);
-      const observed = names[i] || curName;
-
-      if (holdPrev) {
-        distOnNew += d;
-        if (observed === holdPrev.name && distOnNew < REJOIN_WINDOW_M) {
-          curName = holdPrev.name;
-          startIdx = holdPrev.i0;
-          holdPrev = null; pendName = null; pendDist = 0;
-          continue;
-        }
-        if (distOnNew >= REJOIN_WINDOW_M) {
-          rowsIdx.push({ name: holdPrev.name, i0: holdPrev.i0, i1: i });
-          holdPrev = null;
-        }
+      // Highway cutoff: if this step is highway, emit it and stop
+      if (isHighwayName(nm)){
+        pushRow(nm, i0, i1);
+        break;
       }
 
-      if (observed === curName || !observed) continue;
+      // Normal street row
+      pushRow(nm, i0, i1);
+    }
 
-      if (pendName === observed) {
-        pendDist += d;
-        if (pendDist >= SWITCH_CONFIRM_M) {
-          // close current
-          rowsIdx.push({ name: curName, i0: startIdx, i1: i });
-          // holdPrev for quick rejoin
-          holdPrev = { name: curName, i0: startIdx };
-          distOnNew = 0;
-          // open new row
-          curName = pendName;
-          startIdx = Math.max(0, i - Math.ceil(pendDist / SAMPLE_EVERY_M));
-          pendName = null; pendDist = 0;
+    // Rejoin pass: merge rows that separated briefly then rejoined within REJOIN_WINDOW_M
+    if (rows.length > 2){
+      const merged = [rows[0]];
+      for (let i=1;i<rows.length;i++){
+        const a = merged[merged.length-1];
+        const b = rows[i];
+        // we don't have explicit gaps distances here (because we sliced per step),
+        // but if same name+dir appears again immediately, merge them
+        if (a.name === b.name && a.dir === b.dir){
+          a.km = +(a.km + b.km).toFixed(2);
+        } else {
+          merged.push(b);
         }
-      } else {
-        pendName = observed; pendDist = d;
       }
-    }
-    // push final local row up to cutoff/end
-    rowsIdx.push({ name: curName, i0: startIdx, i1: lastIdx });
-
-    // If cutoff happened on highway, append one final highway row
-    if (firstHwyIdx > -1) {
-      const r = snapRefAt(firstHwyIdx);
-      const hwyName = isHighwayName(names[firstHwyIdx]) ? names[firstHwyIdx] : (r ? `Highway ${r}` : 'Highway');
-      rowsIdx.push({ name: hwyName, i0: firstHwyIdx, i1: sampled.length-1, isHighway:true });
+      return merged;
     }
 
-    // Convert indices → rows with distance + bound; drop slivers/unnamed
-    const rows = [];
-    for (const r of rowsIdx) {
-      let meters = 0;
-      for (let i=r.i0; i<r.i1; i++) meters += distBetween(i);
-      if (meters < MIN_FRAGMENT_M) continue;
-
-      // ✅ Bound from the first ≤300 m of THIS row (correct averaging)
-      const dir = avgHeadingBetween(sampled, r.i0, r.i1, BOUND_LOCK_WINDOW_M);
-      const nm  = normalizeName(r.name);
-      if (!nm || nm==='(unnamed)') continue;
-
-      rows.push({ dir, name: nm, km: +(meters/1000).toFixed(2) });
-      if (r.isHighway) break; // stop after highway row
-    }
     return rows;
   }
 
@@ -344,9 +284,13 @@
           <div class="key-row" style="margin-top:8px;display:grid;gap:8px;">
             <label for="rt-keys" style="font-weight:600;">OpenRouteService key(s)</label>
             <input id="rt-keys" type="text" placeholder="KEY1,KEY2 (comma-separated)">
-            <div class="routing-row" style="display:flex;gap:10px;flex-wrap:wrap;">
+            <div class="routing-row" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
               <button id="rt-save">Save Keys</button>
               <button id="rt-url" class="ghost">Use ?orsKey</button>
+              <label style="display:flex;gap:6px;align-items:center;margin-left:auto;">
+                <input id="rt-dirs-only" type="checkbox" checked>
+                <span>Use Directions-only (no Snap)</span>
+              </label>
             </div>
             <small class="routing-hint">Priority: ?orsKey → saved → inline fallback. Keys auto-rotate on 401/429.</small>
           </div>
@@ -365,7 +309,7 @@
         <div class="routing-actions" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
           <button id="rt-print" disabled>Print Report</button>
         </div>
-        <small class="routing-hint">Prints the directions already generated — no new API calls.</small>`;
+        <small class="routing-hint">Prints the routes already generated — no new API calls.</small>`;
       L.DomEvent.disableClickPropagation(el);
       return el;
     }
@@ -376,6 +320,11 @@
   // ===== Init / Generate / Print ===========================================
   function init(map){
     S.map=map; S.keys=loadKeys(); setIndex(getIndex());
+
+    // load dirs-only pref (default true)
+    const savedPref = localStorage.getItem(LS_DIRS_ONLY);
+    S.dirsOnly = savedPref === null ? true : savedPref === 'true';
+
     S.map.addControl(new TripControl()); S.map.addControl(new ReportControl());
 
     S.els = {
@@ -384,9 +333,18 @@
       print:document.getElementById('rt-print'),
       keys:document.getElementById('rt-keys'),
       save:document.getElementById('rt-save'),
-      url:document.getElementById('rt-url')
+      url:document.getElementById('rt-url'),
+      dirsOnly:document.getElementById('rt-dirs-only')
     };
     if (S.els.keys) S.els.keys.value=S.keys.join(',');
+    if (S.els.dirsOnly) {
+      S.els.dirsOnly.checked = S.dirsOnly;
+      S.els.dirsOnly.onchange = () => {
+        S.dirsOnly = !!S.els.dirsOnly.checked;
+        localStorage.setItem(LS_DIRS_ONLY, String(S.dirsOnly));
+        popup(`<b>Routing</b><br>Mode: ${S.dirsOnly ? 'Directions-only' : 'Directions + Snap (not active in this build)'}`);
+      };
+    }
 
     if (S.els.gen)   S.els.gen.onclick   = generateTrips;
     if (S.els.clr)   S.els.clr.onclick   = () => clearAll();
@@ -427,15 +385,17 @@
           const feat = gj?.features?.[0];
           const seg  = feat?.properties?.segments?.[0];
           const coords = feat?.geometry?.coordinates || [];
+          const steps  = seg?.steps || [];
 
           const distKm = seg?.distance ? seg.distance/1000
             : coords.reduce((a,_,j,arr)=> j? a + haversineMeters(arr[j-1],arr[j])/1000 : 0, 0);
           const km  = distKm.toFixed(1);
           const min = seg ? Math.round((seg.duration||0)/60) : '—';
 
-          const assignments = await buildMovements(coords, seg);
+          // Directions-only assignments (no Snap)
+          const assignments = buildMovementsFromDirections(coords, steps);
 
-          const stepsTxt = (seg?.steps||[]).map(s=>{
+          const stepsTxt = steps.map(s=>{
             const txt = String(s.instruction||'').replace(/<[^>]+>/g,'');
             const d = ((s.distance||0)/1000).toFixed(2);
             return `${txt} — ${d} km`;
@@ -451,7 +411,7 @@
                 <em>Street assignments</em>
                 <ul style="margin:6px 0 8px 18px; padding:0;">${preview || '<li><em>No named streets</em></li>'}</ul>
               </div>
-            </div>`, 5).openPopup();
+            </div>`, 5);
         } catch (e) {
           console.error(e);
           popup(`<b>Routing</b><br>Route failed for ${label}<br><small>${e.message}</small>`);
@@ -495,7 +455,7 @@
         </div>`;
     }).join('');
     w.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>Trip Report</title>${css}</head>
-    <body><h1>Trip Report — Street Assignments</h1>${cards}
+    <body><h1>Trip Report — Street Assignments (Directions-only)</h1>${cards}
     <script>window.onload=()=>window.print();</script></body></html>`);
     w.document.close();
   }
