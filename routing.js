@@ -465,3 +465,27 @@
   global.Routing = Routing;
   document.addEventListener('DOMContentLoaded', ()=>{ if (global.map) Routing.init(global.map); });
 })(window);
+
+// --- robust lazy bootstrap: ensure controls appear even if map is created later
+(function ensureRoutingBoot() {
+  // already initialized?
+  if (window.Routing && window.Routing.__booted) return;
+
+  // if map exists now, init immediately
+  if (window.map && typeof window.map.addControl === 'function') {
+    try { window.Routing.init(window.map); window.Routing.__booted = true; } catch (_) {}
+    return;
+  }
+
+  // otherwise, retry until the Leaflet map is ready
+  let tries = 0;
+  const timer = setInterval(() => {
+    if (window.map && typeof window.map.addControl === 'function') {
+      clearInterval(timer);
+      try { window.Routing.init(window.map); window.Routing.__booted = true; } catch (_) {}
+    } else if (++tries > 40) { // ~20s cap @ 500ms
+      clearInterval(timer);
+      // no-op: user may init manually with Routing.init(map)
+    }
+  }, 500);
+})();
