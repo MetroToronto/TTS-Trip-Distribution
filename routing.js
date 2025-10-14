@@ -1,9 +1,5 @@
-/* routing.js — Directions-only with robust highway extraction
-   - Uses ORS Directions v2 steps only (no Snap)
-   - Parses highway names from step.name OR instruction text
-   - Expands Pkwy/Expwy abbreviations; recognizes DVP, QEW, Gardiner
-   - Includes the first highway segment (merges ramp + first highway step)
-   - Stable NB/EB/SB/WB from the first ≤300 m of each row
+/* routing.js — Directions-only with robust highway extraction + hardened bootstrap
+   NOTE: In your script.js (right after creating the map), set:  window.map = map;
 */
 (function (global) {
   // ===== Tunables ===========================================================
@@ -363,6 +359,9 @@
       S.keys=arr; setIndex(0);
       popup('<b>Routing</b><br>Using keys from URL.');
     };
+
+    // expose state for fallback
+    global.Routing.__state = S;
   }
 
   async function generateTrips(){
@@ -461,31 +460,109 @@
   }
 
   // Public API + boot
-  const Routing = { init(map){ init(map); }, clear(){ clearAll(); }, setApiKeys(arr){ S.keys=Array.isArray(arr)?[...arr]:[]; saveKeys(S.keys); setIndex(0); } };
+  const Routing = {
+    init(map){ init(map); },
+    clear(){ clearAll(); },
+    setApiKeys(arr){ S.keys=Array.isArray(arr)?[...arr]:[]; saveKeys(S.keys); setIndex(0); },
+    getResults(){ return S.results; },
+
+    // expose internal actions for fallback panel
+    __generateTrips: generateTrips,
+    __printReport : printReport,
+    __state: S
+  };
   global.Routing = Routing;
+
   document.addEventListener('DOMContentLoaded', ()=>{ if (global.map) Routing.init(global.map); });
 })(window);
 
-// --- robust lazy bootstrap: ensure controls appear even if map is created later
+/* ---- HARDENED BOOTSTRAP (append stays at end) --------------------------- */
 (function ensureRoutingBoot() {
-  // already initialized?
-  if (window.Routing && window.Routing.__booted) return;
+  // safety CSS: ensure controls are on top
+  try {
+    const css = `
+      .leaflet-top.leaflet-left { z-index: 10000 !important; }
+      .routing-fallback { position:absolute; top:8px; left:8px; z-index:10001;
+        background:#fff; border:1px solid #ddd; border-radius:12px; padding:10px;
+        box-shadow:0 2px 8px rgba(0,0,0,0.08); font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,Arial;
+      }
+      .routing-fallback h4{ margin:0 0 6px; font-size:14px; }
+      .routing-fallback .row{ display:flex; gap:8px; flex-wrap:wrap; }
+      .routing-fallback button{ padding:6px 10px; border-radius:8px; border:1px solid #ccc; background:#f8f8f8; cursor:pointer; }
+      .routing-fallback button:disabled{ opacity:.5; cursor:not-allowed; }
+    `;
+    const style = document.createElement('style');
+    style.id = 'routing-boot-style';
+    style.textContent = css;
+    document.head.appendChild(style);
+  } catch {}
 
-  // if map exists now, init immediately
-  if (window.map && typeof window.map.addControl === 'function') {
-    try { window.Routing.init(window.map); window.Routing.__booted = true; } catch (_) {}
-    return;
+  function alreadyMounted() {
+    return !!(document.querySelector('.trip-card') && document.querySelector('.report-card'));
   }
 
-  // otherwise, retry until the Leaflet map is ready
-  let tries = 0;
-  const timer = setInterval(() => {
-    if (window.map && typeof window.map.addControl === 'function') {
-      clearInterval(timer);
-      try { window.Routing.init(window.map); window.Routing.__booted = true; } catch (_) {}
-    } else if (++tries > 40) { // ~20s cap @ 500ms
-      clearInterval(timer);
-      // no-op: user may init manually with Routing.init(map)
+  function mountFallbackPanel() {
+    const mapEl = document.querySelector('.leaflet-container') || document.getElementById('map');
+    if (!mapEl || document.getElementById('routing-fallback')) return;
+
+    const box = document.createElement('div');
+    box.id = 'routing-fallback';
+    box.className = 'routing-fallback';
+    box.innerHTML = `
+      <h4>Routing</h4>
+      <div class="row">
+        <button id="fb-gen">Generate Trips</button>
+        <button id="fb-clr">Clear</button>
+        <button id="fb-print" disabled>Print Report</button>
+      </div>
+    `;
+    if (!mapEl.style.position) mapEl.style.position = 'relative';
+    mapEl.appendChild(box);
+
+    const gen = document.getElementById('fb-gen');
+    const clr = document.getElementById('fb-clr');
+    const prn = document.getElementById('fb-print');
+
+    gen.onclick = () => {
+      const real = document.getElementById('rt-gen');
+      if (real) real.click();
+      else if (window.Routing && window.Routing.__generateTrips) window.Routing.__generateTrips();
+    };
+    clr.onclick = () => window.Routing && window.Routing.clear && window.Routing.clear();
+    prn.onclick = () => {
+      const real = document.getElementById('rt-print');
+      if (real) real.click();
+      else if (window.Routing && window.Routing.__printReport) window.Routing.__printReport();
+    };
+
+    // keep print enabled state in sync
+    setInterval(() => {
+      try {
+        const has = (window.Routing && window.Routing.getResults && window.Routing.getResults().length>0);
+        prn.disabled = !has;
+      } catch {}
+    }, 800);
+  }
+
+  function tryInit() {
+    if (window.Routing && window.Routing.__booted) return true;
+    if (window.map && typeof window.map.addControl === 'function' &&
+        window.Routing && typeof window.Routing.init === 'function') {
+      try { window.Routing.init(window.map); window.Routing.__booted = true; } catch (e) { console.error('Routing init error:', e); }
+      return true;
     }
-  }, 500);
+    return false;
+  }
+
+  if (!tryInit()) {
+    let tries = 0;
+    const timer = setInterval(() => {
+      if (tryInit() || ++tries > 40) {
+        clearInterval(timer);
+        setTimeout(() => { if (!alreadyMounted()) mountFallbackPanel(); }, 300);
+      }
+    }, 500);
+  } else {
+    setTimeout(() => { if (!alreadyMounted()) mountFallbackPanel(); }, 300);
+  }
 })();
