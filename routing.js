@@ -1,10 +1,11 @@
-/* routing.js — natural names, zero filtering, and a Debug Steps report */
+/* routing.js — natural names, debug-first; highlights long unnamed motorway-like steps */
 (function (global) {
   // ===== Tunables ===========================================================
-  const MIN_FRAGMENT_M      = 0;    // keep everything (even tiny ramps)
-  const BOUND_LOCK_WINDOW_M = 300;  // meters to stabilize heading labels
-  const SAMPLE_EVERY_M      = 50;   // resampling interval for heading
-  const PER_REQUEST_DELAY   = 80;   // ms between PD requests
+  const MIN_FRAGMENT_M        = 0;      // keep everything (even tiny ramps)
+  const LONG_UNNAMED_KM       = 5;      // >= 5 km unnamed + generic instruction -> placeholder
+  const BOUND_LOCK_WINDOW_M   = 300;    // meters to stabilize heading labels
+  const SAMPLE_EVERY_M        = 50;     // resampling interval for heading
+  const PER_REQUEST_DELAY     = 80;     // ms between PD requests
 
   const PROFILE    = 'driving-car';
   const PREFERENCE = 'fastest';
@@ -21,33 +22,25 @@
   const LS_ACTIVE_INDEX = 'ORS_ACTIVE_INDEX';
 
   // ===== State ==============================================================
-  const S = {
-    map: null,
-    group: null,
-    keys: [],
-    keyIndex: 0,
-    results: [], // { dest, route:{coords,steps} }
-  };
+  const S = { map:null, group:null, keys:[], keyIndex:0, results:[] };
 
-  // ===== Small helpers ======================================================
-  const byId   = (id) => document.getElementById(id);
-  const sleep  = (ms) => new Promise(r => setTimeout(r, ms));
+  // ===== Misc helpers =======================================================
+  const byId = (id) => document.getElementById(id);
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   const qParam = (k) => new URLSearchParams(location.search).get(k) || '';
   const toRad  = (d) => d * Math.PI / 180;
 
-  function isFiniteNum(n){ return Number.isFinite(n) && !Number.isNaN(n); }
-  function num(x){ const n = typeof x === 'string' ? parseFloat(x) : +x; return Number.isFinite(n) ? n : NaN; }
-  function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
+  const isFiniteNum = (n) => Number.isFinite(n) && !Number.isNaN(n);
+  const num = (x) => { const n = typeof x === 'string' ? parseFloat(x) : +x; return Number.isFinite(n) ? n : NaN; };
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
-  // Accepts anything-ish; returns [lon, lat] or throws with context
+  // Accepts anything-ish; returns [lon, lat] or throws
   function sanitizeLonLat(input){
     let arr = Array.isArray(input) ? input : [undefined, undefined];
-    let x = num(arr[0]);
-    let y = num(arr[1]);
+    let x = num(arr[0]), y = num(arr[1]);
     if (isFiniteNum(x) && isFiniteNum(y) && Math.abs(x) <= 90 && Math.abs(y) > 90){ const t = x; x = y; y = t; }
     if (!isFiniteNum(x) || !isFiniteNum(y)) throw new Error(`Invalid coordinate (NaN). Raw: ${JSON.stringify(input)}`);
-    x = clamp(x, -180, 180);
-    y = clamp(y,  -85,  85);
+    x = clamp(x, -180, 180); y = clamp(y, -85, 85);
     return [x, y];
   }
 
@@ -56,18 +49,18 @@
     const o = global.ROUTING_ORIGIN;
     if (!o) throw new Error('Origin not set');
     if (Array.isArray(o) && o.length >= 2) return sanitizeLonLat([o[0], o[1]]);
-    if (typeof o.getLatLng === 'function') { const ll = o.getLatLng(); return sanitizeLonLat([ll.lng, ll.lat]); }
+    if (typeof o.getLatLng === 'function'){ const ll = o.getLatLng(); return sanitizeLonLat([ll.lng, ll.lat]); }
     if (isFiniteNum(num(o.lng)) && isFiniteNum(num(o.lat))) return sanitizeLonLat([o.lng, o.lat]);
     if (o.latlng && isFiniteNum(num(o.latlng.lng)) && isFiniteNum(num(o.latlng.lat))) return sanitizeLonLat([o.latlng.lng, o.latlng.lat]);
-    if (o.center) {
+    if (o.center){
       if (Array.isArray(o.center) && o.center.length >= 2) return sanitizeLonLat([o.center[0], o.center[1]]);
       if (isFiniteNum(num(o.center.lng)) && isFiniteNum(num(o.center.lat))) return sanitizeLonLat([o.center.lng, o.center.lat]);
     }
     if (o.geometry && Array.isArray(o.geometry.coordinates) && o.geometry.coordinates.length >= 2)
       return sanitizeLonLat([o.geometry.coordinates[0], o.geometry.coordinates[1]]);
-    const x = o.lon ?? o.x; const y = o.lat ?? o.y;
+    const x = o.lon ?? o.x, y = o.lat ?? o.y;
     if (isFiniteNum(num(x)) && isFiniteNum(num(y))) return sanitizeLonLat([x, y]);
-    if (typeof o === 'string' && o.includes(',')) {
+    if (typeof o === 'string' && o.includes(',')){
       const [a,b] = o.split(',').map(s => s.trim());
       try { return sanitizeLonLat([a,b]); } catch {}
       return sanitizeLonLat([b,a]);
@@ -75,7 +68,7 @@
     throw new Error(`Origin shape unsupported: ${JSON.stringify(o)}`);
   }
 
-  // Normalize possible outputs from getSelectedPDTargets()
+  // Normalize outputs from getSelectedPDTargets()
   function normalizeTargets(rawList){
     const out = [], bad = [];
     (rawList || []).forEach((t, i) => {
@@ -89,7 +82,7 @@
     return { good: out, bad };
   }
 
-  // ===== Distances / bearings ==============================================
+  // ===== Distances / headings ==============================================
   function haversineMeters(a, b) {
     const R = 6371000;
     const [lon1, lat1] = a, [lon2, lat2] = b;
@@ -127,56 +120,58 @@
     return out;
   }
 
-  // ===== Minimal naming (no rewrites) ======================================
-  function cleanHtml(s) { return String(s || '').replace(/<[^>]*>/g, '').trim(); }
-  function normalizeName(raw) {
+  // ===== Name helpers =======================================================
+  function cleanHtml(s){ return String(s || '').replace(/<[^>]*>/g, '').trim(); }
+  function normalizeName(raw){
     if (!raw) return '';
     const s = String(raw).trim().replace(/\s+/g, ' ');
     if (!s || /^unnamed\b/i.test(s) || /^[-–]+$/.test(s)) return '';
     return s;
   }
 
-  // Keep ORS step.name raw; if missing, try to pull *any* token; else show full instruction.
-  function stepName(step) {
-    const field = normalizeName(step?.name || step?.road || '');
-    if (field) return field;
+  // Capture any obvious motorway token anywhere in the instruction.
+  const TOKEN_PATTERNS = [
+    /\b(?:ON[- ]?)?(?:HWY|Hwy|Highway)?[- ]?\d{2,3}\b(?:\s*[ENSW][BW]?)?/i, // ON-401 E, Hwy 404 N, 427 S
+    /\b(QEW|DVP|Gardiner(?:\s+Expressway)?|Don Valley Parkway|Allen Road|Black Creek Drive)\b/i
+  ];
 
-    const t = cleanHtml(step?.instruction || '');
-    if (!t) return '';
-
-    // Try to extract common motorway tokens WITHOUT rewriting (debug-friendly)
-    // Examples we want to surface as-is: "ON-401 E", "Hwy 404 N", "QEW", "DVP", "Gardiner Expressway"
-    const token =
-      t.match(/\b(?:ON[- ]?)?(?:HWY|Hwy|Highway)?[- ]?\d{2,3}\b(?:\s*[ENSW][BW]?)?/i) ||  // ON-401 E / Hwy 404 N / 427 S
-      t.match(/\b(QEW|DVP|Gardiner(?:\s+Expressway)?|Don Valley Parkway|Allen Road|Black Creek Drive)\b/i);
-    if (token) return normalizeName(token[0]);
-
-    // Fallback: show the whole instruction tail after 'onto/on/to/toward'
-    const m = t.match(/\b(?:onto|on|to|toward|towards)\s+([A-Za-z0-9 .,'\-\/&()]+)$/i);
-    if (m) return normalizeName(m[1]);
-
-    // Last resort: show the entire instruction so we can see what ORS said
-    return normalizeName(t);
+  function extractAnyToken(text){
+    for (const re of TOKEN_PATTERNS){
+      const m = text.match(re);
+      if (m) return normalizeName(m[0]);
+    }
+    return '';
   }
 
-  // ===== ORS keys & fetch with retry =======================================
-  function savedKeys() { try { return JSON.parse(localStorage.getItem(LS_KEYS) || '[]'); } catch { return []; } }
-  function saveKeys(arr) { localStorage.setItem(LS_KEYS, JSON.stringify(Array.isArray(arr) ? arr : [])); }
-  function getIndex() { return +(localStorage.getItem(LS_ACTIVE_INDEX) || 0) || 0; }
-  function setIndex(i) { localStorage.setItem(LS_ACTIVE_INDEX, String(i)); }
+  // Prefer ORS step.name; fallback to token; else show full instruction.
+  function stepName(step) {
+    const fromField = normalizeName(step?.name || step?.road || '');
+    if (fromField) return fromField;
 
-  function hydrateKeys() {
+    const instr = cleanHtml(step?.instruction || '');
+    if (!instr) return '';
+
+    const token = extractAnyToken(instr);
+    if (token) return token;
+
+    // Last resort: whole instruction (so we can see what ORS said)
+    return normalizeName(instr);
+  }
+
+  // ===== ORS calls ==========================================================
+  function savedKeys(){ try { return JSON.parse(localStorage.getItem(LS_KEYS) || '[]'); } catch { return []; } }
+  function hydrateKeys(){
     const urlKey = qParam('orsKey');
     const saved = savedKeys();
     const inline = [INLINE_DEFAULT_KEY];
     S.keys = (urlKey ? [urlKey] : []).concat(saved.length ? saved : inline);
-    S.keyIndex = Math.min(getIndex(), Math.max(0, S.keys.length - 1));
+    S.keyIndex = Math.min(+localStorage.getItem(LS_ACTIVE_INDEX) || 0, Math.max(0, S.keys.length - 1));
   }
   function currentKey(){ return S.keys[Math.min(Math.max(S.keyIndex,0), S.keys.length-1)] || ''; }
   function rotateKey(){
     if (S.keys.length <= 1) return false;
     S.keyIndex = (S.keyIndex + 1) % S.keys.length;
-    setIndex(S.keyIndex);
+    localStorage.setItem(LS_ACTIVE_INDEX, String(S.keyIndex));
     return true;
   }
 
@@ -188,7 +183,6 @@
       headers: { Authorization: currentKey(), ...(method !== 'GET' && { 'Content-Type':'application/json' }) },
       body: method === 'GET' ? undefined : JSON.stringify(body)
     });
-
     if ([401,403,429].includes(res.status) && rotateKey()){
       await sleep(150);
       return orsFetch(path, { method, body, query }, attempt + 1);
@@ -197,7 +191,6 @@
       await sleep(200);
       return orsFetch(path, { method, body, query }, attempt + 1);
     }
-
     if (!res.ok){
       const txt = await res.text().catch(()=>res.statusText);
       throw new Error(`ORS ${res.status}: ${txt}`);
@@ -205,7 +198,6 @@
     return res.json();
   }
 
-  // Try normal; if we get ORS 500/2099, attempt a one-time destination swap.
   async function getRoute(originLonLat, destLonLat) {
     let o = sanitizeLonLat(originLonLat);
     let d = sanitizeLonLat(destLonLat);
@@ -227,14 +219,13 @@
       const msg = String(e.message || '');
       const is2099 = msg.includes('ORS 500') && (msg.includes('"code":2099') || msg.includes('code:2099'));
       if (!is2099) throw e;
-
       const dSwap = sanitizeLonLat([d[1], d[0]]);
       const bodySwap = { ...baseBody, coordinates: [o, dSwap] };
       return await orsFetch(`/v2/directions/${PROFILE}/geojson`, { method: 'POST', body: bodySwap });
     }
   }
 
-  // ===== Movement list (no special casing) =================================
+  // ===== Movement builder ===================================================
   function sliceCoords(full, i0, i1){
     const s = Math.max(0, Math.min(i0, full.length - 1));
     const e = Math.max(0, Math.min(i1, full.length - 1));
@@ -263,13 +254,16 @@
   function buildMovementsFromDirections(coords, steps){
     if (!coords?.length || !steps?.length) return [];
     const rows = [];
-    const pushRow = (name, i0, i1, waypoints) => {
+
+    const pushRow = (name, i0, i1, waypoints, forceKeep=false) => {
       const nm = normalizeName(name);
       if (!nm) return;
       const seg = sliceCoords(coords, i0, i1);
       if (seg.length < 2) return;
+
       let meters = 0; for (let i = 1; i < seg.length; i++) meters += haversineMeters(seg[i-1], seg[i]);
-      if (meters < MIN_FRAGMENT_M) return; // currently zero → no drops
+      if (meters < MIN_FRAGMENT_M && !forceKeep) return;
+
       const dir = stableBoundForStep(coords, waypoints, BOUND_LOCK_WINDOW_M) || '';
       const last = rows[rows.length - 1];
       if (last && last.name === nm && last.dir === dir){
@@ -278,16 +272,35 @@
         rows.push({ dir, name: nm, km: +(meters / 1000).toFixed(2) });
       }
     };
-    for (const step of steps){
+
+    for (let idx = 0; idx < steps.length; idx++){
+      const step = steps[idx];
       const nm = stepName(step);
       const wp = step.way_points || step.wayPoints || step.waypoints || [0, 0];
       const [i0, i1] = wp;
+
+      // If the instruction is generic AND there is no token AND the step is very long,
+      // keep a visible placeholder so we know a major unnamed segment occurred.
+      const instr = cleanHtml(step?.instruction || '');
+      const token = extractAnyToken(instr);
+      const distKm = (step?.distance || 0) / 1000;
+
+      if (!token && (!step?.name || !step?.name.trim()) &&
+          /\b(keep (right|left)|continue|head (east|west|north|south))\b/i.test(instr) &&
+          distKm >= LONG_UNNAMED_KM) {
+
+        console.warn('[routing] Long unnamed generic step ~', distKm.toFixed(2), 'km; waypoints=', wp, 'instr=', instr);
+        pushRow('Unnamed motorway segment', i0, i1, [i0, i1], /*forceKeep*/true);
+        continue;
+      }
+
       pushRow(nm, i0, i1, [i0, i1]);
     }
+
     return rows; // no final filter
   }
 
-  // ===== Map drawing & orchestration =======================================
+  // ===== Map & orchestration ===============================================
   function clearAll(){
     S.results = [];
     if (S.group) S.group.clearLayers();
@@ -352,7 +365,6 @@
 
   function printReport(){
     if (!S.results.length) { alert('No trips generated yet.'); return; }
-
     const rowsHtml = S.results.map((r) => {
       const mov = buildMovementsFromDirections(r.route.coords, r.route.steps);
       const lines = mov.map(m => `<tr><td>${m.dir || ''}</td><td>${m.name}</td><td style="text-align:right">${km2(m.km)}</td></tr>`).join('');
@@ -365,7 +377,6 @@
           </table>
         </div>`;
     }).join('');
-
     const css = `
       <style>
         body{font:14px/1.45 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;}
@@ -382,7 +393,7 @@
     w.document.close();
   }
 
-  // NEW: Debug steps report (raw view for screenshots)
+  // Debug: raw steps view
   function printDebugSteps(){
     if (!S.results.length) { alert('No trips generated yet.'); return; }
 
