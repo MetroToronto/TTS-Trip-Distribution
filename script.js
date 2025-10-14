@@ -1,4 +1,4 @@
-// ===================== Map boot =====================
+// ===================== Map boot ===================== 
 const map = L.map('map').setView([43.6532, -79.3832], 11);
 window.map = map; // expose for routing.js
 
