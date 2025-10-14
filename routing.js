@@ -478,3 +478,40 @@
   // Auto-init if the map already exists
   document.addEventListener('DOMContentLoaded', ()=>{ if (global.map) Routing.init(global.map); });
 })(window);
+
+// --- CLICK FALLBACK + PUBLIC HOOKS (append at end of routing.js) ---
+(function () {
+  if (!window.Routing) return;
+
+  // expose internals so we can call them from delegated clicks
+  if (typeof window.Routing.__generateTrips !== 'function' && typeof generateTrips === 'function') {
+    window.Routing.__generateTrips = generateTrips;
+  }
+  if (typeof window.Routing.__printReport !== 'function' && typeof printReport === 'function') {
+    window.Routing.__printReport = printReport;
+  }
+  if (typeof window.Routing.clear === 'function') {
+    // already public in most builds
+  }
+
+  // delegate clicks so they always trigger, even if controls mount later
+  document.addEventListener('click', (ev) => {
+    const id = ev.target && ev.target.id;
+    if (!id) return;
+    if (id === 'rt-gen')    { ev.preventDefault(); window.Routing.__generateTrips && window.Routing.__generateTrips(); }
+    if (id === 'rt-print')  { ev.preventDefault(); window.Routing.__printReport && window.Routing.__printReport(); }
+    if (id === 'rt-clr')    { ev.preventDefault(); window.Routing.clear && window.Routing.clear(); }
+  });
+
+  // ensure Leaflet controls mount even if map was created after routing.js loaded
+  function tryInit() {
+    if (window.map && typeof window.Routing.init === 'function') {
+      try { window.Routing.init(window.map); return true; } catch (e) { console.error(e); }
+    }
+    return false;
+  }
+  if (!tryInit()) {
+    let tries = 0;
+    const t = setInterval(() => { if (tryInit() || ++tries > 40) clearInterval(t); }, 500); // ~20s
+  }
+})();
