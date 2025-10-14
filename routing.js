@@ -1,19 +1,27 @@
-/* routing.js — ORS Directions + Snap v2 (street movements, no extra calls at print)
- * Goals:
- *  - Snap-only naming (no Overpass/centerlines)
- *  - Collapse near-immediate zig-zags (no duplicate rows for tiny detours)
- *  - Average initial heading for each street (stable NB/EB/SB/WB on curves)
- *  - Normalize highway variants (401 Express/Collector -> Highway 401)
- *  - Repeats ALLOWED when truly later/farther in the trip
+/* routing.js — ORS Directions + Snap v2 (street movements)
+ * Focus:
+ *  • Snap-only naming (no Overpass / no centerlines)
+ *  • Highway-401 (and similar) normalization (handles ref-only, Express/Collector, ON-401, etc.)
+ *  • Rows collapse small zig-zags (rejoin window)
+ *  • Direction (NB/EB/SB/WB) is the AVERAGE HEADING over the FIRST N METERS of that street’s appearance
+ *  • End-of-trip name repair so last segments aren’t unnamed
+ *
+ * Tunables:
+ *  - SWITCH_CONFIRM_M: how long a “new street” must persist before switching
+ *  - REJOIN_WINDOW_M: if we leave a street then return within this distance, merge (avoid duplicate rows)
+ *  - BOUND_LOCK_WINDOW_M: meters to average for the FIRST PART of a street to lock the bound
+ *  - SAMPLE_EVERY_M: sampling interval for Snap
+ *  - MIN_FRAGMENT_M: drop tiny slivers
  */
+
 (function (global) {
   // ===== Tunables =====
-  const SWITCH_CONFIRM_M   = 180;  // must stay on a new street at least this to switch
-  const REJOIN_WINDOW_M    = 450;  // if we return to the SAME street within this, merge back (no extra row)
-  const MIN_FRAGMENT_M     = 60;   // drop tiny slivers
-  const SAMPLE_EVERY_M     = 50;   // sampling along polyline
-  const SNAP_BATCH_SIZE    = 200;  // Snap /road batch
-  const BOUND_AVG_WINDOW_M = 200;  // average heading for the first bound of a street
+  const SWITCH_CONFIRM_M    = 180;
+  const REJOIN_WINDOW_M     = 450;
+  const BOUND_LOCK_WINDOW_M = 250; // << lock NB/EB/SB/WB using ONLY the first 250 m on a new street
+  const SAMPLE_EVERY_M      = 50;
+  const SNAP_BATCH_SIZE     = 200;
+  const MIN_FRAGMENT_M      = 60;
 
   const PROFILE    = 'driving-car';
   const PREFERENCE = 'fastest';
@@ -22,7 +30,7 @@
   const COLOR_FIRST  = '#0b3aa5';
   const COLOR_OTHERS = '#2166f3';
 
-  // Inline fallback + key mgmt (URL ?orsKey=..., localStorage, fallback)
+  // Inline fallback + key mgmt
   const INLINE_DEFAULT_KEY =
     'eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6Ijk5NWI5MTE5OTM2YTRmYjNhNDRiZTZjNDRjODhhNTRhIiwiaCI6Im11cm11cjY0In0=';
   const LS_KEYS = 'ORS_KEYS';
@@ -39,9 +47,8 @@
   };
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-  // ===== Utils =====
+  // ===== Math / utils =====
   const toRad = d => d*Math.PI/180;
-  const toDeg = r => r*180/Math.PI;
   function haversineMeters(a,b){
     const R=6371000;
     const [lng1,lat1]=a, [lng2,lat2]=b;
@@ -49,6 +56,14 @@
     const s=Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLng/2)**2;
     return 2*R*Math.asin(Math.sqrt(s));
   }
+  function bearingDeg(a,b){
+    const [lng1,lat1]=[toRad(a[0]),toRad(a[1])], [lng2,lat2]=[toRad(b[0]),toRad(b[1])];
+    const y=Math.sin(lng2-lng1)*Math.cos(lat2);
+    const x=Math.cos(lat1)*Math.sin(lat2)-Math.sin(lat1)*Math.cos(lat2)*Math.cos(lng2-lng1);
+    return (Math.atan2(y,x)*180/Math.PI+360)%360;
+  }
+  function cardinal4(deg){ if (deg>=315||deg<45) return "NB"; if (deg<135) return "EB"; if (deg<225) return "SB"; return "WB"; }
+
   function sampleLine(coords, stepM){
     if (!coords || coords.length<2) return coords||[];
     const pts=[coords[0]]; let acc=0;
@@ -59,14 +74,9 @@
     if (pts[pts.length-1]!==coords[coords.length-1]) pts.push(coords[coords.length-1]);
     return pts;
   }
-  function bearingDeg(a,b){
-    const [lng1,lat1]=[toRad(a[0]),toRad(a[1])], [lng2,lat2]=[toRad(b[0]),toRad(b[1])];
-    const y=Math.sin(lng2-lng1)*Math.cos(lat2);
-    const x=Math.cos(lat1)*Math.sin(lat2)-Math.sin(lat1)*Math.cos(lat2)*Math.cos(lng2-lng1);
-    return (toDeg(Math.atan2(y,x))+360)%360;
-  }
-  function cardinal4(deg){ if (deg>=315||deg<45) return "NB"; if (deg<135) return "EB"; if (deg<225) return "SB"; return "WB"; }
-  function avgHeading(sampled, iStart, windowM) {
+
+  // Average heading from index i forward, over at most windowM meters
+  function avgHeadingFrom(sampled, iStart, windowM) {
     let vx = 0, vy = 0, acc = 0;
     for (let i=iStart; i<sampled.length-1 && acc < windowM; i++) {
       const a = sampled[i], b = sampled[i+1];
@@ -76,32 +86,65 @@
       vy += Math.sin(br) * d;
       acc += d;
     }
-    if (vx === 0 && vy === 0) return cardinal4(bearingDeg(sampled[iStart], sampled[Math.min(sampled.length-1, iStart+1)]));
+    if (vx === 0 && vy === 0) {
+      const j = Math.min(sampled.length-1, iStart+1);
+      return cardinal4(bearingDeg(sampled[iStart], sampled[j]));
+    }
     const deg = (Math.atan2(vy, vx) * 180/Math.PI + 360) % 360;
     return cardinal4(deg);
   }
 
-  // Name normalization to collapse obvious variants
+  // ===== Name normalization / extraction (Snap) =====
   function normalizeName(raw){
     if (!raw) return '';
     let s = String(raw).trim();
-    // Common highway variants → canonical
-    s = s.replace(/\b(?:Hwy|HWY|highway)\s*401(?:\s*(?:collector|express))?\b/ig, 'Highway 401');
-    s = s.replace(/\b(?:Hwy|HWY|highway)\s*404(?:\s*(?:collector|express))?\b/ig, 'Highway 404');
-    s = s.replace(/\b(?:Hwy|HWY|highway)\s*400(?:\s*(?:collector|express))?\b/ig, 'Highway 400');
+
+    // Canonicalize Ontario 400-series variants → “Highway NNN”
+    s = s.replace(/\b(?:ON|Ontario)?\s*[-–]?\s*(?:Hwy|HWY|Highway|RTE|Route)?\s*401\b.*?/ig, 'Highway 401');
+    s = s.replace(/\b(?:ON|Ontario)?\s*[-–]?\s*(?:Hwy|HWY|Highway|RTE|Route)?\s*400\b.*?/ig, 'Highway 400');
+    s = s.replace(/\b(?:ON|Ontario)?\s*[-–]?\s*(?:Hwy|HWY|Highway|RTE|Route)?\s*404\b.*?/ig, 'Highway 404');
+    s = s.replace(/\b(?:ON|Ontario)?\s*[-–]?\s*(?:Hwy|HWY|Highway|RTE|Route)?\s*427\b.*?/ig, 'Highway 427');
+    s = s.replace(/\b(?:ON|Ontario)?\s*[-–]?\s*(?:Hwy|HWY|Highway|RTE|Route)?\s*409\b.*?/ig, 'Highway 409');
+
     // Abbrev expansions
     s = s.replace(/\b(st)\b\.?/ig,'Street')
          .replace(/\b(rd)\b\.?/ig,'Road')
          .replace(/\b(ave)\b\.?/ig,'Avenue');
+
+    // Remove ramp-only noise like “Ramp to …”/“Collector/Express” suffixes already collapsed above
+    s = s.replace(/\b(?:Onramp|Offramp|Ramp)\b.*$/i,'');
+
     return s.replace(/\s+/g,' ').trim();
   }
+
   function pickFromSnapProps(props={}){
-    const k = ['name','street','road','way_name','label','ref','display_name','name:en'];
-    for (const key of k){ if (props[key]) return normalizeName(props[key]); }
-    const tags=props.tags||props.properties||{};
-    for (const key of k){ if (tags[key]) return normalizeName(tags[key]); }
+    // Try typical flat props first
+    const k1 = ['name','street','road','way_name','label','display_name','name:en'];
+    for (const k of k1) if (props[k]) return normalizeName(props[k]);
+    // If only a ref is present (common for highways)
     if (props.ref) return normalizeName(`Highway ${props.ref}`);
+    // Nested variants
+    const tags = props.tags || props.properties || {};
+    const k2 = ['name','street','road','way_name','label','display_name','name:en'];
+    for (const k of k2) if (tags[k]) return normalizeName(tags[k]);
+    if (tags.ref) return normalizeName(`Highway ${tags.ref}`);
     return '';
+  }
+
+  // Minor majority/repair so tails don’t go unnamed
+  function repairNames(seq) {
+    const out = seq.slice();
+    // forward fill one step if missing
+    for (let i=0;i<out.length;i++){
+      if (!out[i] || out[i]==='(unnamed)') {
+        if (i>0 && out[i-1] && out[i-1] !== '(unnamed)') out[i] = out[i-1];
+      }
+    }
+    // backward fill last stretch if still missing
+    for (let i=out.length-2;i>=0;i--){
+      if ((!out[i] || out[i]==='(unnamed)') && out[i+1] && out[i+1] !== '(unnamed)') out[i] = out[i+1];
+    }
+    return out;
   }
 
   // ===== Keys =====
@@ -129,7 +172,7 @@
     else alert(html.replace(/<[^>]+>/g, ''));
   };
 
-  // ===== ORS fetch =====
+  // ===== ORS =====
   async function orsFetch(path, { method = 'GET', body, query } = {}) {
     const url = new URL(ORS_BASE + path);
     if (query) Object.entries(query).forEach(([k,v]) => url.searchParams.set(k, v));
@@ -163,22 +206,22 @@
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Authorization': currentKey(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ points, locations: points }) // send both to be tenant-proof
+      body: JSON.stringify({ points, locations: points })
     });
     if ([401,403,429].includes(res.status) && rotateKey()) return snapRoad(points);
-    if (!res.ok) return []; // treat as "no info" rather than failing
+    if (!res.ok) return []; // treat as "no info"
     const json = await res.json();
     return Array.isArray(json?.features) ? json.features : [];
   }
 
-  // ===== Movements builder (Snap-only naming) =====
+  // ===== Movements (Snap-only naming + bound lock on first N meters) =====
   async function buildMovements(coords, segForFallback) {
     const sampled = sampleLine(coords, SAMPLE_EVERY_M);
     if (sampled.length < 2) return [];
 
-    // 1) Snap names at samples
+    // Snap names at samples
     let snapFeatures = [];
-    try { 
+    try {
       for (let i=0;i<sampled.length;i+=SNAP_BATCH_SIZE){
         const chunk = sampled.slice(i, i+SNAP_BATCH_SIZE);
         const feats = await snapRoad(chunk);
@@ -188,8 +231,9 @@
       }
     } catch { snapFeatures = []; }
 
-    const snapNames = snapFeatures.map(f => pickFromSnapProps(f?.properties || {}));
-    // last-resort fallback to ORS steps (only for unnamed points)
+    // Extract + normalize names
+    let snapNames = snapFeatures.map(f => pickFromSnapProps(f?.properties || {}));
+    // As a last resort, use ORS steps only for unnamed samples (helps at trip tail)
     const steps = segForFallback?.steps || [];
     const fallbackName = (i) => {
       if (!steps.length) return '';
@@ -198,88 +242,89 @@
       const raw = (st?.name || String(st?.instruction||'').replace(/<[^>]*>/g,'')).trim();
       return normalizeName(raw);
     };
+    snapNames = snapNames.map((n,i) => n || fallbackName(i) || '(unnamed)');
 
-    const nameAt = (i) => {
-      return normalizeName(snapNames[i]) || fallbackName(i) || '(unnamed)';
-    };
+    // Repair end / small gaps to avoid unnamed tails
+    snapNames = repairNames(snapNames);
 
-    // 2) Build rows with switch-confirm & rejoin-window logic
+    // State machine with:
+    //  • switch-confirm,
+    //  • rejoin-window (merge tiny detours),
+    //  • bound lock based on FIRST BOUND_LOCK_WINDOW_M meters on a new street
     const rows = [];
+    let curName = snapNames[0];
+    let curDist = 0;
+    let curBound = avgHeadingFrom(sampled, 0, BOUND_LOCK_WINDOW_M);
 
-    // current appearance
-    let curName = nameAt(0);
-    let curBound = avgHeading(sampled, 0, BOUND_AVG_WINDOW_M);
-    let curDist  = 0;
-
-    // pending switch candidate
     let pendName = null;
     let pendDist = 0;
 
-    // hold previous while we see if we rejoin it quickly
-    let holdPrev = null;            // {name,bound,dist}
-    let distOnNewSinceConfirm = 0;  // distance traveled on new street since confirm
+    let holdPrev = null;           // { name, bound, dist }
+    let distOnNewSinceConfirm = 0; // meters since confirming switch
 
     for (let i=0;i<sampled.length-1;i++){
       const segDist = haversineMeters(sampled[i], sampled[i+1]);
       if (segDist <= 0) continue;
 
-      const observedName = nameAt(i);
+      const observedName = snapNames[i];
 
-      // If we confirmed a switch previously, see if we rejoin the old street within REJOIN_WINDOW_M
+      // If we confirmed a switch earlier, check for quick rejoin
       if (holdPrev) {
         distOnNewSinceConfirm += segDist;
         if (observedName === holdPrev.name && distOnNewSinceConfirm < REJOIN_WINDOW_M) {
-          // Merge back: cancel switch; continue previous segment as if detour never happened
+          // merge back: cancel switch; continue previous
           curName = holdPrev.name;
-          curBound = holdPrev.bound;      // keep original bound
+          curBound = holdPrev.bound;
           curDist  = holdPrev.dist + segDist;
           holdPrev = null;
           pendName = null; pendDist = 0;
           continue;
         }
         if (distOnNewSinceConfirm >= REJOIN_WINDOW_M) {
-          // Rejoin window passed: finalize the previous row now
+          // finalize previous
           if (holdPrev.dist >= MIN_FRAGMENT_M)
             rows.push({ dir: holdPrev.bound, name: holdPrev.name, km: +(holdPrev.dist/1000).toFixed(2) });
-          holdPrev = null; // now we are firmly on the new street
+          holdPrev = null;
         }
       }
 
-      // still on the same named street
+      // still on same street
       if (observedName === curName) {
         curDist += segDist;
         pendName = null; pendDist = 0;
         continue;
       }
 
-      // considering a new street
+      // consider switching
       if (pendName === observedName) {
         pendDist += segDist;
         if (pendDist >= SWITCH_CONFIRM_M) {
-          // confirm switch: average an initial bound for the new street
+          // confirm: lock bound from the FIRST N meters of this new appearance
           const backSamples = Math.max(0, Math.ceil(pendDist / SAMPLE_EVERY_M));
-          const startIdx = Math.max(0, i - backSamples);
-          const newBound = avgHeading(sampled, startIdx, BOUND_AVG_WINDOW_M);
-          // put current segment on hold until we know we won't rejoin quickly
+          const switchIdxStart = Math.max(0, i - backSamples);
+          const newBound = avgHeadingFrom(sampled, switchIdxStart, BOUND_LOCK_WINDOW_M);
+
+          // put current on hold until rejoin window passes
           holdPrev = { name: curName, bound: curBound, dist: curDist };
           distOnNewSinceConfirm = 0;
-          // start the new current
+
+          // start new current
           curName = pendName;
-          curBound = newBound;
+          curBound = newBound;   // << lock using first N meters
           curDist  = pendDist;
           pendName = null; pendDist = 0;
         }
       } else {
-        // new candidate replaces old candidate
+        // new candidate
         pendName = observedName;
         pendDist = segDist;
       }
     }
 
-    // finalize after loop
+    // finalize at end
     if (holdPrev) {
       if (distOnNewSinceConfirm < REJOIN_WINDOW_M) {
-        curName = holdPrev.name;
+        curName  = holdPrev.name;
         curBound = holdPrev.bound;
         curDist += holdPrev.dist;
       } else {
@@ -505,6 +550,5 @@
   };
   global.Routing = Routing;
 
-  // Boot if map is ready
   document.addEventListener('DOMContentLoaded', () => { if (global.map) Routing.init(global.map); });
 })(window);
