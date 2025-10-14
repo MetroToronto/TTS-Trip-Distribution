@@ -202,147 +202,144 @@
   }
 
   // ===== Movement builder ===================================================
-  async function buildMovements(coords, seg) {
-    const sampled = sampleLine(coords, SAMPLE_EVERY_M);
-    if (sampled.length < 2) return [];
+ async function buildMovements(coords, seg) {
+  const sampled = sampleLine(coords, SAMPLE_EVERY_M);
+  if (sampled.length < 2) return [];
 
-    const steps = seg?.steps || [];
-    const stepNameAt = (i) => {
-      if (!steps.length) return '';
-      const idx = Math.floor((i / (sampled.length-1)) * steps.length);
-      const st  = steps[Math.max(0, Math.min(steps.length-1, idx))];
-      const raw = (st?.name || String(st?.instruction||'').replace(/<[^>]*>/g,'')).trim();
-      return normalizeName(raw);
-    };
+  const steps = seg?.steps ?? [];
+  const stepNameAt = (i) => {
+    if (!steps.length) return '';
+    const idx = Math.floor((i / (sampled.length - 1)) * steps.length);
+    const st = steps[Math.max(0, Math.min(steps.length - 1, idx))];
+    const raw = (st?.name ?? String(st?.instruction ?? '')).replace(/<[^>]*>/g, '').trim();
+    return normalizeName(raw);
+  };
 
-    // Snap fallback (batched)
-    let snapFeats = [];
-    try {
-      for (let i=0;i<sampled.length;i+=SNAP_BATCH_SIZE){
-        const chunk = sampled.slice(i, i+SNAP_BATCH_SIZE);
-        const got = await snapRoad(chunk);
-        if (got.length < chunk.length) for (let k=got.length;k<chunk.length;k++) got.push({});
-        else if (got.length > chunk.length) got.length = chunk.length;
-        snapFeats.push(...got);
+  // Snap fallback (batched)
+  let snapFeats = [];
+  try {
+    for (let i = 0; i < sampled.length; i += SNAP_BATCH_SIZE) {
+      const chunk = sampled.slice(i, i + SNAP_BATCH_SIZE);
+      const got = await snapRoad(chunk);
+      if (got.length < chunk.length) {
+        for (let k = got.length; k < chunk.length; k++) got.push({});
+      } else if (got.length > chunk.length) {
+        got.length = chunk.length;
       }
-    } catch { snapFeats = []; }
+      snapFeats.push(...got);
+    }
+  } catch {
+    snapFeats = [];
+  }
 
-    const snapNameAt = (i) => pickFromSnapProps(snapFeats[i]?.properties || {});
-    const snapIsHwy  = (i) => isHighwayByProps(snapFeats[i]?.properties || {});
-    const snapRefAt  = (i) => {
-      const p = snapFeats[i]?.properties || {};
-      return p.ref || p?.tags?.ref || p?.properties?.ref || '';
-    };
+  const snapNameAt = (i) => pickFromSnapProps(snapFeats[i]?.properties ?? {});
+  const snapIsHwy = (i) => isHighwayByProps(snapFeats[i]?.properties ?? {});
+  const snapRefAt = (i) => snapRef(snapFeats[i]?.properties ?? {});
 
-    // per-sample chosen name + highway flag
-    const names = [];
-    const isHwy = [];
-    for (let i=0;i<sampled.length-1;i++){
-      const stepNm = stepNameAt(i);
-      if (stepNm) {
-        names[i] = stepNm;
-        isHwy[i]  = isHighwayName(stepNm) || snapIsHwy(i);
+  const names = [];
+  const isHwy = [];
+
+  for (let i = 0; i < sampled.length - 1; i++) {
+    const stepNm = stepNameAt(i);
+    if (stepNm) {
+      names[i] = stepNm;
+      isHwy[i] = isHighwayName(stepNm) || snapIsHwy(i);
+      continue;
+    }
+
+    const nm = snapNameAt(i);
+    if (nm) {
+      names[i] = nm;
+    } else if (snapIsHwy(i)) {
+      const r = snapRefAt(i);
+      names[i] = r ? `Highway ${r}` : 'Highway';
+    } else {
+      names[i] = '';
+    }
+
+    isHwy[i] = snapIsHwy(i) || isHighwayName(names[i]);
+  }
+
+  names[names.length - 1] = names[names.length - 2] ?? '';
+  isHwy[isHwy.length - 1] = isHwy[isHwy.length - 2] ?? false;
+
+  const distBetween = (i) => haversineMeters(sampled[i], sampled[i + 1]);
+
+  const firstHwyIdx = isHwy.findIndex(Boolean);
+  const lastIdx = (firstHwyIdx > -1 ? firstHwyIdx : sampled.length - 1);
+
+  const rowsIdx = [];
+  let curName = names[0] ?? '(unnamed)';
+  let startIdx = 0;
+  let pendName = null;
+  let pendDist = 0;
+  let holdPrev = null;
+  let distOnNew = 0;
+
+  for (let i = 0; i < lastIdx; i++) {
+    const d = distBetween(i);
+    const observed = names[i] ?? curName;
+
+    if (holdPrev) {
+      distOnNew += d;
+      if (observed === holdPrev.name && distOnNew < REJOIN_WINDOW_M) {
+        curName = holdPrev.name;
+        startIdx = holdPrev.i0;
+        holdPrev = null;
+        pendName = null;
+        pendDist = 0;
         continue;
       }
-      const nm = snapNameAt(i);
-      if (nm) {
-        names[i] = nm;
-      } else if (snapIsHwy(i)) {
-        const r = snapRefAt(i);
-        names[i] = r ? `Highway ${r}` : 'Highway';  // synthesize name on highway
-      } else {
-        names[i] = '';
+      if (distOnNew >= REJOIN_WINDOW_M) {
+        rowsIdx.push({ name: holdPrev.name, i0: holdPrev.i0, i1: i });
+        holdPrev = null;
       }
-      isHwy[i] = snapIsHwy(i) || isHighwayName(names[i]);
-    }
-    names[names.length-1] = names[names.length-2] || '';
-    isHwy[isHwy.length-1] = isHwy[isHwy.length-2] || false;
-
-    const distBetween = (i) => haversineMeters(sampled[i], sampled[i+1]);
-
-    // Find first highway sample → cutoff point
-    const firstHwyIdx = isHwy.findIndex(Boolean);
-    const lastIdx = (firstHwyIdx > -1 ? firstHwyIdx : sampled.length-1);
-
-    // --- (FIXED) Build row index ranges with more precise switch logic ---
-    const rowsIdx = [];
-    let curName = names[0] || '(unnamed)';
-    let startIdx = 0;
-    let pendName = null;
-    let pendDist = 0;
-    let pendStartIdx = -1; // Index where the pending switch *started*
-
-    for (let i = 0; i < lastIdx; i++) {
-        const d = distBetween(i);
-        const observed = names[i] || curName;
-
-        if (observed === curName) {
-            // Name is stable, so reset any pending switch
-            pendName = null;
-            pendDist = 0;
-            pendStartIdx = -1;
-            continue;
-        }
-
-        // A different name is observed
-        if (pendName === observed) {
-            // This name is still pending, accumulate distance
-            pendDist += d;
-        } else {
-            // This is a new potential street name
-            pendName = observed;
-            pendDist = d;
-            pendStartIdx = i; // CRITICAL: Remember where this new segment began
-        }
-
-        if (pendName && pendDist >= SWITCH_CONFIRM_M) {
-            // The switch is now confirmed!
-            // 1. Close out the *previous* street's row. It ends right *before* the new one started.
-            if (pendStartIdx > startIdx) {
-                rowsIdx.push({ name: curName, i0: startIdx, i1: pendStartIdx });
-            }
-
-            // 2. The new street is now the current one. It starts from where it was first observed.
-            curName = pendName;
-            startIdx = pendStartIdx;
-
-            // 3. Reset the pending state
-            pendName = null;
-            pendDist = 0;
-            pendStartIdx = -1;
-        }
-    }
-    // Push the final local street row
-    if (lastIdx > startIdx) {
-        rowsIdx.push({ name: curName, i0: startIdx, i1: lastIdx });
     }
 
-    // If a highway was detected, add one final, clean row for it.
-    if (firstHwyIdx > -1) {
-        const hwySampleIndex = Math.min(firstHwyIdx, names.length - 1);
-        const ref = snapRefAt(hwySampleIndex);
-        const nameFromList = normalizeName(names[hwySampleIndex] || '');
-        const hwyName = isHighwayName(nameFromList) && nameFromList ? nameFromList : (ref ? `Highway ${ref}` : 'Highway');
-        rowsIdx.push({ name: hwyName, i0: firstHwyIdx, i1: sampled.length - 1, isHighway: true });
+    if (observed === curName || !observed) continue;
+
+    if (pendName === observed) {
+      pendDist += d;
+      if (pendDist >= SWITCH_CONFIRM_M) {
+        rowsIdx.push({ name: curName, i0: startIdx, i1: i });
+        holdPrev = { name: curName, i0: startIdx };
+        distOnNew = 0;
+        curName = pendName;
+        startIdx = Math.max(0, i - Math.ceil(pendDist / SAMPLE_EVERY_M));
+        pendName = null;
+        pendDist = 0;
+      }
+    } else {
+      pendName = observed;
+      pendDist = d;
     }
-
-    // Convert indices to final rows with distance and bound
-    const rows = [];
-    for (const r of rowsIdx) {
-      let meters = 0;
-      for (let i=r.i0; i<r.i1 && i<sampled.length-1; i++) meters += distBetween(i);
-      if (meters < MIN_FRAGMENT_M) continue;
-
-      // ✅ Bound from the first part of THIS row (now using clean geometry)
-      const dir = avgHeadingBetween(sampled, r.i0, r.i1, BOUND_LOCK_WINDOW_M);
-      const nm  = normalizeName(r.name);
-      if (!nm || nm==='(unnamed)') continue;
-
-      rows.push({ dir, name: nm, km: +(meters/1000).toFixed(2) });
-      if (r.isHighway) break; // stop after first highway row
-    }
-    return rows;
   }
+
+  rowsIdx.push({ name: curName, i0: startIdx, i1: lastIdx });
+
+  if (firstHwyIdx > -1) {
+    const r = snapRefAt(firstHwyIdx);
+    const hwyName = isHighwayName(names[firstHwyIdx]) ? names[firstHwyIdx] : (r ? `Highway ${r}` : 'Highway');
+    rowsIdx.push({ name: hwyName, i0: firstHwyIdx, i1: sampled.length - 1, isHighway: true });
+  }
+
+  const rows = [];
+  for (const r of rowsIdx) {
+    let meters = 0;
+    for (let i = r.i0; i < r.i1; i++) meters += distBetween(i);
+    if (meters < MIN_FRAGMENT_M) continue;
+
+    // ✅ Use only the first segment for direction
+    const dir = cardinal4(bearingDeg(sampled[r.i0], sampled[r.i0 + 1]));
+    const nm = normalizeName(r.name);
+    if (!nm || nm === '(unnamed)') continue;
+
+    rows.push({ dir, name: nm, km: +(meters / 1000).toFixed(2) });
+    if (r.isHighway) break;
+  }
+
+  return rows;
+}
 
   // ===== Drawing & Controls ================================================
   function drawRoute(geojson, color){ ensureGroup(); const line=L.geoJSON(geojson,{style:{color,weight:5,opacity:0.9}}); S.group.addLayer(line); return line;
