@@ -1,25 +1,25 @@
-/* routing.js — lean build (Directions-only, simplified naming, keep highways)
-   - One ORS Directions request per PD
-   - No Snap v2, no extra_info, no auto-init
-   - Minimal normalizeName() (no aggressive rewrites)
-   - Permissive isHighwayName() (Hwy/ON-401/Expressway/Parkway/DVP/QEW/Gardiner)
-   - Highways are NEVER dropped by the min-length filter
-   - Stable NB/EB/SB/WB from geometry
+/* routing.js — Directions-only (no Snap v2), highway ref parser
+   - Street list from ORS steps only
+   - Parses highway names from instructions when step.name is "-" or blank
+   - Stable NB/EB/SB/WB per contiguous street segment
+   - Highway cutoff on first highway segment (Highway 401 / QEW / DVP / Gardiner …)
+   - One Directions request per PD; Print uses cached results
 */
 (function (global) {
   // ===== Tunables ===========================================================
+  const SWITCH_CONFIRM_M    = 200;
+  const REJOIN_WINDOW_M     = 600;
+  const MIN_FRAGMENT_M      = 60;
+  const BOUND_LOCK_WINDOW_M = 300;
+  const SAMPLE_EVERY_M      = 50;
+
   const PROFILE    = 'driving-car';
   const PREFERENCE = 'fastest';
   const ORS_BASE   = 'https://api.openrouteservice.org';
 
-  const MIN_FRAGMENT_M      = 60;   // drop tiny non-highway rows
-  const BOUND_LOCK_WINDOW_M = 300;  // meters used to compute a row's bound
-  const SAMPLE_EVERY_M      = 50;   // sampling spacing for heading calc
-
   const COLOR_FIRST  = '#0b3aa5';
   const COLOR_OTHERS = '#2166f3';
 
-  // Inline fallback key + localStorage slots
   const INLINE_DEFAULT_KEY =
     'eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6Ijk5NWI5MTE5OTM2YTRmYjNhNDRiZTZjNDRjODhhNTRhIiwiaCI6Im11cm11cjY0In0=';
   const LS_KEYS = 'ORS_KEYS';
@@ -38,7 +38,6 @@
     return 2*R*Math.asin(Math.sqrt(s));
   }
   function bearingDeg(a,b){
-    // Initial bearing FROM a TO b, from NORTH clockwise
     const [lng1,lat1]=[toRad(a[0]),toRad(a[1])], [lng2,lat2]=[toRad(b[0]),toRad(b[1])];
     const y=Math.sin(lng2-lng1)*Math.cos(lat2);
     const x=Math.cos(lat1)*Math.sin(lat2)-Math.sin(lat1)*Math.cos(lat2)*Math.cos(lng2-lng1);
@@ -57,16 +56,16 @@
     return pts;
   }
 
+  // Correct averaging for bearings from NORTH (clockwise)
   function avgHeadingBetween(sampled, iStart, iEnd, capM=BOUND_LOCK_WINDOW_M){
-    // Correct vector average for bearings from NORTH
     let sumEast=0, sumNorth=0, acc=0;
     for (let i=iStart; i<iEnd && i<sampled.length-1 && acc<capM; i++){
       const a=sampled[i], b=sampled[i+1];
       const d=haversineMeters(a,b); if (d<=0) continue;
       const br=bearingDeg(a,b)*Math.PI/180;
-      sumEast  += Math.sin(br)*d;   // x
-      sumNorth += Math.cos(br)*d;   // y
-      acc      += d;
+      sumEast  += Math.sin(br)*d;  // x
+      sumNorth += Math.cos(br)*d;  // y
+      acc += d;
     }
     if (!sumEast && !sumNorth) {
       const j=Math.min(sampled.length-1, iStart+1);
@@ -76,46 +75,76 @@
     return cardinal4(deg);
   }
 
-  // ===== Minimal naming helpers ============================================
-  const cleanText = (s) => String(s||'').replace(/<[^>]*>/g,' ').replace(/\s+/g,' ').trim();
+  // ===== Naming / normalization ============================================
+  function cleanHtml(s){ return String(s||'').replace(/<[^>]*>/g,'').trim(); }
 
-  // Keep this *minimal* — do not rewrite highways
   function normalizeName(raw){
     if (!raw) return '';
-    let s = String(raw).trim();
+    let s=String(raw).trim();
     if (!s || /^unnamed\b/i.test(s) || /^[-–]+$/.test(s)) return '';
-    s = s
-      .replace(/\bPkwy\.?\b/ig, 'Parkway')
-      .replace(/\b(?:Expwy|Expy)\b/ig, 'Expressway')
-      .replace(/\s+/g, ' ')
-      .trim();
-    return s;
+
+    // Convert ON-401 / Hwy 401 / 401 Express → Highway 401
+    const canon = n => `Highway ${n}`;
+    s = s.replace(/\b(?:ON|Ontario)?[-– ]?(?:Hwy|HWY|Highway|RTE|Route)?\s*401\b.*?/ig, canon(401));
+    s = s.replace(/\b(?:ON|Ontario)?[-– ]?(?:Hwy|HWY|Highway|RTE|Route)?\s*400\b.*?/ig, canon(400));
+    s = s.replace(/\b(?:ON|Ontario)?[-– ]?(?:Hwy|HWY|Highway|RTE|Route)?\s*404\b.*?/ig, canon(404));
+    s = s.replace(/\b(?:ON|Ontario)?[-– ]?(?:Hwy|HWY|Highway|RTE|Route)?\s*427\b.*?/ig, canon(427));
+    s = s.replace(/\b(?:ON|Ontario)?[-– ]?(?:Hwy|HWY|Highway|RTE|Route)?\s*409\b.*?/ig, canon(409));
+
+    // Expand common suffixes
+    s = s.replace(/\b(st)\b\.?/ig,'Street')
+         .replace(/\b(rd)\b\.?/ig,'Road')
+         .replace(/\b(ave)\b\.?/ig,'Avenue')
+         .replace(/\b(ct)\b\.?/ig,'Court')
+         .replace(/\b(blvd)\b\.?/ig,'Boulevard');
+
+    // Remove ramp suffixes
+    s = s.replace(/\b(?:Onramp|Offramp|Ramp)\b.*$/i,'');
+
+    return s.replace(/\s+/g,' ').trim();
   }
 
-  // Permissive highway detector
-  function isHighwayName(s=''){
-    return /\b((?:ON|Ontario)?-?\s*Hwy\b|Highway\b|Expressway\b|Express\b|Freeway\b|Parkway\b|QEW\b|DVP\b|Gardiner\b|Don Valley\b)/i
-      .test(s);
-  }
-
-  // Fallback: derive name from instruction when step.name is "-"
+  // Pull a highway name from instruction text when step.name is "-" or blank
   function nameFromInstruction(instrHtml){
-    const t = cleanText(instrHtml);
-    // common Toronto highways first
-    if (/\bGardiner\b/i.test(t)) return 'Gardiner Expressway';
-    if (/\b(?:Don Valley (?:Parkway|Pkwy)|\bDVP\b)/i.test(t)) return 'Don Valley Parkway';
-    if (/\bQEW\b/i.test(t)) return 'QEW';
+    const t = cleanHtml(instrHtml);
 
-    // try highway numbers: ON-401 / Hwy 404 / to 427
-    const num = t.match(/\b(?:ON|Ontario)?[-– ]?(?:Hwy|HWY|Highway|RTE|Route)?\s*(\d{2,3})\b/);
-    if (num && num[1]) return `Hwy ${num[1]}`;
+    // Direct named expressways first
+    const named = t.match(/\b(Gardiner(?:\s+Expressway)?|Don Valley Parkway|DVP|QEW)\b/i);
+    if (named){
+      const n = named[1].toLowerCase();
+      if (/gardiner/.test(n)) return 'Gardiner Expressway';
+      if (/don valley parkway|dvp/.test(n)) return 'Don Valley Parkway';
+      if (/qew/.test(n)) return 'QEW';
+    }
 
-    // more generic: "onto/toward NAME"
+    // Patterns like "onto ON-401 E", "merge onto Hwy 401", "ramp to 404 S/Express/Collector"
+    const num = t.match(/\b(?:ON|Ontario)?[-– ]?(?:Hwy|HWY|Highway|RTE|Route)?\s*(\d{2,3})(?:\s*(?:Express|Collector))?\b/ig);
+    if (num){
+      // pick first number, prefer 3-digit (401/404/427/409/407)
+      const first = (num.map(x=> (x.match(/(\d{2,3})/)||[])[1]).filter(Boolean)
+                    .sort((a,b)=> String(b).length - String(a).length))[0];
+      if (first) return `Highway ${first}`;
+    }
+
+    // Sometimes instructions say “toward 401 E / to 401”
+    const toward = t.match(/\b(?:to|onto|toward|towards)\s*(\d{2,3})\b/ig);
+    if (toward){
+      const first = (toward.map(x=> (x.match(/(\d{2,3})/)||[])[1]).filter(Boolean))[0];
+      if (first) return `Highway ${first}`;
+    }
+
+    // Fallback: try generic “onto <Name>” for streets
     const m = t.match(/\b(?:onto|to|toward|towards)\s+([A-Za-z0-9 .'\-\/&]+)$/i);
-    return m ? normalizeName(m[1]) : '';
+    if (m) return normalizeName(m[1]);
+
+    return '';
   }
 
-  // ===== ORS fetchers =======================================================
+  function isHighwayName(s=''){
+    return /\b(Highway\s?\d{2,3}|Gardiner(?:\s+Expressway)?|Don Valley Parkway|DVP|QEW|Expressway|Express\b|Collector\b)\b/i.test(s);
+  }
+
+  // ===== Key management =====================================================
   const parseUrlKeys = () => {
     const raw=new URLSearchParams(location.search).get('orsKey');
     return raw ? raw.split(',').map(s=>s.trim()).filter(Boolean) : [];
@@ -131,6 +160,16 @@
   const currentKey = () => S.keys[S.keyIndex];
   const rotateKey  = () => (S.keys.length>1 ? (setIndex((S.keyIndex+1)%S.keys.length), true) : false);
 
+  // ===== Map helpers ========================================================
+  const ensureGroup = () => { if (!S.group) S.group = L.layerGroup().addTo(S.map); };
+  const clearAll = () => { if (S.group) S.group.clearLayers(); S.results=[]; setReportEnabled(false); };
+  const popup = (html, at) => {
+    const ll = at || (S.map ? S.map.getCenter() : null);
+    if (ll) L.popup().setLatLng(ll).setContent(html).openOn(S.map);
+    else alert(html.replace(/<[^>]+>/g,''));
+  };
+
+  // ===== ORS fetchers =======================================================
   async function orsFetch(path, { method='GET', body, query } = {}) {
     const url = new URL(ORS_BASE + path);
     if (query) Object.entries(query).forEach(([k,v]) => url.searchParams.set(k,v));
@@ -143,7 +182,6 @@
     if (!res.ok) throw new Error(`ORS ${res.status}: ${await res.text().catch(()=>res.statusText)}`);
     return res.json();
   }
-
   async function getRoute(originLonLat, destLonLat){
     return orsFetch(`/v2/directions/${PROFILE}/geojson`, {
       method:'POST',
@@ -154,37 +192,42 @@
         instructions_format:'html',
         language:'en',
         units:'km'
-        // deliberately *no* extra_info — keep it simple
       }
     });
   }
 
-  // ===== Movement builder ===================================================
-  function sliceCoords(full, i0, i1){
-    const s=Math.max(0,Math.min(i0, full.length-1));
-    const e=Math.max(0,Math.min(i1, full.length-1));
-    if (e<=s) return full.slice(s,s+1);
-    return full.slice(s,e+1);
+  // ===== Directions-only movement builder ==================================
+  function sliceCoords(fullCoords, i0, i1){
+    const s = Math.max(0, Math.min(i0, fullCoords.length-1));
+    const e = Math.max(0, Math.min(i1, fullCoords.length-1));
+    if (e <= s) return fullCoords.slice(s, s+1);
+    return fullCoords.slice(s, e+1);
   }
-  function distRange(coords, i0, i1){
-    let m=0; const s=Math.max(0,i0), e=Math.min(i1,coords.length-1);
-    for (let i=Math.max(1,s); i<=e; i++) m+=haversineMeters(coords[i-1],coords[i]);
-    return m;
+
+  function stepName(step){
+    // 1) step.name (treat "-" or "Unnamed" as empty)
+    const primary = normalizeName(step?.name || '');
+    if (primary) return primary;
+
+    // 2) try to parse a highway/street from instruction
+    const parsed = nameFromInstruction(step?.instruction || '');
+    if (parsed) return normalizeName(parsed);
+
+    return '';
   }
 
   function buildMovementsFromDirections(coords, steps){
     if (!coords?.length || !steps?.length) return [];
 
-    const rows=[];
-    const pushRow = (name, j0, j1) => {
+    const rows = [];
+    const pushRow = (name, i0, i1) => {
       const nm = normalizeName(name);
       if (!nm) return;
-      const seg = sliceCoords(coords, j0, j1);
+      const seg = sliceCoords(coords, i0, i1);
       if (seg.length < 2) return;
 
-      const meters = distRange(seg, 0, seg.length-1);
-      const highway = isHighwayName(nm);
-      if (!highway && meters < MIN_FRAGMENT_M) return;   // highways are ALWAYS kept
+      let meters = 0; for (let i=1;i<seg.length;i++) meters += haversineMeters(seg[i-1], seg[i]);
+      if (meters < MIN_FRAGMENT_M) return;
 
       const sampled = sampleLine(seg, SAMPLE_EVERY_M);
       const dir = avgHeadingBetween(sampled, 0, sampled.length-1, BOUND_LOCK_WINDOW_M);
@@ -197,30 +240,45 @@
       }
     };
 
-    // Walk ‘steps’ in order; stop after the first highway row we add
     for (let si=0; si<steps.length; si++){
       const st = steps[si];
       const [i0, i1] = st?.way_points || [0,0];
+      let nm = stepName(st);
 
-      let nm = normalizeName(st?.name || '');
-      if (!nm) nm = nameFromInstruction(st?.instruction || '');
+      if (!nm) continue;
 
-      if (nm){
+      // Highway cutoff: if this step is a highway, emit and stop
+      if (isHighwayName(nm)){
         pushRow(nm, i0, i1);
-        if (isHighwayName(nm)) break; // cutoff once highway/expressway appears
+        break;
       }
+
+      pushRow(nm, i0, i1);
+    }
+
+    // Light rejoin pass
+    if (rows.length > 2){
+      const merged = [rows[0]];
+      for (let i=1;i<rows.length;i++){
+        const a = merged[merged.length-1];
+        const b = rows[i];
+        if (a.name === b.name && a.dir === b.dir){
+          a.km = +(a.km + b.km).toFixed(2);
+        } else {
+          merged.push(b);
+        }
+      }
+      return merged;
     }
     return rows;
   }
 
   // ===== Drawing & Controls ================================================
-  function ensureGroup(){ if(!S.group) S.group=L.layerGroup().addTo(S.map); }
-  function drawRoute(gj, color){ ensureGroup(); const l=L.geoJSON(gj,{style:{color,weight:5,opacity:.9}}); S.group.addLayer(l); return l; }
-  function addMarker(lat,lon,html,r=6){ ensureGroup(); const m=L.circleMarker([lat,lon],{radius:r}).bindPopup(html); S.group.addLayer(m); return m; }
-  function popup(html){ L.popup().setLatLng(S.map.getCenter()).setContent(html).openOn(S.map); }
+  function drawRoute(geojson, color){ ensureGroup(); const line=L.geoJSON(geojson,{style:{color,weight:5,opacity:0.9}}); S.group.addLayer(line); return line; }
+  function addMarker(lat, lon, html, radius=6){ ensureGroup(); const m=L.circleMarker([lat,lon],{radius}).bindPopup(html); S.group.addLayer(m); return m; }
 
   const TripControl = L.Control.extend({
-    options:{position:'topleft'},
+    options:{ position:'topleft' },
     onAdd(){
       const el=L.DomUtil.create('div','routing-control trip-card');
       el.innerHTML=`
@@ -235,11 +293,11 @@
           <div class="key-row" style="margin-top:8px;display:grid;gap:8px;">
             <label for="rt-keys" style="font-weight:600;">OpenRouteService key(s)</label>
             <input id="rt-keys" type="text" placeholder="KEY1,KEY2 (comma-separated)">
-            <div style="display:flex;gap:10px;flex-wrap:wrap;">
+            <div class="routing-row" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
               <button id="rt-save">Save Keys</button>
               <button id="rt-url" class="ghost">Use ?orsKey</button>
             </div>
-            <small class="routing-hint">Priority: ?orsKey → saved → inline fallback.</small>
+            <small class="routing-hint">Priority: ?orsKey → saved → inline fallback. Keys auto-rotate on 401/429.</small>
           </div>
         </details>`;
       L.DomEvent.disableClickPropagation(el);
@@ -248,7 +306,7 @@
   });
 
   const ReportControl = L.Control.extend({
-    options:{position:'topleft'},
+    options:{ position:'topleft' },
     onAdd(){
       const el=L.DomUtil.create('div','routing-control report-card');
       el.innerHTML=`
@@ -262,11 +320,11 @@
     }
   });
 
-  const setReportEnabled = (on) => { const b=document.getElementById('rt-print'); if(b) b.disabled=!on; };
+  function setReportEnabled(enabled){ const b=document.getElementById('rt-print'); if (b) b.disabled=!enabled; }
 
   // ===== Init / Generate / Print ===========================================
   function init(map){
-    S.map=map; S.keys=loadKeys(); S.keyIndex=Number(localStorage.getItem(LS_ACTIVE_INDEX)||0);
+    S.map=map; S.keys=loadKeys(); setIndex(getIndex());
     S.map.addControl(new TripControl()); S.map.addControl(new ReportControl());
 
     S.els = {
@@ -279,75 +337,84 @@
     };
     if (S.els.keys) S.els.keys.value=S.keys.join(',');
 
-    S.els.gen.onclick   = generateTrips;
-    S.els.clr.onclick   = () => { if (S.group) S.group.clearLayers(); S.results=[]; setReportEnabled(false); };
-    S.els.print.onclick = printReport;
-    S.els.save.onclick  = () => {
+    if (S.els.gen)   S.els.gen.onclick   = generateTrips;
+    if (S.els.clr)   S.els.clr.onclick   = () => clearAll();
+    if (S.els.print) S.els.print.onclick = () => printReport();
+    if (S.els.save)  S.els.save.onclick  = () => {
       const arr=(S.els.keys.value||'').split(',').map(s=>s.trim()).filter(Boolean);
       if(!arr.length) return popup('<b>Routing</b><br>Enter a key.');
-      S.keys=arr; localStorage.setItem(LS_KEYS, JSON.stringify(arr)); S.keyIndex=0;
+      S.keys=arr; saveKeys(arr); setIndex(0);
       popup('<b>Routing</b><br>Keys saved.');
     };
-    S.els.url.onclick   = () => {
-      const arr=parseUrlKeys(); if(!arr.length) return popup('<b>Routing</b><br>No <code>?orsKey</code> in URL.');
-      S.keys=arr; S.keyIndex=0; popup('<b>Routing</b><br>Using keys from URL.');
+    if (S.els.url)   S.els.url.onclick   = () => {
+      const arr=parseUrlKeys();
+      if(!arr.length) return popup('<b>Routing</b><br>No <code>?orsKey=</code> in URL.');
+      S.keys=arr; setIndex(0);
+      popup('<b>Routing</b><br>Using keys from URL.');
     };
   }
 
   async function generateTrips(){
-    const origin = global.ROUTING_ORIGIN;
-    if (!origin) return popup('<b>Routing</b><br>Search an address in the top bar and select a result first.');
-    if (!global.getSelectedPDTargets) return popup('<b>Routing</b><br>Zone/PD selection isn’t ready.');
-    const targets = global.getSelectedPDTargets() || [];
-    if (!targets.length) return popup('<b>Routing</b><br>No PDs selected.');
+    try{
+      const origin = global.ROUTING_ORIGIN;
+      if (!origin) return popup('<b>Routing</b><br>Search an address in the top bar and select a result first.');
+      if (!global.getSelectedPDTargets) return popup('<b>Routing</b><br>Zone/PD selection isn\'t ready.');
+      const targets = global.getSelectedPDTargets() || [];
+      if (!targets.length) return popup('<b>Routing</b><br>No PDs selected.');
 
-    if (S.group) S.group.clearLayers(); S.results=[]; setReportEnabled(false);
-    addMarker(origin.lat, origin.lon, `<b>Origin</b><br>${origin.label}`, 6);
-    try { const f=targets[0]; S.map.fitBounds(L.latLngBounds([[origin.lat,origin.lon],[f[1],f[0]]]), { padding:[24,24] }); } catch {}
+      clearAll();
+      addMarker(origin.lat, origin.lon, `<b>Origin</b><br>${origin.label}`, 6);
 
-    for (let i=0;i<targets.length;i++){
-      const [dlon,dlat,label]=targets[i];
-      try{
-        const gj = await getRoute([origin.lon,origin.lat],[dlon,dlat]);
-        drawRoute(gj, i===0 ? COLOR_FIRST : COLOR_OTHERS);
+      try { const f=targets[0]; S.map.fitBounds(L.latLngBounds([[origin.lat,origin.lon],[f[1],f[0]]]), { padding:[24,24] }); } catch {}
 
-        const feat = gj?.features?.[0];
-        const seg  = feat?.properties?.segments?.[0];
-        const coords = feat?.geometry?.coordinates || [];
-        const steps  = seg?.steps || [];
+      for (let i=0;i<targets.length;i++){
+        const [dlon,dlat,label]=targets[i];
+        try{
+          const gj = await getRoute([origin.lon,origin.lat],[dlon,dlat]);
+          drawRoute(gj, i===0 ? COLOR_FIRST : COLOR_OTHERS);
 
-        const distKm = seg?.distance ? seg.distance/1000
-          : coords.reduce((a,_,j,arr)=> j? a + haversineMeters(arr[j-1],arr[j])/1000 : 0, 0);
-        const km  = distKm.toFixed(1);
-        const min = seg ? Math.round((seg.duration||0)/60) : '—';
+          const feat = gj?.features?.[0];
+          const seg  = feat?.properties?.segments?.[0];
+          const coords = feat?.geometry?.coordinates || [];
+          const steps  = seg?.steps || [];
 
-        const assignments = buildMovementsFromDirections(coords, steps);
+          const distKm = seg?.distance ? seg.distance/1000
+            : coords.reduce((a,_,j,arr)=> j? a + haversineMeters(arr[j-1],arr[j])/1000 : 0, 0);
+          const km  = distKm.toFixed(1);
+          const min = seg ? Math.round((seg.duration||0)/60) : '—';
 
-        const stepsTxt = steps.map(s=>{
-          const txt = cleanText(s.instruction||'');
-          const d = ((s.distance||0)/1000).toFixed(2);
-          return `${txt} — ${d} km`;
-        });
+          const assignments = buildMovementsFromDirections(coords, steps);
 
-        S.results.push({ label, lat:dlat, lon:dlon, km, min, steps:stepsTxt, assignments, gj });
+          const stepsTxt = steps.map(s=>{
+            const txt = cleanHtml(s.instruction||'');
+            const d = ((s.distance||0)/1000).toFixed(2);
+            return `${txt} — ${d} km`;
+          });
 
-        const preview = assignments.slice(0,6).map(a=>`<li>${a.dir} ${a.name} — ${a.km.toFixed(2)} km</li>`).join('');
-        addMarker(dlat, dlon, `
-          <div style="max-height:35vh;overflow:auto;">
-            <strong>${label}</strong><br>${km} km • ${min} min
-            <div style="margin-top:6px;">
-              <em>Street assignments</em>
-              <ul style="margin:6px 0 8px 18px; padding:0;">${preview || '<li><em>No named streets</em></li>'}</ul>
-            </div>
-          </div>`, 5);
-      } catch (e) {
-        console.error(e);
-        popup(`<b>Routing</b><br>Route failed for ${label}<br><small>${e.message}</small>`);
+          S.results.push({ label, lat:dlat, lon:dlon, km, min, steps:stepsTxt, assignments, gj });
+
+          const preview = assignments.slice(0,6).map(a=>`<li>${a.dir} ${a.name} — ${a.km.toFixed(2)} km</li>`).join('');
+          addMarker(dlat, dlon, `
+            <div style="max-height:35vh;overflow:auto;">
+              <strong>${label}</strong><br>${km} km • ${min} min
+              <div style="margin-top:6px;">
+                <em>Street assignments</em>
+                <ul style="margin:6px 0 8px 18px; padding:0;">${preview || '<li><em>No named streets</em></li>'}</ul>
+              </div>
+            </div>`, 5);
+        } catch (e) {
+          console.error(e);
+          popup(`<b>Routing</b><br>Route failed for ${label}<br><small>${e.message}</small>`);
+        }
+        if (i<targets.length-1) await sleep(1200);
       }
-      if (i<targets.length-1) await sleep(1200); // respect ORS burst limits
-    }
 
-    setReportEnabled(S.results.length>0);
+      setReportEnabled(S.results.length>0);
+      if (S.results.length) popup('<b>Routing</b><br>All routes processed. Popups added at each destination.');
+    } catch (e) {
+      console.error(e);
+      popup(`<b>Routing</b><br>${e.message||'Unknown error.'}`);
+    }
   }
 
   function printReport(){
@@ -366,7 +433,7 @@
     const cards = S.results.map((r,i)=>{
       const lines = (r.assignments && r.assignments.length)
         ? r.assignments.map(a=>`<tr><td>${a.dir}</td><td>${a.name}</td><td class="right">${a.km.toFixed(2)} km</td></tr>`).join('')
-        : `<tr><td colspan="3"><em>No named streets</em></td></tr>`;
+        : `<tr><td colspan="3"><em>No named streets on route</em></td></tr>`;
       return `
         <div class="card">
           <h2>${i+1}. ${r.label}</h2>
@@ -378,14 +445,12 @@
         </div>`;
     }).join('');
     w.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>Trip Report</title>${css}</head>
-    <body><h1>Trip Report — Street Assignments</h1>${cards}
+    <body><h1>Trip Report — Street Assignments (Directions-only)</h1>${cards}
     <script>window.onload=()=>window.print();</script></body></html>`);
     w.document.close();
   }
 
-  // ===== Public API (no auto-init) =========================================
-  global.Routing = {
-    init,
-    clear(){ if (S.group) S.group.clearLayers(); S.results=[]; setReportEnabled(false); }
-  };
+  const Routing = { init(map){ init(map); }, clear(){ clearAll(); }, setApiKeys(arr){ S.keys=Array.isArray(arr)?[...arr]:[]; saveKeys(S.keys); setIndex(0); } };
+  global.Routing = Routing;
+  document.addEventListener('DOMContentLoaded', ()=>{ if (global.map) Routing.init(global.map); });
 })(window);
