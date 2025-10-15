@@ -1,15 +1,16 @@
-/* routing.js — ORS geometry/movements; HighwayResolver labels long unnamed motorway segments.
-   Fixes:
-     • Use RELATIVE paths for GitHub Pages ("data/..."), not absolute "/data/..."
-     • Loader supports GeoJSON FeatureCollection and ESRI Feature JSON (geometry.paths)
+/* routing.js — ORS for geometry; nearest-centerline highway naming.
+   Pipeline for long unnamed "generic" chains (keep/continue/head):
+     1) Try local centerlines (data/highway_centrelines.json)
+     2) Fallback to Overpass (nearest motorway/trunk way name/ref)
+   Prints after async name resolution completes.
 */
 (function (global) {
-  // ===== Tunables ===========================================================
+  // ============================= Tunables ===================================
   const GENERIC_REGEX          = /\b(keep (right|left)|continue|head (east|west|north|south))\b/i;
-  const GENERIC_CHAIN_MIN_KM   = 3.0;
-  const SAMPLE_EVERY_M         = 750;
-  const MATCH_BUFFER_M         = 260;
-  const BOUND_LOCK_WINDOW_M    = 300;
+  const GENERIC_CHAIN_MIN_KM   = 3.0;   // unnamed+generic chain must be >= this to attempt naming
+  const SAMPLE_EVERY_M         = 750;   // sampling step along unnamed segment
+  const MATCH_BUFFER_M         = 280;   // max distance (m) for local centerline match
+  const BOUND_LOCK_WINDOW_M    = 300;   // meters to stabilize NB/EB/SB/WB
   const MIN_FRAGMENT_M         = 0;
   const PER_REQUEST_DELAY      = 80;
 
@@ -20,12 +21,18 @@
   const COLOR_FIRST  = '#0b3aa5';
   const COLOR_OTHERS = '#2166f3';
 
-  // IMPORTANT: relative paths for GitHub Pages project sites
+  // NOTE: relative paths (works on GitHub Pages project sites)
   const HIGHWAY_URLS = [
-    'data/highway_centrelines.json',  // your file
-    'data/highway_centerlines.json',  // fallback (US spelling)
-    'data/toronto_highways.geojson'   // fallback
+    'data/highway_centrelines.json', // your file (Canadian spelling)
+    'data/highway_centerlines.json', // fallback
+    'data/toronto_highways.geojson'  // fallback
   ];
+
+  // Overpass fallback
+  const OVERPASS_URL = 'https://overpass-api.de/api/interpreter';
+  const OVERPASS_RADIUS_M = 600;        // search radius around sample point
+  const OVERPASS_DELAY_MS = 450;        // gentle rate-limit between calls
+  const OSM_CACHE_TTL_MS  = 1000 * 60 * 60 * 24; // 24h
 
   // Inline fallback ORS key (ignored if orsKey exists/saved)
   const INLINE_DEFAULT_KEY =
@@ -34,14 +41,14 @@
   const LS_KEYS = 'ORS_KEYS';
   const LS_ACTIVE_INDEX = 'ORS_ACTIVE_INDEX';
 
-  // ===== State ==============================================================
+  // =============================== State ====================================
   const S = { map:null, group:null, keys:[], keyIndex:0, results:[] };
 
-  // ===== Helpers ============================================================
+  // =============================== Helpers ==================================
   const byId = (id) => document.getElementById(id);
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   const qParam = (k) => new URLSearchParams(location.search).get(k) || '';
-  const toRad  = (d) => d * Math.PI / 180;
+  const toRad = (d) => d * Math.PI / 180;
   const isFiniteNum = (n) => Number.isFinite(n) && !Number.isNaN(n);
   const num = (x) => { const n = typeof x === 'string' ? parseFloat(x) : +x; return Number.isFinite(n) ? n : NaN; };
   const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
@@ -77,6 +84,7 @@
     throw new Error(`Origin shape unsupported: ${JSON.stringify(o)}`);
   }
 
+  // ====================== Distances / bearings / sampling ===================
   function haversineMeters(a, b) {
     const R = 6371000;
     const [lon1, lat1] = a, [lon2, lat2] = b;
@@ -113,7 +121,20 @@
     if (out[out.length-1] !== coords[coords.length-1]) out.push(coords[coords.length-1]);
     return out;
   }
+  function midpoint(coords){
+    // rough midpoint by cumulative distance
+    if (!coords || coords.length < 2) return coords?.[0] || [0,0];
+    const lengths = [0];
+    let total = 0;
+    for (let i=1;i<coords.length;i++){ total += haversineMeters(coords[i-1], coords[i]); lengths.push(total); }
+    const half = total/2;
+    for (let i=1;i<lengths.length;i++){
+      if (lengths[i] >= half) return coords[i];
+    }
+    return coords[coords.length-1];
+  }
 
+  // ============================== Name helpers ==============================
   function cleanHtml(s){ return String(s || '').replace(/<[^>]*>/g, '').trim(); }
   function normalizeName(raw){
     if (!raw) return '';
@@ -136,10 +157,13 @@
     return normalizeName(t);
   }
 
-  // ===== Highway Name Resolver =============================================
+  // ====================== Highway Name Resolver (local+OSM) =================
   const HighwayResolver = (() => {
-    let features = null;
+    let features = null; // [{label, coords}]
+    let lastOverpassAt = 0;
+    const memCache = new Map();
 
+    // ---- Local file loader (GeoJSON or ESRI Feature JSON) ------------------
     function flattenGeoJSONFeature(f){
       const props = f.properties || {};
       const g = f.geometry || {};
@@ -149,9 +173,7 @@
       if (g.type === 'MultiLineString') (g.coordinates || []).forEach(cs => out.push({ props, coords: cs }));
       return out;
     }
-
     function flattenEsriFeature(f){
-      // ESRI: { attributes:{Name:…}, geometry:{ paths:[ [ [x,y],... ], ... ] } }
       const props = (f.attributes || f.properties || {});
       const geom  = f.geometry || {};
       const paths = geom.paths || geom.PATHS || [];
@@ -159,26 +181,9 @@
       for (const p of paths) out.push({ props, coords: p });
       return out;
     }
-
     function labelFromProps(props){
-      // Your data: props.Name = "HIGHWAY 48"
-      return normalizeName(props.Name || props.name || props.official_name || props.short || props.ref);
+      return normalizeName(props.Name || props.ref || props.short || props.name || props.official_name);
     }
-
-    function pointSegDistM(p, a, b){
-      const kx = 111320 * Math.cos(toRad((a[1]+b[1])/2));
-      const ky = 110540;
-      const ax = a[0]*kx, ay=a[1]*ky, bx=b[0]*kx, by=b[1]*ky, px=p[0]*kx, py=p[1]*ky;
-      const vx = bx-ax, vy = by-ay;
-      const wx = px-ax, wy = py-ay;
-      const c1 = vx*wx + vy*wy;
-      const c2 = vx*vx + vy*vy;
-      const t = c2 ? Math.max(0, Math.min(1, c1/c2)) : 0;
-      const nx = ax + t*vx, ny = ay + t*vy;
-      const dx = px - nx, dy = py - ny;
-      return Math.sqrt(dx*dx + dy*dy);
-    }
-
     async function loadFirstAvailable(urls){
       for (const url of urls){
         try {
@@ -188,7 +193,6 @@
 
           let arr = [];
           if (Array.isArray(data?.features)) {
-            // GeoJSON FC OR ESRI FeatureSet lookalike
             const isEsri = !!data.features[0]?.geometry?.paths || !!data.geometryType;
             if (isEsri) {
               data.features.forEach(f => {
@@ -205,34 +209,35 @@
                 });
               });
             }
-          } else if (Array.isArray(data)) {
-            // Plain array of features
-            data.forEach(f => {
-              // try both ways
-              flattenGeoJSONFeature(f).concat(flattenEsriFeature(f)).forEach(part => {
-                const label = labelFromProps(part.props);
-                if (label) arr.push({ label, coords: part.coords });
-              });
-            });
-          } else {
-            console.warn('[HighwayResolver] unknown format for', url, data);
           }
-
           features = arr;
-          console.info('[HighwayResolver] loaded features:', features.length, 'from', url);
+          console.info('[HighwayResolver] local features:', features.length, 'from', url);
           if (features.length) return true;
-        } catch (e) {
-          console.warn('[HighwayResolver] error loading', url, e);
-        }
+        } catch (e) { console.warn('[HighwayResolver] error loading', url, e); }
       }
       features = [];
-      console.warn('[HighwayResolver] no highway file found / parsed');
+      console.warn('[HighwayResolver] no local highway lines parsed (will use OSM fallback)');
       return false;
     }
 
-    function labelForSegment(segCoords){
+    // ---- Geometry helpers ---------------------------------------------------
+    function pointSegDistM(p, a, b){
+      const kx = 111320 * Math.cos(toRad((a[1]+b[1])/2));
+      const ky = 110540;
+      const ax = a[0]*kx, ay=a[1]*ky, bx=b[0]*kx, by=b[1]*ky, px=p[0]*kx, py=p[1]*ky;
+      const vx = bx-ax, vy = by-ay;
+      const wx = px-ax, wy = py-ay;
+      const c1 = vx*wx + vy*wy;
+      const c2 = vx*vx + vy*vy;
+      const t = c2 ? Math.max(0, Math.min(1, c1/c2)) : 0;
+      const nx = ax + t*vx, ny = ay + t*vy;
+      const dx = px - nx, dy = py - ny;
+      return Math.sqrt(dx*dx + dy*dy);
+    }
+
+    // ---- Local nearest-line label ------------------------------------------
+    function labelForSegmentLocal(segCoords){
       if (!features || !features.length) return '';
-      if (!segCoords || segCoords.length < 2) return '';
       const sampled = resampleByDistance(segCoords, SAMPLE_EVERY_M);
       let best = { d: 1e12, label: '' };
       for (const p of sampled){
@@ -247,10 +252,84 @@
       return (best.d <= MATCH_BUFFER_M) ? best.label : '';
     }
 
+    // ---- Overpass fallback (nearest motorway/trunk around point) -----------
+    function cacheKey(lon,lat){
+      return `${lon.toFixed(5)},${lat.toFixed(5)}`;
+    }
+    function osmCacheGet(lon,lat){
+      try {
+        const key = cacheKey(lon,lat);
+        const raw = localStorage.getItem('OSM_HWY_CACHE_'+key);
+        if (!raw) return null;
+        const { t, v } = JSON.parse(raw);
+        if (Date.now() - t > OSM_CACHE_TTL_MS) return null;
+        return v;
+      } catch { return null; }
+    }
+    function osmCacheSet(lon,lat,val){
+      try {
+        const key = cacheKey(lon,lat);
+        localStorage.setItem('OSM_HWY_CACHE_'+key, JSON.stringify({ t: Date.now(), v: val }));
+      } catch {}
+    }
+    async function labelFromOverpass(point){
+      const [lon,lat] = point;
+      const cached = osmCacheGet(lon,lat);
+      if (cached) return cached;
+
+      const now = Date.now();
+      const wait = Math.max(0, OVERPASS_DELAY_MS - (now - lastOverpassAt));
+      if (wait) await sleep(wait);
+      lastOverpassAt = Date.now();
+
+      // around: R meters from point; prefer motorway, then trunk
+      const query = `
+[out:json][timeout:25];
+way(around:${OVERPASS_RADIUS_M},${lat},${lon})["highway"~"^(motorway|trunk)$"];
+out tags geom;
+`;
+      const res = await fetch(OVERPASS_URL, {
+        method:'POST',
+        headers:{ 'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8' },
+        body: 'data=' + encodeURIComponent(query)
+      });
+      if (!res.ok) { console.warn('[Overpass] HTTP', res.status); return ''; }
+      const json = await res.json();
+      const ways = json.elements || [];
+
+      // choose nearest geometry center
+      let best = { d: 1e12, label: '' };
+      for (const w of ways){
+        const name = normalizeName(w.tags?.short_name || w.tags?.ref || w.tags?.name || '');
+        if (!name) continue;
+        const geom = w.geometry || [];
+        for (let i=1;i<geom.length;i++){
+          const a = [geom[i-1].lon, geom[i-1].lat];
+          const b = [geom[i].lon, geom[i].lat];
+          const d = pointSegDistM([lon,lat], a, b);
+          if (d < best.d){ best.d = d; best.label = name; }
+        }
+      }
+      const label = best.d < 1000 ? best.label : '';
+      if (label) osmCacheSet(lon,lat,label);
+      return label;
+    }
+
+    // ---- Public API ---------------------------------------------------------
+    async function labelForSegment(segCoords){
+      // 1) try local centerlines
+      const local = labelForSegmentLocal(segCoords);
+      if (local) return local;
+      // 2) fallback to OSM
+      const probe = midpoint(segCoords);
+      const osm = await labelFromOverpass(probe);
+      return osm || '';
+    }
+
     return { loadFirstAvailable, labelForSegment };
   })();
 
-  // ===== ORS plumbing =======================================================
+  // ============================ ORS plumbing ================================
   function savedKeys(){ try { return JSON.parse(localStorage.getItem(LS_KEYS) || '[]'); } catch { return []; } }
   function hydrateKeys(){
     const urlKey = qParam('orsKey');
@@ -313,7 +392,7 @@
     }
   }
 
-  // ===== Movement builder ===================================================
+  // ============================ Movement builder ============================
   function sliceCoords(full, i0, i1){
     const s = Math.max(0, Math.min(i0, full.length - 1));
     const e = Math.max(0, Math.min(i1, full.length - 1));
@@ -351,7 +430,8 @@
       return meters / 1000;
     }
 
-    const pushRow = (name, i0, i1, waypoints) => {
+    // we attach an optional probe point for unnamed motorway chains
+    const pushRow = (name, i0, i1, waypoints, probe) => {
       const nm = normalizeName(name);
       if (!nm) return;
       const seg = sliceCoords(coords, i0, i1);
@@ -363,7 +443,7 @@
       if (last && last.name === nm && last.dir === dir){
         last.km = +(last.km + meters / 1000).toFixed(2);
       } else {
-        rows.push({ dir, name: nm, km: +(meters / 1000).toFixed(2) });
+        rows.push({ dir, name: nm, km: +(meters / 1000).toFixed(2), _probe: probe || null, _i0:i0, _i1:i1 });
       }
     };
 
@@ -376,9 +456,9 @@
         const [i0] = (st0.way_points || st0.wayPoints || st0.waypoints || [0,0]);
         const [,i1] = (st1.way_points || st1.wayPoints || st1.waypoints || [0,0]);
         const seg = sliceCoords(coords, i0, i1);
-        const label = HighwayResolver.labelForSegment(seg);
-        const nm = label || 'Unnamed motorway segment';
-        pushRow(nm, i0, i1, [i0, i1]);
+        const probe = midpoint(seg);
+        // temporary label; we’ll resolve asynchronously before printing
+        pushRow('Unnamed motorway segment', i0, i1, [i0, i1], probe);
       }
       chainStart = chainEnd = null; chainKm = 0;
     }
@@ -394,19 +474,19 @@
       if (isGeneric){
         if (chainStart == null) chainStart = i;
         chainEnd = i;
-        chainKm += stepGeomKm(st); // geometry-based accumulation
+        chainKm += stepGeomKm(st);
         continue;
       }
 
       flushChainIfAny();
-      pushRow(nameNatural || normalizeName(instr), i0, i1, [i0, i1]);
+      pushRow(nameNatural || normalizeName(instr), i0, i1, [i0, i1], null);
     }
     flushChainIfAny();
 
     return rows;
   }
 
-  // ===== Map & orchestration ===============================================
+  // =========================== Map & orchestration ==========================
   function clearAll(){
     S.results = [];
     if (S.group) S.group.clearLayers();
@@ -470,17 +550,41 @@
     if (g){ g.disabled = b; g.textContent = b ? 'Generating…' : 'Generate Trips'; }
   }
 
-  // ===== Reports ============================================================
+  // ================================ Reports =================================
   function km2(n){ return (n || 0).toFixed(2); }
 
-  function printReport(){
+  async function resolveHighwayNamesForResult(r){
+    // Find unnamed motorway segments and resolve names
+    const mov = buildMovementsFromDirections(r.route.coords, r.route.steps);
+    for (const m of mov){
+      if (m.name === 'Unnamed motorway segment' && m._probe){
+        const seg = sliceCoords(r.route.coords, m._i0, m._i1);
+        try {
+          const label = await HighwayResolver.labelForSegment(seg);
+          if (label) m.name = label;
+        } catch (e) {
+          console.warn('Highway resolve failed', e);
+        }
+      }
+      // cleanup helper fields
+      delete m._probe; delete m._i0; delete m._i1;
+    }
+    return mov;
+  }
+
+  async function printReport(){
     if (!S.results.length) { alert('No trips generated yet.'); return; }
-    const rowsHtml = S.results.map((r) => {
-      const mov = buildMovementsFromDirections(r.route.coords, r.route.steps);
-      const lines = mov.map(m => `<tr><td>${m.dir || ''}</td><td>${m.name}</td><td style="text-align:right">${km2(m.km)}</td></tr>`).join('');
+    const all = [];
+    for (const r of S.results){
+      const rows = await resolveHighwayNamesForResult(r);
+      all.push({ dest: r.dest, rows });
+    }
+
+    const blocks = all.map(({dest, rows}) => {
+      const lines = rows.map(m => `<tr><td>${m.dir || ''}</td><td>${m.name}</td><td style="text-align:right">${km2(m.km)}</td></tr>`).join('');
       return `
         <div class="card">
-          <h2>Destination: ${r.dest.label || (r.dest.lon+','+r.dest.lat)}</h2>
+          <h2>Destination: ${dest.label || (dest.lon+','+dest.lat)}</h2>
           <table>
             <thead><tr><th>Dir</th><th>Street</th><th style="text-align:right">km</th></tr></thead>
             <tbody>${lines}</tbody>
@@ -500,7 +604,7 @@
       </style>
     `;
     const w = window.open('', '_blank');
-    w.document.write(`<!doctype html><meta charset="utf-8"><title>Trip Report</title>${css}<h1>Trip Report — Street List</h1>${rowsHtml}<script>onload=()=>print();</script>`);
+    w.document.write(`<!doctype html><meta charset="utf-8"><title>Trip Report</title>${css}<h1>Trip Report — Street List</h1>${blocks}<script>onload=()=>print();</script>`);
     w.document.close();
   }
 
@@ -553,7 +657,7 @@
     w.document.close();
   }
 
-  // ===== Controls & Init ====================================================
+  // ================================ Controls ================================
   const GeneratorControl = L.Control.extend({
     options: { position: 'topleft' },
     onAdd() {
@@ -610,6 +714,7 @@
     };
   }
 
+  // ================================ Init ====================================
   async function innerInit(map){
     S.map = map;
     hydrateKeys();
@@ -617,7 +722,7 @@
     map.addControl(new GeneratorControl());
     setTimeout(wireControls, 0);
 
-    // Load highway file (first available)
+    // Load highway file (first available). OK if none; we’ll fall back to OSM.
     await HighwayResolver.loadFirstAvailable(HIGHWAY_URLS);
   }
 
