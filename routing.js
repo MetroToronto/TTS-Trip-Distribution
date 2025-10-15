@@ -1,13 +1,16 @@
-/* routing.js — ORS geometry/movements; local HighwayResolver labels long unnamed motorway segments.
-   IMPORTANT FIX: chain length now measured from geometry slice (way_points) instead of step.distance. */
+/* routing.js — ORS geometry/movements; HighwayResolver labels long unnamed motorway segments.
+   Fixes:
+     • Use RELATIVE paths for GitHub Pages ("data/..."), not absolute "/data/..."
+     • Loader supports GeoJSON FeatureCollection and ESRI Feature JSON (geometry.paths)
+*/
 (function (global) {
-  // ============================= Tunables ===================================
+  // ===== Tunables ===========================================================
   const GENERIC_REGEX          = /\b(keep (right|left)|continue|head (east|west|north|south))\b/i;
-  const GENERIC_CHAIN_MIN_KM   = 3.0;   // unnamed+generic chain must be >= this to attempt highway match
-  const SAMPLE_EVERY_M         = 750;   // sampling step along long unnamed segment
-  const MATCH_BUFFER_M         = 260;   // max distance from sample to highway centerline
-  const BOUND_LOCK_WINDOW_M    = 300;   // meters to stabilize NB/EB/SB/WB
-  const MIN_FRAGMENT_M         = 0;     // keep tiny pieces; we do our own merging
+  const GENERIC_CHAIN_MIN_KM   = 3.0;
+  const SAMPLE_EVERY_M         = 750;
+  const MATCH_BUFFER_M         = 260;
+  const BOUND_LOCK_WINDOW_M    = 300;
+  const MIN_FRAGMENT_M         = 0;
   const PER_REQUEST_DELAY      = 80;
 
   const PROFILE    = 'driving-car';
@@ -17,11 +20,11 @@
   const COLOR_FIRST  = '#0b3aa5';
   const COLOR_OTHERS = '#2166f3';
 
-  // Your dataset (first path tried) + fallbacks if you rename
+  // IMPORTANT: relative paths for GitHub Pages project sites
   const HIGHWAY_URLS = [
-    '/data/highway_centrelines.json',   // <-- your file (Canadian spelling)
-    '/data/highway_centerlines.json',   // fallback (US spelling)
-    '/data/toronto_highways.geojson'    // fallback (earlier suggestion)
+    'data/highway_centrelines.json',  // your file
+    'data/highway_centerlines.json',  // fallback (US spelling)
+    'data/toronto_highways.geojson'   // fallback
   ];
 
   // Inline fallback ORS key (ignored if orsKey exists/saved)
@@ -31,15 +34,14 @@
   const LS_KEYS = 'ORS_KEYS';
   const LS_ACTIVE_INDEX = 'ORS_ACTIVE_INDEX';
 
-  // =============================== State ====================================
+  // ===== State ==============================================================
   const S = { map:null, group:null, keys:[], keyIndex:0, results:[] };
 
-  // =============================== Helpers ==================================
+  // ===== Helpers ============================================================
   const byId = (id) => document.getElementById(id);
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   const qParam = (k) => new URLSearchParams(location.search).get(k) || '';
-  const toRad = (d) => d * Math.PI / 180;
-
+  const toRad  = (d) => d * Math.PI / 180;
   const isFiniteNum = (n) => Number.isFinite(n) && !Number.isNaN(n);
   const num = (x) => { const n = typeof x === 'string' ? parseFloat(x) : +x; return Number.isFinite(n) ? n : NaN; };
   const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
@@ -75,7 +77,6 @@
     throw new Error(`Origin shape unsupported: ${JSON.stringify(o)}`);
   }
 
-  // Distances / headings / sampling
   function haversineMeters(a, b) {
     const R = 6371000;
     const [lon1, lat1] = a, [lon2, lat2] = b;
@@ -113,7 +114,6 @@
     return out;
   }
 
-  // Natural naming (no highway rewrites)
   function cleanHtml(s){ return String(s || '').replace(/<[^>]*>/g, '').trim(); }
   function normalizeName(raw){
     if (!raw) return '';
@@ -126,37 +126,45 @@
     if (field) return field;
     const t = cleanHtml(step?.instruction || '');
     if (!t) return '';
-    // tokens (don’t rewrite)
     const token =
       t.match(/\b(?:ON[- ]?)?(?:HWY|Hwy|Highway)?[- ]?\d{2,3}\b(?:\s*[ENSW][BW]?)?/i) ||
       t.match(/\b(QEW|DVP|Gardiner(?:\s+Expressway)?|Don Valley Parkway|Allen Road|Black Creek Drive)\b/i);
     if (token) return normalizeName(token[0]);
-    if (GENERIC_REGEX.test(t)) return ''; // let resolver handle long generic chains
+    if (GENERIC_REGEX.test(t)) return '';
     const m = t.match(/\b(?:onto|on|to|toward|towards)\s+([A-Za-z0-9 .,'\-\/&()]+)$/i);
     if (m) return normalizeName(m[1]);
     return normalizeName(t);
   }
 
-  // ====================== Highway Name Resolver (local) =====================
+  // ===== Highway Name Resolver =============================================
   const HighwayResolver = (() => {
     let features = null;
 
-    function flattenFeature(f){
+    function flattenGeoJSONFeature(f){
       const props = f.properties || {};
       const g = f.geometry || {};
-      if (!g) return [];
-      if (g.type === 'LineString')      return [{ props, coords: g.coordinates }];
-      if (g.type === 'MultiLineString') return g.coordinates.map(cs => ({ props, coords: cs }));
-      return [];
+      const out = [];
+      if (!g) return out;
+      if (g.type === 'LineString') out.push({ props, coords: g.coordinates });
+      if (g.type === 'MultiLineString') (g.coordinates || []).forEach(cs => out.push({ props, coords: cs }));
+      return out;
+    }
+
+    function flattenEsriFeature(f){
+      // ESRI: { attributes:{Name:…}, geometry:{ paths:[ [ [x,y],... ], ... ] } }
+      const props = (f.attributes || f.properties || {});
+      const geom  = f.geometry || {};
+      const paths = geom.paths || geom.PATHS || [];
+      const out = [];
+      for (const p of paths) out.push({ props, coords: p });
+      return out;
     }
 
     function labelFromProps(props){
-      // Your dataset uses "Name": "HIGHWAY 48"
-      const fromNameField = normalizeName(props.Name || props.name || props.official_name || props.short || props.ref);
-      return fromNameField || '';
+      // Your data: props.Name = "HIGHWAY 48"
+      return normalizeName(props.Name || props.name || props.official_name || props.short || props.ref);
     }
 
-    // rough meters using a local projection
     function pointSegDistM(p, a, b){
       const kx = 111320 * Math.cos(toRad((a[1]+b[1])/2));
       const ky = 110540;
@@ -175,24 +183,50 @@
       for (const url of urls){
         try {
           const res = await fetch(url, { cache: 'no-cache' });
-          if (!res.ok) continue;
-          const gj = await res.json();
-          const arr = [];
-          (gj.features || []).forEach(f => {
-            const parts = flattenFeature(f);
-            const label = labelFromProps(f.properties || {});
-            if (!label) return;
-            parts.forEach(p => arr.push({ label, coords: p.coords }));
-          });
+          if (!res.ok) { console.warn('[HighwayResolver] fetch failed', url, res.status); continue; }
+          const data = await res.json();
+
+          let arr = [];
+          if (Array.isArray(data?.features)) {
+            // GeoJSON FC OR ESRI FeatureSet lookalike
+            const isEsri = !!data.features[0]?.geometry?.paths || !!data.geometryType;
+            if (isEsri) {
+              data.features.forEach(f => {
+                flattenEsriFeature(f).forEach(part => {
+                  const label = labelFromProps(part.props);
+                  if (label) arr.push({ label, coords: part.coords });
+                });
+              });
+            } else {
+              data.features.forEach(f => {
+                flattenGeoJSONFeature(f).forEach(part => {
+                  const label = labelFromProps(part.props);
+                  if (label) arr.push({ label, coords: part.coords });
+                });
+              });
+            }
+          } else if (Array.isArray(data)) {
+            // Plain array of features
+            data.forEach(f => {
+              // try both ways
+              flattenGeoJSONFeature(f).concat(flattenEsriFeature(f)).forEach(part => {
+                const label = labelFromProps(part.props);
+                if (label) arr.push({ label, coords: part.coords });
+              });
+            });
+          } else {
+            console.warn('[HighwayResolver] unknown format for', url, data);
+          }
+
           features = arr;
           console.info('[HighwayResolver] loaded features:', features.length, 'from', url);
-          return true;
+          if (features.length) return true;
         } catch (e) {
-          /* try next */
+          console.warn('[HighwayResolver] error loading', url, e);
         }
       }
-      console.warn('[HighwayResolver] no highway file found');
       features = [];
+      console.warn('[HighwayResolver] no highway file found / parsed');
       return false;
     }
 
@@ -216,7 +250,7 @@
     return { loadFirstAvailable, labelForSegment };
   })();
 
-  // ============================ ORS plumbing ================================
+  // ===== ORS plumbing =======================================================
   function savedKeys(){ try { return JSON.parse(localStorage.getItem(LS_KEYS) || '[]'); } catch { return []; } }
   function hydrateKeys(){
     const urlKey = qParam('orsKey');
@@ -279,7 +313,7 @@
     }
   }
 
-  // ============================ Movement builder ============================
+  // ===== Movement builder ===================================================
   function sliceCoords(full, i0, i1){
     const s = Math.max(0, Math.min(i0, full.length - 1));
     const e = Math.max(0, Math.min(i1, full.length - 1));
@@ -309,7 +343,6 @@
     if (!coords?.length || !steps?.length) return [];
     const rows = [];
 
-    // length of a step from geometry indices
     function stepGeomKm(step){
       const wp = step.way_points || step.wayPoints || step.waypoints || [0,0];
       const [i0, i1] = wp;
@@ -334,7 +367,6 @@
       }
     };
 
-    // Walk; detect chains of generic/unnamed steps. If long, query resolver.
     let chainStart = null, chainEnd = null, chainKm = 0;
 
     function flushChainIfAny(){
@@ -353,17 +385,16 @@
 
     for (let i = 0; i < steps.length; i++){
       const st = steps[i];
-      const nameNatural = stepNameNatural(st); // may be "" if generic
+      const nameNatural = stepNameNatural(st);
       const instr = cleanHtml(st?.instruction || '');
       const isGeneric = !nameNatural && GENERIC_REGEX.test(instr);
-
       const wp = st.way_points || st.wayPoints || st.waypoints || [0, 0];
       const [i0, i1] = wp;
 
       if (isGeneric){
         if (chainStart == null) chainStart = i;
-        chainEnd = i; 
-        chainKm += stepGeomKm(st);        // <-- geometry-based length (FIX)
+        chainEnd = i;
+        chainKm += stepGeomKm(st); // geometry-based accumulation
         continue;
       }
 
@@ -375,7 +406,7 @@
     return rows;
   }
 
-  // =========================== Map & orchestration ==========================
+  // ===== Map & orchestration ===============================================
   function clearAll(){
     S.results = [];
     if (S.group) S.group.clearLayers();
@@ -425,7 +456,7 @@
       }
 
       const printBtn = byId('rt-print'); if (printBtn) printBtn.disabled = false;
-      const debugBtn = byId('rt-debug'); if (debugBtn) printBtn.disabled = debugBtn.disabled = false;
+      const debugBtn = byId('rt-debug'); if (debugBtn) debugBtn.disabled = false;
     } catch (e) {
       console.error(e);
       alert('Routing error: ' + e.message);
@@ -439,12 +470,11 @@
     if (g){ g.disabled = b; g.textContent = b ? 'Generating…' : 'Generate Trips'; }
   }
 
-  // ================================ Reports =================================
+  // ===== Reports ============================================================
   function km2(n){ return (n || 0).toFixed(2); }
 
   function printReport(){
     if (!S.results.length) { alert('No trips generated yet.'); return; }
-
     const rowsHtml = S.results.map((r) => {
       const mov = buildMovementsFromDirections(r.route.coords, r.route.steps);
       const lines = mov.map(m => `<tr><td>${m.dir || ''}</td><td>${m.name}</td><td style="text-align:right">${km2(m.km)}</td></tr>`).join('');
@@ -474,7 +504,6 @@
     w.document.close();
   }
 
-  // Debug: raw steps view
   function printDebugSteps(){
     if (!S.results.length) { alert('No trips generated yet.'); return; }
     const cards = S.results.map((r) => {
@@ -524,7 +553,7 @@
     w.document.close();
   }
 
-  // ================================ Controls ================================
+  // ===== Controls & Init ====================================================
   const GeneratorControl = L.Control.extend({
     options: { position: 'topleft' },
     onAdd() {
@@ -581,7 +610,6 @@
     };
   }
 
-  // ================================ Init ====================================
   async function innerInit(map){
     S.map = map;
     hydrateKeys();
