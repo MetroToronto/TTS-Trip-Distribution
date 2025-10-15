@@ -1,12 +1,9 @@
-/* routing.js — ORS routes + street list + PZ report
-   - Highway name fallback from local centerlines (only real highways; confidence-gated).
-   - Ramp buffer: skip first 100 m of a highway step for naming & direction stabilization.
-   - Direction stability with whole-step fallback.
-   - Highway alias grouping (same corridor name & direction = max-km).
-   - Drops tiny fragments (<30 m) to avoid ghosts.
-   - Buttons: Generate Trips, Print Report, Debug Steps, Highways: ON/OFF, **PZ report**.
-   - PZ report: runs trips for **all Planning Zones in exactly one selected PD**. If multiple/none PDs selected, shows an alert.
-   - Expects WGS84 centerlines; tries the paths in HIGHWAY_URLS (relative, for GitHub Pages).
+/* routing.js — ORS routes + street list + PZ report (property- or spatial-based)
+   - Highway fallback names (confidence-gated), ramp buffer 100 m, stable directions.
+   - Highway alias grouping (same corridor; dir = max-km; name = longest-km).
+   - "Highways: ON/OFF" overlay.
+   - NEW: PZ report now falls back to **spatial containment**: loads PD polygons and
+     includes all zone centroids inside the selected PD polygon.
 */
 (function (global) {
   // ===== Tunables =====
@@ -17,7 +14,7 @@
   const CONF_REQ_MEAN_M        = 120;
   const BOUND_LOCK_WINDOW_M    = 300;
   const MIN_FRAGMENT_M         = 30;
-  const RAMP_SKIP_M            = 100;   // ramp buffer
+  const RAMP_SKIP_M            = 100;
   const PER_REQUEST_DELAY      = 80;
 
   const PROFILE    = 'driving-car';
@@ -35,7 +32,8 @@
     'data/toronto_highways.geojson'
   ];
 
-  const ZONES_URL = 'data/tts_zones.json'; // fallback for PZ report when helpers not provided
+  const ZONES_URL = 'data/tts_zones.json';
+  const PDS_URL   = 'data/tts_pds.json';
 
   // ===== Keys / State =====
   const INLINE_DEFAULT_KEY =
@@ -48,7 +46,8 @@
     keys:[], keyIndex:0,
     highwaysOn:true,
     highwayFeatures:[],  // [{label, coords:[ [lon,lat], ... ]}]
-    highwayLayer:null
+    highwayLayer:null,
+    resultsRouteCoordsRef:null
   };
 
   // ===== Utils =====
@@ -197,7 +196,7 @@
     function bestLabelForSegment(features, segCoords){
       if (!features?.length || !segCoords || segCoords.length < 2) return '';
       const sampled = resampleByDistance(segCoords, SAMPLE_EVERY_M);
-      const tallies = new Map(); // label -> {near:count, sum:meters}
+      const tallies = new Map();
       for (const p of sampled){
         let best = { d: 1e12, label: '' };
         for (const f of features){
@@ -423,7 +422,7 @@
       const nm = normalizeName(name);
       if (!nm) return;
 
-      let seg = sliceCoords(coords, i0, i1);
+      const seg = sliceCoords(coords, i0, i1);
       if (seg.length < 2) return;
 
       let meters = 0; for (let i = 1; i < seg.length; i++) meters += haversineMeters(seg[i-1], seg[i]);
@@ -451,15 +450,13 @@
       const wp  = st.way_points || st.wayPoints || st.waypoints || [0,0];
       const [i0, i1] = wp;
 
-      // 1) Natural name
       let name = stepNameNatural(st);
       const instr = cleanHtml(st?.instruction || '');
       const isGeneric = !name && GENERIC_REGEX.test(instr);
 
-      // 2) Highway naming (ramp-buffered) if unlabeled/generic
       let isHighwayStep = false;
       if (S.highwaysOn && (!name || isGeneric)) {
-        const cut = cutAfterDistance(S.resultsRouteCoordsRef || [], i0, i1, RAMP_SKIP_M); // guard if not set
+        const cut = cutAfterDistance(S.resultsRouteCoordsRef || [], i0, i1, RAMP_SKIP_M);
         const segAfter = sliceCoords(S.resultsRouteCoordsRef || [], cut, i1);
         const label = HighwayResolver.bestLabelForSegment(S.highwayFeatures, segAfter.length ? segAfter : sliceCoords(S.resultsRouteCoordsRef || [], i0, i1));
         if (label) { name = label; isHighwayStep = true; }
@@ -484,11 +481,9 @@
     if (!S.group) S.group = L.layerGroup().addTo(S.map);
     L.polyline(coords.map(([lng, lat]) => [lat, lng]), { color, weight: 4, opacity: 0.9 }).addTo(S.group);
   }
-
   function updateCenterlineLayer(){
     if (S.highwayLayer){ try { S.map.removeLayer(S.highwayLayer); } catch {} S.highwayLayer = null; }
     if (!S.highwaysOn || !S.highwayFeatures.length) return;
-
     const grp = L.layerGroup();
     for (const f of S.highwayFeatures){
       const latlngs = f.coords.map(([lon,lat]) => [lat, lon]);
@@ -549,23 +544,13 @@
     if (g){ g.disabled = b; g.textContent = b ? 'Generating…' : 'Generate Trips'; }
   }
 
-  // ===== PZ report (zones in one PD) =====
-  function parsePDIdFromLabel(lbl){
-    const m = String(lbl || '').match(/\bPD\s*([0-9]+)\b/i);
-    return m ? m[1] : null;
-  }
-  async function loadZonesGeo(){
-    try {
-      const res = await fetch(ZONES_URL, { cache:'no-cache' });
-      if (!res.ok) throw new Error('zones not found');
-      return await res.json();
-    } catch (e) {
-      console.warn('Could not load zones file', e);
-      return null;
-    }
+  // ===== Geo helpers for PZ report =====
+  async function loadJson(url){
+    const res = await fetch(url, { cache:'no-cache' });
+    if (!res.ok) throw new Error(`${url} not found`);
+    return res.json();
   }
   function centroidWGS84(geom){
-    // rough centroid; fine for routing origins
     function polyCentroid(coords){
       let area=0, x=0, y=0;
       const pts = coords[0]; if (!pts || pts.length<3) return null;
@@ -585,11 +570,47 @@
     }
     return null;
   }
+  // ray-casting for Polygon or MultiPolygon
+  function pointInPolygon(pt, geom){
+    const [x, y] = pt;
+    const inRing = (ring) => {
+      let inside = false;
+      for (let i=0, j=ring.length-1; i<ring.length; j=i++){
+        const xi = ring[i][0], yi = ring[i][1];
+        const xj = ring[j][0], yj = ring[j][1];
+        const intersect = ((yi>y)!==(yj>y)) && (x < (xj-xi)*(y-yi)/(yj-yi + 1e-20)+xi);
+        if (intersect) inside = !inside;
+      }
+      return inside;
+    };
+    if (geom.type === 'Polygon'){
+      const rings = geom.coordinates || [];
+      if (!rings.length) return false;
+      if (!inRing(rings[0])) return false;
+      for (let k=1;k<rings.length;k++){ if (inRing(rings[k])) return false; }
+      return true;
+    }
+    if (geom.type === 'MultiPolygon'){
+      for (const poly of geom.coordinates){
+        if (!poly.length) continue;
+        if (inRing(poly[0])) {
+          let holeHit = false;
+          for (let k=1;k<poly.length;k++){ if (inRing(poly[k])) { holeHit = true; break; } }
+          if (!holeHit) return true;
+        }
+      }
+    }
+    return false;
+  }
 
-  async function getZoneTargetsForSinglePD(selectedPDId){
-    // 1) Prefer helper from your app if present
+  function parsePDIdFromLabel(lbl){
+    const m = String(lbl || '').match(/\bPD\s*([0-9]+)\b/i);
+    return m ? m[1] : null;
+  }
+
+  async function getZoneTargetsForSinglePD(selectedPDId, selectedPDPointLonLat){
+    // 1) App-provided helpers
     if (typeof global.getZoneTargetsForPD === 'function') {
-      // expected return: [{lon,lat,label}] or [[lon,lat,label], ...]
       const arr = await Promise.resolve(global.getZoneTargetsForPD(selectedPDId));
       return (arr || []).map(t => Array.isArray(t) ? { lon:t[0], lat:t[1], label:t[2] } : t);
     }
@@ -598,43 +619,77 @@
       return (arr || []).map(t => Array.isArray(t) ? { lon:t[0], lat:t[1], label:t[2] } : t);
     }
 
-    // 2) Fallback: load zones file and filter by PD id/name field
-    const gj = await loadZonesGeo();
-    if (!gj || !Array.isArray(gj.features)) throw new Error('Zones data unavailable');
-
-    const feats = gj.features.filter(f => {
+    // 2) Load zones & try property match first
+    const gjZones = await loadJson(ZONES_URL);
+    const featuresZ = gjZones?.features || [];
+    const byProp = featuresZ.filter(f => {
       const p = f.properties || {};
-      // try a handful of likely field names
-      const pd = p.PD || p.PD_ID || p.PDID || p.DISTRICT || p.PlanningDistrict || p.PD_NAME;
+      const pd = p.PD ?? p.PD_ID ?? p.PDID ?? p.DISTRICT ?? p.PlanningDistrict ?? p.PD_NAME;
       if (pd == null) return false;
       return String(pd).trim().replace(/^PD\s*/i,'') == String(selectedPDId);
     });
 
-    if (!feats.length) throw new Error('No zones found for PD ' + selectedPDId);
+    if (byProp.length){
+      const targets = [];
+      for (const f of byProp){
+        const c = centroidWGS84(f.geometry);
+        if (!c) continue;
+        const [lon, lat] = sanitizeLonLat([c[0], c[1]]);
+        const p = f.properties || {};
+        const label = p.ZONE ?? p.ZONE_ID ?? p.TTS_ZONE ?? p.ID ?? p.Name ?? 'Zone';
+        targets.push({ lon, lat, label: String(label) });
+      }
+      if (targets.length) return targets;
+    }
 
+    // 3) Spatial fallback: find PD polygon (by property OR by containment of selected PD point),
+    //    then include all zone centroids that are inside that polygon.
+    const gjPDs = await loadJson(PDS_URL);
+    const featuresP = gjPDs?.features || [];
+
+    // Try property match to get the PD geometry
+    let pdFeature = featuresP.find(f => {
+      const p = f.properties || {};
+      const pd = p.PD ?? p.PD_ID ?? p.PDID ?? p.DISTRICT ?? p.PlanningDistrict ?? p.PD_NAME;
+      return pd != null && String(pd).trim().replace(/^PD\s*/i,'') == String(selectedPDId);
+    });
+
+    // If still not found, pick the PD whose polygon contains the *selected PD point*
+    if (!pdFeature && selectedPDPointLonLat){
+      const pt = sanitizeLonLat(selectedPDPointLonLat);
+      pdFeature = featuresP.find(f => pointInPolygon(pt, f.geometry));
+    }
+    if (!pdFeature) throw new Error('PD boundary not found for PD ' + selectedPDId);
+
+    // Build targets by spatial containment
+    const pdGeom = pdFeature.geometry;
     const targets = [];
-    for (const f of feats){
+    for (const f of featuresZ){
       const c = centroidWGS84(f.geometry);
       if (!c) continue;
-      const [lon, lat] = sanitizeLonLat([c[0], c[1]]);
-      const p = f.properties || {};
-      const label = p.ZONE || p.ZONE_ID || p.TTS_ZONE || p.ID || p.Name || 'Zone';
-      targets.push({ lon, lat, label: String(label) });
+      const lonlat = sanitizeLonLat([c[0], c[1]]);
+      if (pointInPolygon(lonlat, pdGeom)){
+        const p = f.properties || {};
+        const label = p.ZONE ?? p.ZONE_ID ?? p.TTS_ZONE ?? p.ID ?? p.Name ?? 'Zone';
+        targets.push({ lon: lonlat[0], lat: lonlat[1], label: String(label) });
+      }
     }
     return targets;
   }
 
   async function pzReport(){
-    // get selected PDs (use your helper if present)
     const pdTargets = (global.getSelectedPDTargets && global.getSelectedPDTargets()) || [];
-    if (!pdTargets.length) { alert('Please select one PD to run a PZ report.'); return; }
+    if (!pdTargets.length) { alert('Please select exactly one PD to run a PZ report.'); return; }
     if (pdTargets.length > 1) { alert('Only one PD can be selected for a PZ report.'); return; }
 
-    // Determine PD id (try label like "PD 5", else accept numeric in object)
     const one = pdTargets[0];
     const label = Array.isArray(one) ? (one[2] || '') : (one.label || one.name || '');
     const pdId = parsePDIdFromLabel(label) || one.pdId || one.PD || one.PD_ID;
     if (!pdId) { alert('Could not determine the PD id for the selection.'); return; }
+
+    const selectedPDPoint = Array.isArray(one)
+      ? sanitizeLonLat([one[0], one[1]])
+      : sanitizeLonLat([one.lon ?? one.lng ?? one.x, one.lat ?? one.y]);
 
     let originLonLat;
     try { originLonLat = getOriginLonLat(); }
@@ -643,8 +698,8 @@
     setBusy(true);
 
     try {
-      const zones = await getZoneTargetsForSinglePD(String(pdId));
-      if (!zones || !zones.length){ alert('No zones found for this PD.'); return; }
+      const zones = await getZoneTargetsForSinglePD(String(pdId), selectedPDPoint);
+      if (!zones || !zones.length){ alert('No zones found for PD ' + pdId); return; }
 
       const results = [];
       for (let i=0; i<zones.length; i++){
@@ -655,13 +710,12 @@
         const feat  = json.features?.[0];
         const coords = feat?.geometry?.coordinates || [];
         const steps  = feat?.properties?.segments?.[0]?.steps || [];
-        S.resultsRouteCoordsRef = coords; // for ramp-buffered labeling
+        S.resultsRouteCoordsRef = coords;
 
         results.push({ dest: { lon: dest[0], lat: dest[1], label: z.label || `Zone ${i+1}` }, route: { coords, steps }});
         await sleep(PER_REQUEST_DELAY);
       }
 
-      // Build a single PZ report window
       const cards = results.map((r) => {
         const mov = buildMovementsFromDirections(r.route.coords, r.route.steps);
         const lines = mov.map(m => `<tr><td>${m.dir || ''}</td><td>${m.name}</td><td style="text-align:right">${(m.km||0).toFixed(2)}</td></tr>`).join('');
@@ -700,10 +754,8 @@
 
   // ===== Reports =====
   function km2(n){ return (n || 0).toFixed(2); }
-
   function printReport(){
     if (!S.results.length) { alert('No trips generated yet.'); return; }
-
     const rowsHtml = S.results.map((r) => {
       const mov = buildMovementsFromDirections(r.route.coords, r.route.steps);
       const lines = mov.map(m => `<tr><td>${m.dir || ''}</td><td>${m.name}</td><td style="text-align:right">${km2(m.km)}</td></tr>`).join('');
