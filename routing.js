@@ -1,5 +1,5 @@
-/* routing.js — ORS for geometry/movements; HighwayResolver labels long unnamed motorway segments
-   Reads your /data/highway_centrelines.json (props.Name) and falls back to a couple of alternates. */
+/* routing.js — ORS geometry/movements; local HighwayResolver labels long unnamed motorway segments.
+   IMPORTANT FIX: chain length now measured from geometry slice (way_points) instead of step.distance. */
 (function (global) {
   // ============================= Tunables ===================================
   const GENERIC_REGEX          = /\b(keep (right|left)|continue|head (east|west|north|south))\b/i;
@@ -309,6 +309,15 @@
     if (!coords?.length || !steps?.length) return [];
     const rows = [];
 
+    // length of a step from geometry indices
+    function stepGeomKm(step){
+      const wp = step.way_points || step.wayPoints || step.waypoints || [0,0];
+      const [i0, i1] = wp;
+      const seg = sliceCoords(coords, i0, i1);
+      let meters = 0; for (let i = 1; i < seg.length; i++) meters += haversineMeters(seg[i-1], seg[i]);
+      return meters / 1000;
+    }
+
     const pushRow = (name, i0, i1, waypoints) => {
       const nm = normalizeName(name);
       if (!nm) return;
@@ -347,13 +356,14 @@
       const nameNatural = stepNameNatural(st); // may be "" if generic
       const instr = cleanHtml(st?.instruction || '');
       const isGeneric = !nameNatural && GENERIC_REGEX.test(instr);
+
       const wp = st.way_points || st.wayPoints || st.waypoints || [0, 0];
       const [i0, i1] = wp;
-      const distKm = (st?.distance || 0) / 1000;
 
       if (isGeneric){
         if (chainStart == null) chainStart = i;
-        chainEnd = i; chainKm += distKm;
+        chainEnd = i; 
+        chainKm += stepGeomKm(st);        // <-- geometry-based length (FIX)
         continue;
       }
 
@@ -415,7 +425,7 @@
       }
 
       const printBtn = byId('rt-print'); if (printBtn) printBtn.disabled = false;
-      const debugBtn = byId('rt-debug'); if (debugBtn) debugBtn.disabled = false;
+      const debugBtn = byId('rt-debug'); if (debugBtn) printBtn.disabled = debugBtn.disabled = false;
     } catch (e) {
       console.error(e);
       alert('Routing error: ' + e.message);
