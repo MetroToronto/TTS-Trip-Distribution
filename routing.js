@@ -1,15 +1,21 @@
-/* routing.js — ORS geometry/movements with per-step highway name fallback and a toggleable centerlines overlay.
-   - Any unlabeled/generic step tries nearest-name from centerline shapefile.
-   - Adds a "Highways: ON/OFF" button to enable/disable resolver and overlay.
-   - Loads data/highway_centrelines.json (relative path; works on GitHub Pages).
+/* routing.js — ORS routes + street list
+   - Per-step highway name fallback (nearest centerline) when unlabeled/generic — only for actual highways.
+   - Direction stability with whole-step fallback.
+   - NEW: Highway alias grouping (e.g., "HIGHWAY 85", "Hwy 85", "Conestoga Parkway, 85") merges as one corridor;
+          the group's direction = direction with the most km in that group; display name = longest-km member's name.
+   - Drops tiny fragments (<30 m) to avoid ghosts.
+   - "Highways: ON/OFF" toggle + overlay.
+   - Expects centerlines in WGS84 at one of the paths in HIGHWAY_URLS (relative paths for GitHub Pages).
 */
 (function (global) {
-  // ============================= Tunables ===================================
+  // ===== Tunables ===========================================================
   const GENERIC_REGEX          = /\b(keep (right|left)|continue|head (east|west|north|south))\b/i;
   const SAMPLE_EVERY_M         = 500;   // sampling step when matching steps to centerlines
-  const MATCH_BUFFER_M         = 260;   // max distance from sample to centerline
-  const BOUND_LOCK_WINDOW_M    = 300;   // meters to stabilize NB/EB/SB/WB
-  const MIN_FRAGMENT_M         = 0;     // keep tiny pieces; we merge ourselves
+  const MATCH_BUFFER_M         = 260;   // absolute maximum considered “near”
+  const CONF_REQ_SHARE         = 0.60;  // >=60% of samples must be near same line
+  const CONF_REQ_MEAN_M        = 120;   // and mean distance of near samples <= 120 m
+  const BOUND_LOCK_WINDOW_M    = 300;   // meters to stabilize NB/EB/SB/WB at start of step
+  const MIN_FRAGMENT_M         = 30;    // drop micro pieces to avoid ghosts
   const PER_REQUEST_DELAY      = 80;
 
   const PROFILE    = 'driving-car';
@@ -20,35 +26,32 @@
   const COLOR_OTHERS = '#2166f3';
   const CENTERLINE_COLOR = '#ff0080';
 
-  // IMPORTANT: relative paths for GitHub Pages project sites
   const HIGHWAY_URLS = [
-    'data/highway_centrelines.json',  // your file (Canadian spelling)
-    'data/highway_centerlines.json',  // fallback (US spelling)
-    'data/toronto_highways.geojson'   // fallback (GeoJSON)
+    'data/highway_centerlines_wgs84.geojson',
+    'data/highway_centrelines.json',
+    'data/highway_centerlines.json',
+    'data/toronto_highways.geojson'
   ];
 
-  // Inline fallback ORS key (ignored if orsKey exists/saved)
+  // ===== State / Keys =======================================================
   const INLINE_DEFAULT_KEY =
     'eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6Ijk5NWI5MTE5OTM2YTRmYjNhNDRiZTZjNDRjODhhNTRhIiwiaCI6Im11cm11cjY0In0=';
-
   const LS_KEYS = 'ORS_KEYS';
   const LS_ACTIVE_INDEX = 'ORS_ACTIVE_INDEX';
 
-  // =============================== State ====================================
   const S = {
     map:null, group:null, results:[],
     keys:[], keyIndex:0,
-    highwaysOn:true,         // toggle state (default ON)
-    highwayFeatures:[],      // [{label, coords}]
-    highwayLayer:null        // Leaflet layer for overlay
+    highwaysOn:true,
+    highwayFeatures:[],  // [{label, coords:[ [lon,lat], ... ]}]
+    highwayLayer:null
   };
 
-  // =============================== Helpers ==================================
+  // ===== Small utils ========================================================
   const byId  = (id) => document.getElementById(id);
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   const qParam = (k) => new URLSearchParams(location.search).get(k) || '';
   const toRad = (d) => d * Math.PI / 180;
-
   const isFiniteNum = (n) => Number.isFinite(n) && !Number.isNaN(n);
   const num = (x) => { const n = typeof x === 'string' ? parseFloat(x) : +x; return Number.isFinite(n) ? n : NaN; };
   const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
@@ -145,8 +148,13 @@
     return normalizeName(t);
   }
 
-  // ====================== Highway Name Resolver (local) =====================
+  // ===== Highway Resolver (local) ===========================================
   const HighwayResolver = (() => {
+    function isHighwayLabel(label){
+      const s = String(label || '').toUpperCase();
+      return /(^|\b)(HWY|HIGHWAY|PARKWAY|EXPRESSWAY|QEW|DVP|DON VALLEY|GARDINER|ALLEN|BLACK CREEK|401|404|427|409|410|403|407)\b/.test(s);
+    }
+
     function flattenGeoJSONFeature(f){
       const props = f.properties || {};
       const g = f.geometry || {};
@@ -156,9 +164,7 @@
       if (g.type === 'MultiLineString') (g.coordinates || []).forEach(cs => out.push({ props, coords: cs }));
       return out;
     }
-
     function flattenEsriFeature(f){
-      // ESRI: { attributes:{Name:…}, geometry:{ paths:[ [ [x,y],... ], ... ] } }
       const props = (f.attributes || f.properties || {});
       const geom  = f.geometry || {};
       const paths = geom.paths || geom.PATHS || [];
@@ -166,9 +172,7 @@
       for (const p of paths) out.push({ props, coords: p });
       return out;
     }
-
     function labelFromProps(props){
-      // Your data: props.Name = "HIGHWAY 401"
       return normalizeName(props.Name || props.name || props.official_name || props.short || props.ref);
     }
 
@@ -186,11 +190,14 @@
       return Math.sqrt(dx*dx + dy*dy);
     }
 
-    function labelForSegment(features, segCoords){
+    function bestLabelForSegment(features, segCoords){
       if (!features?.length || !segCoords || segCoords.length < 2) return '';
       const sampled = resampleByDistance(segCoords, SAMPLE_EVERY_M);
-      let best = { d: 1e12, label: '' };
+      const tallies = new Map(); // label -> {near:count, sum:meters}
+      const nearCap = MATCH_BUFFER_M;
+
       for (const p of sampled){
+        let best = { d: 1e12, label: '' };
         for (const f of features){
           const cs = f.coords;
           for (let i=1; i<cs.length; i++){
@@ -198,8 +205,20 @@
             if (d < best.d){ best.d = d; best.label = f.label; }
           }
         }
+        if (best.label && best.d <= nearCap){
+          const t = tallies.get(best.label) || { near:0, sum:0 };
+          t.near++; t.sum += best.d;
+          tallies.set(best.label, t);
+        }
       }
-      return (best.d <= MATCH_BUFFER_M) ? best.label : '';
+      // choose label with max "near" count; compute confidence
+      let winner = '', wNear = 0, wMean = 1e12;
+      for (const [label, t] of tallies){
+        if (t.near > wNear){ winner = label; wNear = t.near; wMean = t.sum / t.near; }
+      }
+      const share = sampled.length ? (wNear / sampled.length) : 0;
+      if (winner && share >= CONF_REQ_SHARE && wMean <= CONF_REQ_MEAN_M && isHighwayLabel(winner)) return winner;
+      return '';
     }
 
     async function loadFirstAvailable(urls){
@@ -216,14 +235,14 @@
               data.features.forEach(f => {
                 flattenEsriFeature(f).forEach(part => {
                   const label = labelFromProps(part.props);
-                  if (label) arr.push({ label, coords: part.coords });
+                  if (label && isHighwayLabel(label)) arr.push({ label, coords: part.coords });
                 });
               });
             } else {
               data.features.forEach(f => {
                 flattenGeoJSONFeature(f).forEach(part => {
                   const label = labelFromProps(part.props);
-                  if (label) arr.push({ label, coords: part.coords });
+                  if (label && isHighwayLabel(label)) arr.push({ label, coords: part.coords });
                 });
               });
             }
@@ -231,11 +250,9 @@
             data.forEach(f => {
               flattenGeoJSONFeature(f).concat(flattenEsriFeature(f)).forEach(part => {
                 const label = labelFromProps(part.props);
-                if (label) arr.push({ label, coords: part.coords });
+                if (label && isHighwayLabel(label)) arr.push({ label, coords: part.coords });
               });
             });
-          } else {
-            console.warn('[HighwayResolver] unknown format for', url);
           }
 
           if (arr.length){
@@ -250,10 +267,10 @@
       return [];
     }
 
-    return { loadFirstAvailable, labelForSegment };
+    return { loadFirstAvailable, bestLabelForSegment };
   })();
 
-  // ============================ ORS plumbing ================================
+  // ===== ORS plumbing =======================================================
   function savedKeys(){ try { return JSON.parse(localStorage.getItem(LS_KEYS) || '[]'); } catch { return []; } }
   function hydrateKeys(){
     const urlKey = qParam('orsKey');
@@ -316,7 +333,7 @@
     }
   }
 
-  // ============================ Movement builder ============================
+  // ===== Movement / direction ==============================================
   function sliceCoords(full, i0, i1){
     const s = Math.max(0, Math.min(i0, full.length - 1));
     const e = Math.max(0, Math.min(i1, full.length - 1));
@@ -341,7 +358,63 @@
     const mean = circularMean(bearings);
     return boundFrom(mean);
   }
+  function wholeStepBound(seg){
+    const s = resampleByDistance(seg, 50);
+    if (s.length < 2) return '';
+    const bearings = [];
+    for (let i=1;i<s.length;i++) bearings.push(bearingDeg(s[i-1], s[i]));
+    return boundFrom(circularMean(bearings));
+  }
 
+  // ===== Highway alias grouping ============================================
+  // Extract numeric route when present: "Hwy 401", "HIGHWAY 85", "Conestoga Parkway, 85" -> key "RTE-401" / "RTE-85"
+  // If no number, key by uppercase trimmed name for non-numbered corridors (e.g., QEW).
+  function canonicalHighwayKey(name){
+    if (!name) return null;
+    const s = String(name).trim();
+    const numTok = s.match(/(?:HWY|HIGHWAY|ROUTE|RTE)?\s*([0-9]{2,3})\b/) || s.match(/,\s*([0-9]{2,3})\b/);
+    if (numTok) return { key:`RTE-${numTok[1]}`, num:numTok[1], labelBase:`${numTok[1]}` };
+    // common named corridors without numbers
+    const up = s.toUpperCase();
+    const named = up.match(/\b(QEW|DVP|GARDINER|DON VALLEY PARKWAY|ALLEN ROAD|BLACK CREEK DRIVE)\b/);
+    if (named) return { key:`NAMED-${named[1]}`, num:null, labelBase:named[1] };
+    return null;
+  }
+
+  function mergeConsecutiveSameCorridor(rows){
+    if (!rows.length) return rows;
+    const out = [];
+    let i = 0;
+    while (i < rows.length){
+      const r = rows[i];
+      const key = canonicalHighwayKey(r.name);
+      if (!key){ out.push(r); i++; continue; }
+
+      // accumulate consecutive rows with same corridor key
+      let j = i, kmByDir = new Map(), kmTotal = 0;
+      let bestName = r.name, bestKm = r.km;
+      const block = [];
+      while (j < rows.length){
+        const rij = rows[j];
+        const kj  = canonicalHighwayKey(rij.name);
+        if (!kj || kj.key !== key.key) break;
+        block.push(rij);
+        kmTotal += rij.km;
+        kmByDir.set(rij.dir || '', (kmByDir.get(rij.dir || '') || 0) + rij.km);
+        if (rij.km > bestKm){ bestKm = rij.km; bestName = rij.name; }
+        j++;
+      }
+      // choose direction with most km in block
+      let domDir = '', domKm = -1;
+      for (const [d,km] of kmByDir.entries()){ if (km > domKm){ domKm = km; domDir = d; } }
+
+      out.push({ dir: domDir, name: bestName, km: +kmTotal.toFixed(2) });
+      i = j;
+    }
+    return out;
+  }
+
+  // ===== Movement builder ===================================================
   function buildMovementsFromDirections(coords, steps){
     if (!coords?.length || !steps?.length) return [];
     const rows = [];
@@ -353,7 +426,10 @@
       if (seg.length < 2) return;
       let meters = 0; for (let i = 1; i < seg.length; i++) meters += haversineMeters(seg[i-1], seg[i]);
       if (meters < MIN_FRAGMENT_M) return;
-      const dir = stableBoundForStep(coords, waypoints, BOUND_LOCK_WINDOW_M) || '';
+
+      let dir = stableBoundForStep(coords, waypoints, BOUND_LOCK_WINDOW_M);
+      if (!dir) dir = wholeStepBound(seg);   // fallback to full-step bearing
+
       const last = rows[rows.length - 1];
       if (last && last.name === nm && last.dir === dir){
         last.km = +(last.km + meters / 1000).toFixed(2);
@@ -373,9 +449,9 @@
       const instr = cleanHtml(st?.instruction || '');
       const isGeneric = !name && GENERIC_REGEX.test(instr);
 
-      // 2) If unlabeled/generic and highways are ON, query nearest centerline for THIS step
+      // 2) If unlabeled/generic and highways are ON, query nearest centerline for THIS step (with confidence)
       if (S.highwaysOn && (!name || isGeneric)) {
-        const label = HighwayResolver.labelForSegment(S.highwayFeatures, seg);
+        const label = HighwayResolver.bestLabelForSegment(S.highwayFeatures, seg);
         if (label) name = label;
       }
 
@@ -385,10 +461,11 @@
       pushRow(name, i0, i1, [i0, i1]);
     }
 
-    return rows;
+    // 4) Merge consecutive rows that belong to the same highway corridor (alias-aware)
+    return mergeConsecutiveSameCorridor(rows);
   }
 
-  // =========================== Map & orchestration ==========================
+  // ===== Map & orchestration ===============================================
   function clearAll(){
     S.results = [];
     if (S.group) S.group.clearLayers();
@@ -402,14 +479,13 @@
   }
 
   function updateCenterlineLayer(){
-    // Remove existing
     if (S.highwayLayer){ try { S.map.removeLayer(S.highwayLayer); } catch {} S.highwayLayer = null; }
     if (!S.highwaysOn || !S.highwayFeatures.length) return;
 
     const grp = L.layerGroup();
     for (const f of S.highwayFeatures){
       const latlngs = f.coords.map(([lon,lat]) => [lat, lon]);
-      L.polyline(latlngs, { color: CENTERLINE_COLOR, weight: 2, opacity: 0.5, dashArray: '6,6' }).addTo(grp);
+      L.polyline(latlngs, { color: CENTERLINE_COLOR, weight: 2, opacity: 0.45, dashArray: '6,6' }).addTo(grp);
     }
     S.highwayLayer = grp.addTo(S.map);
   }
@@ -465,7 +541,7 @@
     if (g){ g.disabled = b; g.textContent = b ? 'Generating…' : 'Generate Trips'; }
   }
 
-  // ================================ Reports =================================
+  // ===== Reports ============================================================
   function km2(n){ return (n || 0).toFixed(2); }
 
   function printReport(){
@@ -550,7 +626,7 @@
     w.document.close();
   }
 
-  // ================================ Controls ================================
+  // ===== Controls & Init ====================================================
   const GeneratorControl = L.Control.extend({
     options: { position: 'topleft' },
     onAdd() {
@@ -599,7 +675,6 @@
       S.highwaysOn = !S.highwaysOn;
       t.textContent = `Highways: ${S.highwaysOn ? 'ON' : 'OFF'}`;
       updateCenterlineLayer();
-      // Note: naming also follows this toggle (handled during buildMovementsFromDirections)
     };
 
     if (s && inp) s.onclick = () => {
@@ -615,7 +690,6 @@
     };
   }
 
-  // ================================ Init ====================================
   async function innerInit(map){
     S.map = map;
     hydrateKeys();
@@ -623,7 +697,6 @@
     map.addControl(new GeneratorControl());
     setTimeout(wireControls, 0);
 
-    // Load centerlines
     S.highwayFeatures = await HighwayResolver.loadFirstAvailable(HIGHWAY_URLS);
     updateCenterlineLayer();
   }
