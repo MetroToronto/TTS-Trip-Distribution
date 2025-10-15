@@ -1,12 +1,9 @@
-/* routing.js — PD/Zone routing + reports (no network fetch for PZ)
-   - Uses ORS Directions v2 for routes.
-   - Movement list with stable NB/EB/SB/WB, ramp buffer 100m for highways.
-   - Highway name fallback from local centerlines (if provided), toggle overlay.
-   - "PZ report" now harvests polygons already on the Leaflet map:
-       * Finds the selected PD polygon from map layers.
-       * Gathers ALL polygon features that look like zones (or any polygon),
-         takes centroids that fall inside the PD polygon.
-       * Routes to each centroid and prints the same table format.
+/* routing.js — PD/Zone routing + reports (robust)
+   - ORS Directions v2 for routes.
+   - Stable NB/EB/SB/WB with 100 m ramp buffer for highways.
+   - Optional highway name fallback from local centerlines; toggle overlay.
+   - PZ report harvests polygons already on the Leaflet map (no fetch).
+   - FIX: corridor merge loop; extra guards so reports never crash on undefined rows.
 */
 (function (global) {
   // ===== Tunables =====
@@ -62,7 +59,7 @@
 
   function sanitizeLonLat(input){
     let arr = Array.isArray(input) ? input : [undefined, undefined];
-    let x = num(arr[0]), y = num(arr[1]);
+    let x = num(arr[0]), y = num(arr[1]]);
     if (isFiniteNum(x) && isFiniteNum(y) && Math.abs(x) <= 90 && Math.abs(y) > 90){ const t=x; x=y; y=t; }
     if (!isFiniteNum(x) || !isFiniteNum(y)) throw new Error(`Invalid coordinate (NaN). Raw: ${JSON.stringify(input)}`);
     x = clamp(x, -180, 180); y = clamp(y, -85, 85);
@@ -99,7 +96,7 @@
     const s = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon/2)**2;
     return 2 * R * Math.asin(Math.sqrt(s));
   }
-  function bearingDeg(a, b) {
+  function bearingDeg(a, b) { // 0..360
     const [lng1, lat1] = [toRad(a[0]), toRad(a[1])], [lng2, lat2] = [toRad(b[0]), toRad(b[1])];
     const y = Math.sin(lng2 - lng1) * Math.cos(lat2);
     const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(lng2 - lng1);
@@ -328,22 +325,24 @@
   function mergeConsecutiveSameCorridor(rows){
     if (!rows.length) return rows;
     const out=[]; let i=0;
-    while (i<i+rows.length){
-      const r=rows[i]; const key=canonicalHighwayKey(r.name);
+    while (i < rows.length){                 // <-- FIXED LOOP
+      const r = rows[i];
+      if (!r){ i++; continue; }              // guard
+      const key = canonicalHighwayKey(r.name);
       if (!key){ out.push(r); i++; continue; }
-      let j=i, kmByDir=new Map(), kmTotal=0, bestName=r.name, bestKm=r.km;
+      let j=i, kmByDir=new Map(), kmTotal=0, bestName=r.name, bestKm=r.km||0;
       while (j<rows.length){
-        const rij=rows[j], kj=canonicalHighwayKey(rij.name);
+        const rij = rows[j]; if (!rij) { j++; continue; }
+        const kj = canonicalHighwayKey(rij.name);
         if (!kj || kj.key!==key.key) break;
-        kmTotal += rij.km;
-        kmByDir.set(rij.dir||'', (kmByDir.get(rij.dir||'')||0)+rij.km);
-        if (rij.km > bestKm){ bestKm=rij.km; bestName=rij.name; }
+        kmTotal += (rij.km||0);
+        kmByDir.set(rij.dir||'', (kmByDir.get(rij.dir||'')||0)+(rij.km||0));
+        if ((rij.km||0) > bestKm){ bestKm=rij.km||0; bestName=rij.name; }
         j++;
       }
       let domDir='', domKm=-1; for (const [d,km] of kmByDir.entries()){ if (km>domKm){ domKm=km; domDir=d; } }
       out.push({ dir: domDir, name: bestName, km:+kmTotal.toFixed(2) });
       i=j;
-      if (i>=rows.length) break;
     }
     return out;
   }
@@ -353,7 +352,7 @@
     if (!coords?.length || !steps?.length) return [];
     const rows = [];
 
-    const pushRow = (name, i0, i1, waypoints, isHighwayStep=false) => {
+    const pushRow = (name, i0, i1, _wp, isHighwayStep=false) => {
       const nm = normalizeName(name); if (!nm) return;
       const seg = sliceCoords(coords, i0, i1); if (seg.length<2) return;
       let meters=0; for (let i=1;i<seg.length;i++) meters += haversineMeters(seg[i-1], seg[i]);
@@ -367,18 +366,13 @@
       } else {
         dir = stableBoundForStep(coords, [i0,i1], BOUND_LOCK_WINDOW_M) || wholeStepBound(seg);
       }
-
-      const last = rows[rows.length-1];
-      if (last && last.name===nm && last.dir===dir){
-        last.km = +(last.km + meters/1000).toFixed(2);
-      } else {
-        rows.push({ dir, name: nm, km:+(meters/1000).toFixed(2) });
-      }
+      rows.push({ dir, name: nm, km:+(meters/1000).toFixed(2) });
     };
 
     for (let i=0;i<steps.length;i++){
-      const st = steps[i], wp = st.way_points || st.wayPoints || st.waypoints || [0,0];
-      const [i0,i1] = wp;
+      const st = steps[i] || {};
+      const wp = st.way_points || st.wayPoints || st.waypoints || [0,0];
+      const [i0=0,i1=0] = wp;
       let name = stepNameNatural(st);
       const instr = cleanHtml(st?.instruction||'');
       const isGeneric = !name && GENERIC_REGEX.test(instr);
@@ -391,9 +385,9 @@
         if (label){ name = label; isHighwayStep = true; }
       }
       if (!name) name = normalizeName(instr);
-      pushRow(name, i0, i1, [i0,i1], isHighwayStep);
+      pushRow(name, i0, i1, wp, isHighwayStep);
     }
-    return mergeConsecutiveSameCorridor(rows);
+    return mergeConsecutiveSameCorridor(rows).filter(Boolean);
   }
 
   // ===== Map helpers =====
@@ -427,7 +421,7 @@
     const pushFeat = (f) => {
       if (!f || f.type!=='Feature') return;
       const g = f.geometry; if (!g) return;
-      if (g.type==='Polygon' || g.type==='MultiPolygon') polys.push(f);
+      if (g.type==='Polygon' || g.type==='MultiPolygon') polys.push({ type:'Feature', geometry:g, properties: (f.properties||{}) });
     };
 
     Object.values(S.map._layers).forEach(layer=>{
@@ -495,7 +489,7 @@
     return false;
   }
 
-  // ===== Generate PD trips (unchanged) =====
+  // ===== Generate PD trips =====
   async function generate(){
     let originLonLat;
     try { originLonLat = getOriginLonLat(); }
@@ -542,7 +536,7 @@
     if (g){ g.disabled=b; g.textContent = b ? 'Generating…' : 'Generate Trips'; }
   }
 
-  // ===== PZ report — harvest from map only (no fetch) =====
+  // ===== PZ report (harvest from map only) =====
   function parsePDIdFromLabel(lbl){
     const m = String(lbl||'').match(/\bPD\s*([0-9]+)\b/i);
     return m ? m[1] : null;
@@ -551,24 +545,22 @@
     for (const k of keys){ if (obj && obj[k]!=null && obj[k]!=='' ) return obj[k]; }
     return fallback;
   }
-  function guessZoneLabel(props, fallbackIdx){
+  function guessZoneLabel(props, idx){
     const k = pickProp(props, ['ZONE','ZONE_ID','TTS_ZONE','TTS','ID','Name','name','label'], null);
-    return (k!=null && k!=='') ? String(k) : `Zone ${fallbackIdx+1}`;
-  }
+    return (k!=null && k!=='') ? String(k) : `Zone ${idx+1}`;
+    }
   function looksLikeZoneFeature(f){
     const p = f.properties || {};
     const joined = Object.keys(p).join('|').toLowerCase();
-    return /zone/.test(joined) || 'tts' in p || 'id' in p || true; // accept polygons broadly
+    return /zone/.test(joined) || 'tts' in p || 'id' in p || true;
   }
   function looksLikePDFeature(f){
     const p = f.properties || {};
     const joined = Object.keys(p).join('|').toLowerCase();
     return /pd|district|planning/.test(joined);
   }
-
   function findSelectedPDPolygon(pdId, selectedPointLonLat){
     const polys = harvestPolygonsFromMap();
-    // 1) try property match
     let byProp = polys.find(f=>{
       if (!looksLikePDFeature(f)) return false;
       const p = f.properties||{};
@@ -578,18 +570,10 @@
       return clean === String(pdId);
     });
     if (byProp) return byProp.geometry;
-
-    // 2) spatial containment of the selected PD point
     if (selectedPointLonLat){
       const pt = sanitizeLonLat(selectedPointLonLat);
       const container = polys.find(f => looksLikePDFeature(f) && pointInPolygon(pt, f.geometry));
       if (container) return container.geometry;
-    }
-    // 3) last resort: largest polygon near the selected point
-    if (selectedPointLonLat){
-      const pt = sanitizeLonLat(selectedPointLonLat);
-      const candidates = polys.filter(f => pointInPolygon(pt, f.geometry));
-      if (candidates.length) return candidates[0].geometry;
     }
     return null;
   }
@@ -612,14 +596,11 @@
     try { originLonLat = getOriginLonLat(); }
     catch (e) { alert('Origin has invalid coordinates. Please re-select the address.'); return; }
 
-    // Find PD polygon from map layers only
     const pdGeom = findSelectedPDPolygon(String(pdId), selectedPDPoint);
     if (!pdGeom){ alert('PZ report error: PD boundary not found on the map.'); return; }
 
-    // Collect all polygon features that look like zones
     const allPolys = harvestPolygonsFromMap().filter(looksLikeZoneFeature);
 
-    // Build zone targets by centroid-in-PD
     const zoneTargets = [];
     for (let i=0;i<allPolys.length;i++){
       const f = allPolys[i];
@@ -648,9 +629,8 @@
         await sleep(PER_REQUEST_DELAY);
       }
 
-      // Print report window
       const cards = results.map((r) => {
-        const mov = buildMovementsFromDirections(r.route.coords, r.route.steps);
+        const mov = (buildMovementsFromDirections(r.route.coords, r.route.steps) || []).filter(m=>m && m.name);
         const lines = mov.map(m => `<tr><td>${m.dir || ''}</td><td>${m.name}</td><td style="text-align:right">${(m.km||0).toFixed(2)}</td></tr>`).join('');
         return `
           <div class="card">
@@ -687,7 +667,7 @@
   function printReport(){
     if (!S.results.length) { alert('No trips generated yet.'); return; }
     const rowsHtml = S.results.map((r) => {
-      const mov = buildMovementsFromDirections(r.route.coords, r.route.steps);
+      const mov = (buildMovementsFromDirections(r.route.coords, r.route.steps) || []).filter(m=>m && m.name);
       const lines = mov.map(m => `<tr><td>${m.dir || ''}</td><td>${m.name}</td><td style="text-align:right">${km2(m.km)}</td></tr>`).join('');
       return `
         <div class="card">
