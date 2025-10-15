@@ -1,9 +1,9 @@
-/* routing.js — ORS routes + street list + PZ report (property- or spatial-based)
-   - Highway fallback names (confidence-gated), ramp buffer 100 m, stable directions.
-   - Highway alias grouping (same corridor; dir = max-km; name = longest-km).
-   - "Highways: ON/OFF" overlay.
-   - NEW: PZ report now falls back to **spatial containment**: loads PD polygons and
-     includes all zone centroids inside the selected PD polygon.
+/* routing.js — robust PZ report + highways + ramp buffer
+   - Highways: name fallback from local centerlines; ramp buffer (100 m) for stable bounds.
+   - Alias grouping for highways (direction = dominant km, name = longest-km row).
+   - Buttons: Generate Trips, Print Report, Debug Steps, Highways: ON/OFF, PZ report.
+   - PZ report: if a PD’s zones can’t be found by property, uses spatial containment.
+   - NEW: Smart JSON loader tries multiple paths and can harvest GeoJSON from the live Leaflet map.
 */
 (function (global) {
   // ===== Tunables =====
@@ -14,7 +14,7 @@
   const CONF_REQ_MEAN_M        = 120;
   const BOUND_LOCK_WINDOW_M    = 300;
   const MIN_FRAGMENT_M         = 30;
-  const RAMP_SKIP_M            = 100;
+  const RAMP_SKIP_M            = 100;   // skip first 100 m of highway steps for naming & direction
   const PER_REQUEST_DELAY      = 80;
 
   const PROFILE    = 'driving-car';
@@ -25,15 +25,15 @@
   const COLOR_OTHERS = '#2166f3';
   const CENTERLINE_COLOR = '#ff0080';
 
+  // Files (we’ll try several variations of these paths automatically)
   const HIGHWAY_URLS = [
     'data/highway_centerlines_wgs84.geojson',
     'data/highway_centrelines.json',
     'data/highway_centerlines.json',
     'data/toronto_highways.geojson'
   ];
-
-  const ZONES_URL = 'data/tts_zones.json';
-  const PDS_URL   = 'data/tts_pds.json';
+  const ZONES_PATH = 'data/tts_zones.json';
+  const PDS_PATH   = 'data/tts_pds.json';
 
   // ===== Keys / State =====
   const INLINE_DEFAULT_KEY =
@@ -157,7 +157,6 @@
       const s = String(label || '').toUpperCase();
       return /(^|\b)(HWY|HIGHWAY|PARKWAY|EXPRESSWAY|QEW|DVP|DON VALLEY|GARDINER|ALLEN|BLACK CREEK|401|404|427|409|410|403|407)\b/.test(s);
     }
-
     function flattenGeoJSONFeature(f){
       const props = f.properties || {};
       const g = f.geometry || {};
@@ -178,32 +177,30 @@
     function labelFromProps(props){
       return normalizeName(props.Name || props.name || props.official_name || props.short || props.ref);
     }
-
     function pointSegDistM(p, a, b){
       const kx = 111320 * Math.cos(toRad((a[1]+b[1])/2));
       const ky = 110540;
       const ax = a[0]*kx, ay=a[1]*ky, bx=b[0]*kx, by=b[1]*ky, px=p[0]*kx, py=p[1]*ky;
       const vx = bx-ax, vy = by-ay;
-      const wx = px-ax, wy = py-ay;
+      const wx = px-ax, wy=py-ay;
       const c1 = vx*wx + vy*wy;
       const c2 = vx*vx + vy*vy;
       const t = c2 ? Math.max(0, Math.min(1, c1/c2)) : 0;
       const nx = ax + t*vx, ny = ay + t*vy;
-      const dx = px - nx, dy = py - ny;
+      const dx = px-nx, dy = py-ny;
       return Math.sqrt(dx*dx + dy*dy);
     }
-
     function bestLabelForSegment(features, segCoords){
       if (!features?.length || !segCoords || segCoords.length < 2) return '';
       const sampled = resampleByDistance(segCoords, SAMPLE_EVERY_M);
-      const tallies = new Map();
+      const tallies = new Map(); // label -> {near,sum}
       for (const p of sampled){
         let best = { d: 1e12, label: '' };
         for (const f of features){
           const cs = f.coords;
-          for (let i=1; i<cs.length; i++){
+          for (let i=1;i<cs.length;i++){
             const d = pointSegDistM(p, cs[i-1], cs[i]);
-            if (d < best.d){ best.d = d; best.label = f.label; }
+            if (d < best.d){ best = { d, label: f.label }; }
           }
         }
         if (best.label && best.d <= MATCH_BUFFER_M){
@@ -212,7 +209,7 @@
           tallies.set(best.label, t);
         }
       }
-      let winner = '', wNear = 0, wMean = 1e12;
+      let winner = '', wNear=0, wMean=1e12;
       for (const [label, t] of tallies){
         if (t.near > wNear){ winner = label; wNear = t.near; wMean = t.sum / t.near; }
       }
@@ -220,53 +217,43 @@
       if (winner && share >= CONF_REQ_SHARE && wMean <= CONF_REQ_MEAN_M && isHighwayLabel(winner)) return winner;
       return '';
     }
-
     async function loadFirstAvailable(urls){
       for (const url of urls){
         try {
-          const res = await fetch(url, { cache: 'no-cache' });
-          if (!res.ok) { console.warn('[HighwayResolver] fetch failed', url, res.status); continue; }
+          const res = await fetch(url, { cache:'no-store' });
+          if (!res.ok) continue;
           const data = await res.json();
-
           const arr = [];
-          if (Array.isArray(data?.features)) {
+          if (Array.isArray(data?.features)){
             const isEsri = !!data.features[0]?.geometry?.paths || !!data.geometryType;
-            if (isEsri) {
-              data.features.forEach(f => {
-                flattenEsriFeature(f).forEach(part => {
-                  const label = labelFromProps(part.props);
-                  if (label && isHighwayLabel(label)) arr.push({ label, coords: part.coords });
+            if (isEsri){
+              data.features.forEach(f=>{
+                const paths = (f.geometry?.paths)||[];
+                paths.forEach(p=>{
+                  const label = labelFromProps(f.attributes||{});
+                  if (label && isHighwayLabel(label)) arr.push({ label, coords: p });
                 });
               });
             } else {
-              data.features.forEach(f => {
-                flattenGeoJSONFeature(f).forEach(part => {
-                  const label = labelFromProps(part.props);
-                  if (label && isHighwayLabel(label)) arr.push({ label, coords: part.coords });
-                });
+              data.features.forEach(f=>{
+                const g = f.geometry||{};
+                if (g.type==='LineString') {
+                  const label = labelFromProps(f.properties||{});
+                  if (label && isHighwayLabel(label)) arr.push({ label, coords: g.coordinates });
+                } else if (g.type==='MultiLineString'){
+                  (g.coordinates||[]).forEach(cs=>{
+                    const label = labelFromProps(f.properties||{});
+                    if (label && isHighwayLabel(label)) arr.push({ label, coords: cs });
+                  });
+                }
               });
             }
-          } else if (Array.isArray(data)) {
-            data.forEach(f => {
-              flattenGeoJSONFeature(f).concat(flattenEsriFeature(f)).forEach(part => {
-                const label = labelFromProps(part.props);
-                if (label && isHighwayLabel(label)) arr.push({ label, coords: part.coords });
-              });
-            });
           }
-
-          if (arr.length){
-            console.info('[HighwayResolver] loaded features:', arr.length, 'from', url);
-            return arr;
-          }
-        } catch (e) {
-          console.warn('[HighwayResolver] error loading', url, e);
-        }
+          if (arr.length) return arr;
+        } catch {}
       }
-      console.warn('[HighwayResolver] no highway file found / parsed');
       return [];
     }
-
     return { loadFirstAvailable, bestLabelForSegment };
   })();
 
@@ -290,16 +277,16 @@
     const url = new URL(ORS_BASE + path);
     const res = await fetch(url.toString(), {
       method,
-      headers: { Authorization: currentKey(), ...(method !== 'GET' && { 'Content-Type':'application/json' }) },
-      body: method === 'GET' ? undefined : JSON.stringify(body)
+      headers: { Authorization: currentKey(), ...(method!=='GET' && {'Content-Type':'application/json'}) },
+      body: method==='GET'?undefined:JSON.stringify(body)
     });
     if ([401,403,429].includes(res.status) && rotateKey()){
       await sleep(150);
-      return orsFetch(path, { method, body }, attempt + 1);
+      return orsFetch(path, { method, body }, attempt+1);
     }
-    if (res.status === 500 && attempt < 1){
+    if (res.status===500 && attempt<1){
       await sleep(200);
-      return orsFetch(path, { method, body }, attempt + 1);
+      return orsFetch(path, { method, body }, attempt+1);
     }
     if (!res.ok){
       const txt = await res.text().catch(()=>res.statusText);
@@ -307,7 +294,6 @@
     }
     return res.json();
   }
-
   async function getRoute(originLonLat, destLonLat) {
     let o = sanitizeLonLat(originLonLat);
     let d = sanitizeLonLat(destLonLat);
@@ -324,7 +310,7 @@
     try {
       return await orsFetch(`/v2/directions/${PROFILE}/geojson`, { method:'POST', body: baseBody });
     } catch (e) {
-      const msg = String(e.message || '');
+      const msg = String(e.message||'');
       const is2099 = msg.includes('ORS 500') && (msg.includes('"code":2099') || msg.includes('code:2099'));
       if (!is2099) throw e;
       const dSwap = sanitizeLonLat([d[1], d[0]]);
@@ -333,49 +319,48 @@
     }
   }
 
-  // ===== Movement / direction =====
+  // ===== Movement / direction helpers =====
   function sliceCoords(full, i0, i1){
-    const s = Math.max(0, Math.min(i0, full.length - 1));
-    const e = Math.max(0, Math.min(i1, full.length - 1));
-    return e <= s ? full.slice(s, s + 1) : full.slice(s, e + 1);
+    const s = Math.max(0, Math.min(i0, full.length-1));
+    const e = Math.max(0, Math.min(i1, full.length-1));
+    return e<=s ? full.slice(s, s+1) : full.slice(s, e+1);
   }
   function cutAfterDistance(coords, startIdx, endIdx, metersToSkip){
-    if (metersToSkip <= 0) return startIdx;
-    let acc = 0;
-    for (let i = startIdx + 1; i <= endIdx; i++){
+    if (metersToSkip<=0) return startIdx;
+    let acc=0;
+    for (let i=startIdx+1;i<=endIdx;i++){
       acc += haversineMeters(coords[i-1], coords[i]);
       if (acc >= metersToSkip) return i;
     }
     return endIdx;
   }
   function stableBoundForStep(fullCoords, waypoints, limitM = BOUND_LOCK_WINDOW_M){
-    if (!Array.isArray(waypoints) || waypoints.length !== 2) return '';
-    const [w0, w1] = waypoints;
-    const s = Math.max(0, Math.min(w0, fullCoords.length - 1));
-    const e = Math.max(0, Math.min(w1, fullCoords.length - 1));
-    if (e <= s + 1) return '';
-    let acc = 0, cut = s + 1;
-    for (let i = s + 1; i <= e; i++){
+    if (!Array.isArray(waypoints) || waypoints.length!==2) return '';
+    const [w0,w1] = waypoints;
+    const s = Math.max(0, Math.min(w0, fullCoords.length-1));
+    const e = Math.max(0, Math.min(w1, fullCoords.length-1));
+    if (e<=s+1) return '';
+    let acc=0, cut=s+1;
+    for (let i=s+1;i<=e;i++){
       acc += haversineMeters(fullCoords[i-1], fullCoords[i]);
-      if (acc >= limitM) { cut = i; break; }
+      if (acc >= limitM){ cut=i; break; }
     }
-    const seg = fullCoords.slice(s, Math.max(cut, s + 1) + 1);
+    const seg = fullCoords.slice(s, Math.max(cut, s+1)+1);
     const samples = resampleByDistance(seg, 50);
-    if (samples.length < 2) return '';
-    const bearings = [];
-    for (let i = 1; i < samples.length; i++) bearings.push(bearingDeg(samples[i-1], samples[i]));
-    const mean = circularMean(bearings);
-    return boundFrom(mean);
+    if (samples.length<2) return '';
+    const bearings=[];
+    for (let i=1;i<samples.length;i++) bearings.push(bearingDeg(samples[i-1], samples[i]));
+    return boundFrom(circularMean(bearings));
   }
   function wholeStepBound(seg){
     const s = resampleByDistance(seg, 50);
-    if (s.length < 2) return '';
-    const bearings = [];
+    if (s.length<2) return '';
+    const bearings=[];
     for (let i=1;i<s.length;i++) bearings.push(bearingDeg(s[i-1], s[i]));
     return boundFrom(circularMean(bearings));
   }
 
-  // Highway alias grouping
+  // ===== Highway alias grouping =====
   function canonicalHighwayKey(name){
     if (!name) return null;
     const s = String(name).trim();
@@ -388,88 +373,76 @@
   }
   function mergeConsecutiveSameCorridor(rows){
     if (!rows.length) return rows;
-    const out = [];
-    let i = 0;
-    while (i < rows.length){
+    const out=[]; let i=0;
+    while (i<rows.length){
       const r = rows[i];
       const key = canonicalHighwayKey(r.name);
       if (!key){ out.push(r); i++; continue; }
-      let j = i, kmByDir = new Map(), kmTotal = 0;
-      let bestName = r.name, bestKm = r.km;
-      while (j < rows.length){
-        const rij = rows[j];
-        const kj  = canonicalHighwayKey(rij.name);
-        if (!kj || kj.key !== key.key) break;
+      let j=i, kmByDir=new Map(), kmTotal=0, bestName=r.name, bestKm=r.km;
+      while (j<rows.length){
+        const rij = rows[j], kj = canonicalHighwayKey(rij.name);
+        if (!kj || kj.key!==key.key) break;
         kmTotal += rij.km;
-        kmByDir.set(rij.dir || '', (kmByDir.get(rij.dir || '') || 0) + rij.km);
+        kmByDir.set(rij.dir||'', (kmByDir.get(rij.dir||'')||0)+rij.km);
         if (rij.km > bestKm){ bestKm = rij.km; bestName = rij.name; }
         j++;
       }
-      let domDir = '', domKm = -1;
-      for (const [d,km] of kmByDir.entries()){ if (km > domKm){ domKm = km; domDir = d; } }
-      out.push({ dir: domDir, name: bestName, km: +kmTotal.toFixed(2) });
-      i = j;
+      let domDir='', domKm=-1; for (const [d,km] of kmByDir.entries()){ if (km>domKm){ domKm=km; domDir=d; } }
+      out.push({ dir: domDir, name: bestName, km:+kmTotal.toFixed(2) });
+      i=j;
     }
     return out;
   }
 
-  // Build movements
+  // ===== Movements from ORS steps =====
   function buildMovementsFromDirections(coords, steps){
     if (!coords?.length || !steps?.length) return [];
     const rows = [];
 
-    const pushRow = (name, i0, i1, waypoints, isHighwayStep = false) => {
-      const nm = normalizeName(name);
-      if (!nm) return;
-
-      const seg = sliceCoords(coords, i0, i1);
-      if (seg.length < 2) return;
-
-      let meters = 0; for (let i = 1; i < seg.length; i++) meters += haversineMeters(seg[i-1], seg[i]);
+    const pushRow = (name, i0, i1, waypoints, isHighwayStep=false) => {
+      const nm = normalizeName(name); if (!nm) return;
+      const seg = sliceCoords(coords, i0, i1); if (seg.length<2) return;
+      let meters=0; for (let i=1;i<seg.length;i++) meters += haversineMeters(seg[i-1], seg[i]);
       if (meters < MIN_FRAGMENT_M) return;
 
-      let dir = '';
-      if (isHighwayStep) {
+      let dir='';
+      if (isHighwayStep){
         const cut = cutAfterDistance(coords, i0, i1, RAMP_SKIP_M);
         const segAfter = sliceCoords(coords, cut, i1);
         dir = stableBoundForStep(coords, [cut, i1], BOUND_LOCK_WINDOW_M) || wholeStepBound(segAfter);
       } else {
-        dir = stableBoundForStep(coords, waypoints, BOUND_LOCK_WINDOW_M) || wholeStepBound(seg);
+        dir = stableBoundForStep(coords, [i0,i1], BOUND_LOCK_WINDOW_M) || wholeStepBound(seg);
       }
 
-      const last = rows[rows.length - 1];
-      if (last && last.name === nm && last.dir === dir){
-        last.km = +(last.km + meters / 1000).toFixed(2);
+      const last = rows[rows.length-1];
+      if (last && last.name===nm && last.dir===dir){
+        last.km = +(last.km + meters/1000).toFixed(2);
       } else {
-        rows.push({ dir, name: nm, km: +(meters / 1000).toFixed(2) });
+        rows.push({ dir, name: nm, km:+(meters/1000).toFixed(2) });
       }
     };
 
-    for (let i = 0; i < steps.length; i++){
-      const st  = steps[i];
-      const wp  = st.way_points || st.wayPoints || st.waypoints || [0,0];
-      const [i0, i1] = wp;
-
+    for (let i=0;i<steps.length;i++){
+      const st = steps[i], wp = st.way_points || st.wayPoints || st.waypoints || [0,0];
+      const [i0,i1] = wp;
       let name = stepNameNatural(st);
-      const instr = cleanHtml(st?.instruction || '');
+      const instr = cleanHtml(st?.instruction||'');
       const isGeneric = !name && GENERIC_REGEX.test(instr);
 
       let isHighwayStep = false;
-      if (S.highwaysOn && (!name || isGeneric)) {
-        const cut = cutAfterDistance(S.resultsRouteCoordsRef || [], i0, i1, RAMP_SKIP_M);
-        const segAfter = sliceCoords(S.resultsRouteCoordsRef || [], cut, i1);
-        const label = HighwayResolver.bestLabelForSegment(S.highwayFeatures, segAfter.length ? segAfter : sliceCoords(S.resultsRouteCoordsRef || [], i0, i1));
-        if (label) { name = label; isHighwayStep = true; }
+      if (S.highwaysOn && (!name || isGeneric)){
+        const cut = cutAfterDistance(S.resultsRouteCoordsRef||[], i0, i1, RAMP_SKIP_M);
+        const segAfter = sliceCoords(S.resultsRouteCoordsRef||[], cut, i1);
+        const label = HighwayResolver.bestLabelForSegment(S.highwayFeatures, segAfter.length?segAfter:sliceCoords(S.resultsRouteCoordsRef||[], i0, i1));
+        if (label){ name = label; isHighwayStep = true; }
       }
-
       if (!name) name = normalizeName(instr);
-      pushRow(name, i0, i1, [i0, i1], isHighwayStep);
+      pushRow(name, i0, i1, [i0,i1], isHighwayStep);
     }
-
     return mergeConsecutiveSameCorridor(rows);
   }
 
-  // ===== Map & orchestration =====
+  // ===== Map & drawing =====
   function clearAll(){
     S.results = [];
     if (S.group) S.group.clearLayers();
@@ -479,15 +452,15 @@
   function drawRoute(coords, color){
     if (!coords?.length) return;
     if (!S.group) S.group = L.layerGroup().addTo(S.map);
-    L.polyline(coords.map(([lng, lat]) => [lat, lng]), { color, weight: 4, opacity: 0.9 }).addTo(S.group);
+    L.polyline(coords.map(([lng,lat])=>[lat,lng]), { color, weight:4, opacity:0.9 }).addTo(S.group);
   }
   function updateCenterlineLayer(){
-    if (S.highwayLayer){ try { S.map.removeLayer(S.highwayLayer); } catch {} S.highwayLayer = null; }
+    if (S.highwayLayer){ try{ S.map.removeLayer(S.highwayLayer); }catch{} S.highwayLayer=null; }
     if (!S.highwaysOn || !S.highwayFeatures.length) return;
     const grp = L.layerGroup();
     for (const f of S.highwayFeatures){
-      const latlngs = f.coords.map(([lon,lat]) => [lat, lon]);
-      L.polyline(latlngs, { color: CENTERLINE_COLOR, weight: 2, opacity: 0.45, dashArray: '6,6' }).addTo(grp);
+      const latlngs = f.coords.map(([lon,lat])=>[lat,lon]);
+      L.polyline(latlngs, { color:CENTERLINE_COLOR, weight:2, opacity:0.45, dashArray:'6,6' }).addTo(grp);
     }
     S.highwayLayer = grp.addTo(S.map);
   }
@@ -495,117 +468,165 @@
   async function generate(){
     let originLonLat;
     try { originLonLat = getOriginLonLat(); }
-    catch (e) { console.error('Origin invalid:', global.ROUTING_ORIGIN, e); alert('Origin has invalid coordinates. Please re-select the address.'); return; }
+    catch (e) { alert('Origin has invalid coordinates. Please re-select the address.'); return; }
 
     const rawTargets = (global.getSelectedPDTargets && global.getSelectedPDTargets()) || [];
     const targets = [];
-    (rawTargets || []).forEach((t, i) => {
-      try {
-        if (Array.isArray(t)) targets.push([sanitizeLonLat([t[0], t[1]])[0], sanitizeLonLat([t[0], t[1]])[1], t[2] ?? `PD ${i+1}`]);
-        else if (t && typeof t === 'object') {
-          const pair = sanitizeLonLat([t.lon ?? t.lng ?? t.x, t.lat ?? t.y]);
-          targets.push([pair[0], pair[1], t.label ?? t.name ?? `PD ${i+1}`]);
+    (rawTargets||[]).forEach((t,i)=>{
+      try{
+        if (Array.isArray(t)) targets.push([sanitizeLonLat([t[0],t[1]])[0], sanitizeLonLat([t[0],t[1]])[1], t[2]??`PD ${i+1}`]);
+        else if (t && typeof t==='object'){
+          const p = sanitizeLonLat([t.lon ?? t.lng ?? t.x, t.lat ?? t.y]);
+          targets.push([p[0], p[1], t.label ?? t.name ?? `PD ${i+1}`]);
         }
-      } catch {}
+      }catch{}
     });
     if (!targets.length){ alert('Select at least one PD with valid coordinates.'); return; }
 
     setBusy(true); clearAll();
 
-    try {
-      for (let idx = 0; idx < targets.length; idx++){
-        const [lon, lat, label] = targets[idx];
-        const destLonLat = sanitizeLonLat([lon, lat]);
-
-        const json  = await getRoute(originLonLat, destLonLat);
+    try{
+      for (let idx=0; idx<targets.length; idx++){
+        const [lon,lat,label] = targets[idx];
+        const json = await getRoute(originLonLat, [lon,lat]);
         const feat  = json.features?.[0];
         const coords = feat?.geometry?.coordinates || [];
         const steps  = feat?.properties?.segments?.[0]?.steps || [];
         S.resultsRouteCoordsRef = coords;
 
-        S.results.push({ dest: { lon, lat, label }, route: { coords, steps }});
-        drawRoute(coords, idx === 0 ? COLOR_FIRST : COLOR_OTHERS);
-
+        S.results.push({ dest:{lon,lat,label}, route:{coords,steps} });
+        drawRoute(coords, idx===0 ? COLOR_FIRST : COLOR_OTHERS);
         await sleep(PER_REQUEST_DELAY);
       }
-
-      const printBtn = byId('rt-print'); if (printBtn) printBtn.disabled = false;
-      const debugBtn = byId('rt-debug'); if (debugBtn) debugBtn.disabled = false;
-    } catch (e) {
-      console.error(e);
+      const printBtn = byId('rt-print'); if (printBtn) printBtn.disabled=false;
+      const debugBtn = byId('rt-debug'); if (debugBtn) debugBtn.disabled=false;
+    } catch(e){
       alert('Routing error: ' + e.message);
     } finally {
       setBusy(false);
     }
   }
-
   function setBusy(b){
     const g = byId('rt-generate');
-    if (g){ g.disabled = b; g.textContent = b ? 'Generating…' : 'Generate Trips'; }
+    if (g){ g.disabled=b; g.textContent = b ? 'Generating…' : 'Generate Trips'; }
+  }
+
+  // ===== Smart JSON loader & map harvesters =====
+  function urlCandidates(relPath){
+    const basePath = location.pathname.endsWith('/') ? location.pathname : location.pathname.replace(/[^/]+$/, '');
+    const clean = relPath.replace(/^\/+/,'');
+    const uniq = [];
+    const add = (s)=>{ if(!uniq.includes(s)) uniq.push(s); };
+    add(clean);                 // "data/file.json"
+    add('./'+clean);            // "./data/file.json"
+    add(basePath + clean);      // "/repo/sub/ + data/file.json"
+    add('/' + clean);           // "/data/file.json"
+    return uniq;
+  }
+  async function fetchJsonSmart(relPath){
+    const tried = [];
+    for (const p of urlCandidates(relPath)){
+      try {
+        const res = await fetch(p, { cache:'no-store' });
+        if (!res.ok){ tried.push(`${p} (${res.status})`); continue; }
+        const txt = await res.text(); // handle wrong MIME types
+        return JSON.parse(txt);
+      } catch (e) { tried.push(`${p}`); }
+    }
+    const err = new Error('Failed to fetch ' + relPath + ' (tried: ' + tried.join(', ') + ')');
+    err._paths = tried;
+    throw err;
+  }
+  // Harvest features from existing Leaflet GeoJSON layers on the map
+  function harvestGeoJSONFromMap(filterFn){
+    const features = [];
+    if (!S.map || !S.map._layers) return features;
+    Object.values(S.map._layers).forEach(layer=>{
+      if (layer && layer.feature && layer.feature.type && layer.feature.geometry){
+        const f = layer.feature;
+        if (!filterFn || filterFn(f)) features.push(f);
+      }
+      if (layer && typeof layer.eachLayer === 'function' && layer.toGeoJSON){
+        try{
+          const gj = layer.toGeoJSON();
+          const list = Array.isArray(gj.features) ? gj.features : (gj.type==='Feature' ? [gj] : []);
+          list.forEach(f=>{ if (!filterFn || filterFn(f)) features.push(f); });
+        }catch{}
+      }
+    });
+    return features;
   }
 
   // ===== Geo helpers for PZ report =====
-  async function loadJson(url){
-    const res = await fetch(url, { cache:'no-cache' });
-    if (!res.ok) throw new Error(`${url} not found`);
-    return res.json();
-  }
   function centroidWGS84(geom){
     function polyCentroid(coords){
-      let area=0, x=0, y=0;
-      const pts = coords[0]; if (!pts || pts.length<3) return null;
+      let area=0, x=0, y=0; const pts = coords[0]; if (!pts || pts.length<3) return null;
       for (let i=0;i<pts.length-1;i++){
-        const [x0,y0]=pts[i], [x1,y1]=pts[i+1];
-        const a = x0*y1 - x1*y0;
-        area += a; x += (x0+x1)*a; y += (y0+y1)*a;
+        const [x0,y0]=pts[i], [x1,y1]=pts[i+1]; const a = x0*y1 - x1*y0; area += a; x += (x0+x1)*a; y += (y0+y1)*a;
       }
-      area *= 0.5;
-      if (Math.abs(area) < 1e-12) return null;
-      return [x/(6*area), y/(6*area)];
+      area *= 0.5; if (Math.abs(area)<1e-12) return null; return [x/(6*area), y/(6*area)];
     }
     if (!geom) return null;
-    if (geom.type === 'Polygon') return polyCentroid(geom.coordinates);
-    if (geom.type === 'MultiPolygon'){
-      for (const p of geom.coordinates){ const c = polyCentroid(p); if (c) return c; }
-    }
+    if (geom.type==='Polygon') return polyCentroid(geom.coordinates);
+    if (geom.type==='MultiPolygon'){ for (const p of geom.coordinates){ const c = polyCentroid(p); if (c) return c; } }
     return null;
   }
-  // ray-casting for Polygon or MultiPolygon
   function pointInPolygon(pt, geom){
-    const [x, y] = pt;
-    const inRing = (ring) => {
-      let inside = false;
-      for (let i=0, j=ring.length-1; i<ring.length; j=i++){
-        const xi = ring[i][0], yi = ring[i][1];
-        const xj = ring[j][0], yj = ring[j][1];
+    const [x,y] = pt;
+    const inRing = (ring)=>{
+      let inside=false;
+      for (let i=0,j=ring.length-1;i<ring.length;j=i++){
+        const xi=ring[i][0], yi=ring[i][1], xj=ring[j][0], yj=ring[j][1];
         const intersect = ((yi>y)!==(yj>y)) && (x < (xj-xi)*(y-yi)/(yj-yi + 1e-20)+xi);
-        if (intersect) inside = !inside;
+        if (intersect) inside=!inside;
       }
       return inside;
     };
-    if (geom.type === 'Polygon'){
-      const rings = geom.coordinates || [];
-      if (!rings.length) return false;
-      if (!inRing(rings[0])) return false;
-      for (let k=1;k<rings.length;k++){ if (inRing(rings[k])) return false; }
+    if (geom.type==='Polygon'){
+      const rings=geom.coordinates||[]; if (!rings.length) return false;
+      if (!inRing(rings[0])) return false; for (let k=1;k<rings.length;k++){ if (inRing(rings[k])) return false; }
       return true;
     }
-    if (geom.type === 'MultiPolygon'){
+    if (geom.type==='MultiPolygon'){
       for (const poly of geom.coordinates){
         if (!poly.length) continue;
-        if (inRing(poly[0])) {
-          let holeHit = false;
-          for (let k=1;k<poly.length;k++){ if (inRing(poly[k])) { holeHit = true; break; } }
-          if (!holeHit) return true;
-        }
+        if (inRing(poly[0])){ let hole=false; for (let k=1;k<poly.length;k++){ if (inRing(poly[k])){ hole=true; break; } }
+          if (!hole) return true; }
       }
     }
     return false;
   }
-
   function parsePDIdFromLabel(lbl){
-    const m = String(lbl || '').match(/\bPD\s*([0-9]+)\b/i);
+    const m = String(lbl||'').match(/\bPD\s*([0-9]+)\b/i);
     return m ? m[1] : null;
+  }
+
+  async function loadZonesWithFallback(){
+    try { const gj = await fetchJsonSmart(ZONES_PATH); return gj; }
+    catch (e) {
+      // Use features already on the map (zones layer)
+      const feats = harvestGeoJSONFromMap(f=>{
+        const p = f.properties || {};
+        return ('ZONE' in p) || ('ZONE_ID' in p) || ('TTS_ZONE' in p) || ('TTS' in p) || ('ID' in p);
+      });
+      if (feats.length){
+        return { type:'FeatureCollection', features: feats };
+      }
+      throw e;
+    }
+  }
+  async function loadPDsWithFallback(){
+    try { const gj = await fetchJsonSmart(PDS_PATH); return gj; }
+    catch (e) {
+      const feats = harvestGeoJSONFromMap(f=>{
+        const p = f.properties || {};
+        return ('PD' in p) || ('PD_ID' in p) || ('DISTRICT' in p) || ('PlanningDistrict' in p) || ('PD_NAME' in p);
+      });
+      if (feats.length){
+        return { type:'FeatureCollection', features: feats };
+      }
+      throw e;
+    }
   }
 
   async function getZoneTargetsForSinglePD(selectedPDId, selectedPDPointLonLat){
@@ -619,59 +640,52 @@
       return (arr || []).map(t => Array.isArray(t) ? { lon:t[0], lat:t[1], label:t[2] } : t);
     }
 
-    // 2) Load zones & try property match first
-    const gjZones = await loadJson(ZONES_URL);
+    // 2) Load zones & try property match
+    const gjZones = await loadZonesWithFallback();
     const featuresZ = gjZones?.features || [];
-    const byProp = featuresZ.filter(f => {
+    const byProp = featuresZ.filter(f=>{
       const p = f.properties || {};
       const pd = p.PD ?? p.PD_ID ?? p.PDID ?? p.DISTRICT ?? p.PlanningDistrict ?? p.PD_NAME;
       if (pd == null) return false;
       return String(pd).trim().replace(/^PD\s*/i,'') == String(selectedPDId);
     });
-
     if (byProp.length){
-      const targets = [];
+      const targets=[];
       for (const f of byProp){
-        const c = centroidWGS84(f.geometry);
-        if (!c) continue;
-        const [lon, lat] = sanitizeLonLat([c[0], c[1]]);
+        const c = centroidWGS84(f.geometry); if (!c) continue;
+        const [lon,lat] = sanitizeLonLat([c[0],c[1]]);
         const p = f.properties || {};
         const label = p.ZONE ?? p.ZONE_ID ?? p.TTS_ZONE ?? p.ID ?? p.Name ?? 'Zone';
-        targets.push({ lon, lat, label: String(label) });
+        targets.push({ lon, lat, label:String(label) });
       }
       if (targets.length) return targets;
     }
 
-    // 3) Spatial fallback: find PD polygon (by property OR by containment of selected PD point),
-    //    then include all zone centroids that are inside that polygon.
-    const gjPDs = await loadJson(PDS_URL);
+    // 3) Spatial fallback: PD polygon then zone-centroid-in-PD
+    const gjPDs = await loadPDsWithFallback();
     const featuresP = gjPDs?.features || [];
 
-    // Try property match to get the PD geometry
-    let pdFeature = featuresP.find(f => {
+    let pdFeature = featuresP.find(f=>{
       const p = f.properties || {};
       const pd = p.PD ?? p.PD_ID ?? p.PDID ?? p.DISTRICT ?? p.PlanningDistrict ?? p.PD_NAME;
       return pd != null && String(pd).trim().replace(/^PD\s*/i,'') == String(selectedPDId);
     });
 
-    // If still not found, pick the PD whose polygon contains the *selected PD point*
     if (!pdFeature && selectedPDPointLonLat){
       const pt = sanitizeLonLat(selectedPDPointLonLat);
       pdFeature = featuresP.find(f => pointInPolygon(pt, f.geometry));
     }
     if (!pdFeature) throw new Error('PD boundary not found for PD ' + selectedPDId);
 
-    // Build targets by spatial containment
     const pdGeom = pdFeature.geometry;
-    const targets = [];
+    const targets=[];
     for (const f of featuresZ){
-      const c = centroidWGS84(f.geometry);
-      if (!c) continue;
-      const lonlat = sanitizeLonLat([c[0], c[1]]);
+      const c = centroidWGS84(f.geometry); if (!c) continue;
+      const lonlat = sanitizeLonLat([c[0],c[1]]);
       if (pointInPolygon(lonlat, pdGeom)){
         const p = f.properties || {};
         const label = p.ZONE ?? p.ZONE_ID ?? p.TTS_ZONE ?? p.ID ?? p.Name ?? 'Zone';
-        targets.push({ lon: lonlat[0], lat: lonlat[1], label: String(label) });
+        targets.push({ lon:lonlat[0], lat:lonlat[1], label:String(label) });
       }
     }
     return targets;
@@ -746,14 +760,14 @@
 
     } catch (e) {
       console.error(e);
-      alert('PZ report error: ' + e.message);
+      alert('PZ report error: ' + (e.message || e));
     } finally {
       setBusy(false);
     }
   }
 
-  // ===== Reports =====
-  function km2(n){ return (n || 0).toFixed(2); }
+  // ===== Reports / Debug =====
+  function km2(n){ return (n||0).toFixed(2); }
   function printReport(){
     if (!S.results.length) { alert('No trips generated yet.'); return; }
     const rowsHtml = S.results.map((r) => {
@@ -768,7 +782,6 @@
           </table>
         </div>`;
     }).join('');
-
     const css = `
       <style>
         body{font:14px/1.45 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;}
@@ -784,8 +797,6 @@
     w.document.write(`<!doctype html><meta charset="utf-8"><title>Trip Report</title>${css}<h1>Trip Report — Street List</h1>${rowsHtml}<script>onload=()=>print();</script>`);
     w.document.close();
   }
-
-  // ===== Debug =====
   function printDebugSteps(){
     if (!S.results.length) { alert('No trips generated yet.'); return; }
     const cards = S.results.map((r) => {
@@ -882,18 +893,12 @@
     if (c) c.onclick = () => clearAll();
     if (p) p.onclick = () => printReport();
     if (d) d.onclick = () => printDebugSteps();
-    if (t) t.onclick = () => {
-      S.highwaysOn = !S.highwaysOn;
-      t.textContent = `Highways: ${S.highwaysOn ? 'ON' : 'OFF'}`;
-      updateCenterlineLayer();
-    };
+    if (t) t.onclick = () => { S.highwaysOn = !S.highwaysOn; t.textContent = `Highways: ${S.highwaysOn ? 'ON' : 'OFF'}`; updateCenterlineLayer(); };
     if (z) z.onclick = () => pzReport();
 
     if (s && inp) s.onclick = () => {
-      const arr = inp.value.split(',').map(x => x.trim()).filter(Boolean);
-      localStorage.setItem(LS_KEYS, JSON.stringify(arr));
-      hydrateKeys();
-      alert(`Saved ${S.keys.length} key(s).`);
+      const arr = inp.value.split(',').map(x=>x.trim()).filter(Boolean);
+      localStorage.setItem(LS_KEYS, JSON.stringify(arr)); hydrateKeys(); alert(`Saved ${S.keys.length} key(s).`);
     };
     if (u) u.onclick = () => {
       const k = qParam('orsKey');
@@ -922,7 +927,6 @@
       innerInit(map);
     }
   };
-
   global.Routing = Routing;
 
   document.addEventListener('DOMContentLoaded', () => {
