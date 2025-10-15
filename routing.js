@@ -1,21 +1,22 @@
 /* routing.js — ORS routes + street list
-   - Per-step highway name fallback (nearest centerline) when unlabeled/generic — only for actual highways.
+   - Highway name fallback from local centerlines (only real highways; confidence-gated).
+   - NEW: Ramp buffer — skip first 100 m of a step when labeling highways & stabilizing their direction.
    - Direction stability with whole-step fallback.
-   - NEW: Highway alias grouping (e.g., "HIGHWAY 85", "Hwy 85", "Conestoga Parkway, 85") merges as one corridor;
-          the group's direction = direction with the most km in that group; display name = longest-km member's name.
+   - Highway alias grouping (e.g., "HIGHWAY 85", "Conestoga Parkway, 85") → same corridor; group dir = max-km; name = longest-km.
    - Drops tiny fragments (<30 m) to avoid ghosts.
-   - "Highways: ON/OFF" toggle + overlay.
-   - Expects centerlines in WGS84 at one of the paths in HIGHWAY_URLS (relative paths for GitHub Pages).
+   - "Highways: ON/OFF" toggle + centerline overlay.
+   - Expects centerlines in WGS84 at one of HIGHWAY_URLS (relative paths for GitHub Pages).
 */
 (function (global) {
-  // ===== Tunables ===========================================================
+  // ===== Tunables =====
   const GENERIC_REGEX          = /\b(keep (right|left)|continue|head (east|west|north|south))\b/i;
-  const SAMPLE_EVERY_M         = 500;   // sampling step when matching steps to centerlines
-  const MATCH_BUFFER_M         = 260;   // absolute maximum considered “near”
-  const CONF_REQ_SHARE         = 0.60;  // >=60% of samples must be near same line
-  const CONF_REQ_MEAN_M        = 120;   // and mean distance of near samples <= 120 m
-  const BOUND_LOCK_WINDOW_M    = 300;   // meters to stabilize NB/EB/SB/WB at start of step
-  const MIN_FRAGMENT_M         = 30;    // drop micro pieces to avoid ghosts
+  const SAMPLE_EVERY_M         = 500;     // sampling when matching to centerlines
+  const MATCH_BUFFER_M         = 260;     // max distance to consider "near" a centerline
+  const CONF_REQ_SHARE         = 0.60;    // >=60% of samples must match the same centerline
+  const CONF_REQ_MEAN_M        = 120;     // and mean distance of matched samples <= 120 m
+  const BOUND_LOCK_WINDOW_M    = 300;     // meters to stabilize NB/EB/SB/WB at the start of a step
+  const MIN_FRAGMENT_M         = 30;      // drop micro fragments
+  const RAMP_SKIP_M            = 100;     // <<< NEW: skip this many meters at the start of highway steps
   const PER_REQUEST_DELAY      = 80;
 
   const PROFILE    = 'driving-car';
@@ -33,7 +34,7 @@
     'data/toronto_highways.geojson'
   ];
 
-  // ===== State / Keys =======================================================
+  // ===== Keys / State =====
   const INLINE_DEFAULT_KEY =
     'eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6Ijk5NWI5MTE5OTM2YTRmYjNhNDRiZTZjNDRjODhhNTRhIiwiaCI6Im11cm11cjY0In0=';
   const LS_KEYS = 'ORS_KEYS';
@@ -47,11 +48,11 @@
     highwayLayer:null
   };
 
-  // ===== Small utils ========================================================
+  // ===== Utils =====
   const byId  = (id) => document.getElementById(id);
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   const qParam = (k) => new URLSearchParams(location.search).get(k) || '';
-  const toRad = (d) => d * Math.PI / 180;
+  const toRad  = (d) => d * Math.PI / 180;
   const isFiniteNum = (n) => Number.isFinite(n) && !Number.isNaN(n);
   const num = (x) => { const n = typeof x === 'string' ? parseFloat(x) : +x; return Number.isFinite(n) ? n : NaN; };
   const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
@@ -87,7 +88,7 @@
     throw new Error(`Origin shape unsupported: ${JSON.stringify(o)}`);
   }
 
-  // Distances / headings / sampling
+  // Distances / bearings / sampling
   function haversineMeters(a, b) {
     const R = 6371000;
     const [lon1, lat1] = a, [lon2, lat2] = b;
@@ -125,7 +126,7 @@
     return out;
   }
 
-  // Natural naming (no highway rewrites)
+  // ===== Natural naming =====
   function cleanHtml(s){ return String(s || '').replace(/<[^>]*>/g, '').trim(); }
   function normalizeName(raw){
     if (!raw) return '';
@@ -148,7 +149,7 @@
     return normalizeName(t);
   }
 
-  // ===== Highway Resolver (local) ===========================================
+  // ===== Highway resolver =====
   const HighwayResolver = (() => {
     function isHighwayLabel(label){
       const s = String(label || '').toUpperCase();
@@ -194,8 +195,6 @@
       if (!features?.length || !segCoords || segCoords.length < 2) return '';
       const sampled = resampleByDistance(segCoords, SAMPLE_EVERY_M);
       const tallies = new Map(); // label -> {near:count, sum:meters}
-      const nearCap = MATCH_BUFFER_M;
-
       for (const p of sampled){
         let best = { d: 1e12, label: '' };
         for (const f of features){
@@ -205,13 +204,12 @@
             if (d < best.d){ best.d = d; best.label = f.label; }
           }
         }
-        if (best.label && best.d <= nearCap){
+        if (best.label && best.d <= MATCH_BUFFER_M){
           const t = tallies.get(best.label) || { near:0, sum:0 };
           t.near++; t.sum += best.d;
           tallies.set(best.label, t);
         }
       }
-      // choose label with max "near" count; compute confidence
       let winner = '', wNear = 0, wMean = 1e12;
       for (const [label, t] of tallies){
         if (t.near > wNear){ winner = label; wNear = t.near; wMean = t.sum / t.near; }
@@ -270,7 +268,7 @@
     return { loadFirstAvailable, bestLabelForSegment };
   })();
 
-  // ===== ORS plumbing =======================================================
+  // ===== ORS plumbing =====
   function savedKeys(){ try { return JSON.parse(localStorage.getItem(LS_KEYS) || '[]'); } catch { return []; } }
   function hydrateKeys(){
     const urlKey = qParam('orsKey');
@@ -333,12 +331,24 @@
     }
   }
 
-  // ===== Movement / direction ==============================================
+  // ===== Movement / direction =====
   function sliceCoords(full, i0, i1){
     const s = Math.max(0, Math.min(i0, full.length - 1));
     const e = Math.max(0, Math.min(i1, full.length - 1));
     return e <= s ? full.slice(s, s + 1) : full.slice(s, e + 1);
   }
+
+  function cutAfterDistance(coords, startIdx, endIdx, metersToSkip){
+    // Returns index within [startIdx..endIdx] where cumulative distance >= metersToSkip
+    if (metersToSkip <= 0) return startIdx;
+    let acc = 0;
+    for (let i = startIdx + 1; i <= endIdx; i++){
+      acc += haversineMeters(coords[i-1], coords[i]);
+      if (acc >= metersToSkip) return i;
+    }
+    return endIdx; // too short → return end
+  }
+
   function stableBoundForStep(fullCoords, waypoints, limitM = BOUND_LOCK_WINDOW_M){
     if (!Array.isArray(waypoints) || waypoints.length !== 2) return '';
     const [w0, w1] = waypoints;
@@ -358,6 +368,7 @@
     const mean = circularMean(bearings);
     return boundFrom(mean);
   }
+
   function wholeStepBound(seg){
     const s = resampleByDistance(seg, 50);
     if (s.length < 2) return '';
@@ -366,15 +377,12 @@
     return boundFrom(circularMean(bearings));
   }
 
-  // ===== Highway alias grouping ============================================
-  // Extract numeric route when present: "Hwy 401", "HIGHWAY 85", "Conestoga Parkway, 85" -> key "RTE-401" / "RTE-85"
-  // If no number, key by uppercase trimmed name for non-numbered corridors (e.g., QEW).
+  // ===== Highway alias grouping =====
   function canonicalHighwayKey(name){
     if (!name) return null;
     const s = String(name).trim();
     const numTok = s.match(/(?:HWY|HIGHWAY|ROUTE|RTE)?\s*([0-9]{2,3})\b/) || s.match(/,\s*([0-9]{2,3})\b/);
     if (numTok) return { key:`RTE-${numTok[1]}`, num:numTok[1], labelBase:`${numTok[1]}` };
-    // common named corridors without numbers
     const up = s.toUpperCase();
     const named = up.match(/\b(QEW|DVP|GARDINER|DON VALLEY PARKWAY|ALLEN ROAD|BLACK CREEK DRIVE)\b/);
     if (named) return { key:`NAMED-${named[1]}`, num:null, labelBase:named[1] };
@@ -389,46 +397,53 @@
       const r = rows[i];
       const key = canonicalHighwayKey(r.name);
       if (!key){ out.push(r); i++; continue; }
-
-      // accumulate consecutive rows with same corridor key
       let j = i, kmByDir = new Map(), kmTotal = 0;
       let bestName = r.name, bestKm = r.km;
-      const block = [];
       while (j < rows.length){
         const rij = rows[j];
         const kj  = canonicalHighwayKey(rij.name);
         if (!kj || kj.key !== key.key) break;
-        block.push(rij);
         kmTotal += rij.km;
         kmByDir.set(rij.dir || '', (kmByDir.get(rij.dir || '') || 0) + rij.km);
         if (rij.km > bestKm){ bestKm = rij.km; bestName = rij.name; }
         j++;
       }
-      // choose direction with most km in block
       let domDir = '', domKm = -1;
       for (const [d,km] of kmByDir.entries()){ if (km > domKm){ domKm = km; domDir = d; } }
-
       out.push({ dir: domDir, name: bestName, km: +kmTotal.toFixed(2) });
       i = j;
     }
     return out;
   }
 
-  // ===== Movement builder ===================================================
+  // ===== Movement builder =====
   function buildMovementsFromDirections(coords, steps){
     if (!coords?.length || !steps?.length) return [];
     const rows = [];
 
-    const pushRow = (name, i0, i1, waypoints) => {
+    const pushRow = (name, i0, i1, waypoints, isHighwayStep = false) => {
       const nm = normalizeName(name);
       if (!nm) return;
-      const seg = sliceCoords(coords, i0, i1);
+
+      // Segment geometry (optionally ramp-skipped for highways when stabilizing dir)
+      let seg = sliceCoords(coords, i0, i1);
       if (seg.length < 2) return;
+
+      // compute meters for full step (we always keep full distance)
       let meters = 0; for (let i = 1; i < seg.length; i++) meters += haversineMeters(seg[i-1], seg[i]);
       if (meters < MIN_FRAGMENT_M) return;
 
-      let dir = stableBoundForStep(coords, waypoints, BOUND_LOCK_WINDOW_M);
-      if (!dir) dir = wholeStepBound(seg);   // fallback to full-step bearing
+      // direction: for highways, stabilize after skipping the first RAMP_SKIP_M
+      let dir = '';
+      if (isHighwayStep) {
+        const startIdx = i0;
+        const endIdx   = i1;
+        const cut = cutAfterDistance(coords, startIdx, endIdx, RAMP_SKIP_M);
+        const segAfter = sliceCoords(coords, cut, endIdx);
+        dir = stableBoundForStep(coords, [cut, endIdx], BOUND_LOCK_WINDOW_M) || wholeStepBound(segAfter);
+      } else {
+        dir = stableBoundForStep(coords, waypoints, BOUND_LOCK_WINDOW_M) || wholeStepBound(seg);
+      }
 
       const last = rows[rows.length - 1];
       if (last && last.name === nm && last.dir === dir){
@@ -442,30 +457,35 @@
       const st  = steps[i];
       const wp  = st.way_points || st.wayPoints || st.waypoints || [0,0];
       const [i0, i1] = wp;
-      const seg = sliceCoords(coords, i0, i1);
+      const fullSeg = sliceCoords(coords, i0, i1);
 
       // 1) Natural name from ORS
       let name = stepNameNatural(st);
       const instr = cleanHtml(st?.instruction || '');
       const isGeneric = !name && GENERIC_REGEX.test(instr);
 
-      // 2) If unlabeled/generic and highways are ON, query nearest centerline for THIS step (with confidence)
+      // 2) If unlabeled/generic and highways are ON → label via nearest centerline,
+      //    using a segment that skips the first 100 m to avoid ramp wiggles.
+      let isHighwayStep = false;
       if (S.highwaysOn && (!name || isGeneric)) {
-        const label = HighwayResolver.bestLabelForSegment(S.highwayFeatures, seg);
-        if (label) name = label;
+        // cut the geometry before resolving the label
+        const cut = cutAfterDistance(coords, i0, i1, RAMP_SKIP_M);
+        const segAfter = sliceCoords(coords, cut, i1);
+        const label = HighwayResolver.bestLabelForSegment(S.highwayFeatures, segAfter);
+        if (label) { name = label; isHighwayStep = true; }
       }
 
       // 3) Fallback to raw instruction if still empty
       if (!name) name = normalizeName(instr);
 
-      pushRow(name, i0, i1, [i0, i1]);
+      pushRow(name, i0, i1, [i0, i1], isHighwayStep);
     }
 
     // 4) Merge consecutive rows that belong to the same highway corridor (alias-aware)
     return mergeConsecutiveSameCorridor(rows);
   }
 
-  // ===== Map & orchestration ===============================================
+  // ===== Map & orchestration =====
   function clearAll(){
     S.results = [];
     if (S.group) S.group.clearLayers();
@@ -541,12 +561,11 @@
     if (g){ g.disabled = b; g.textContent = b ? 'Generating…' : 'Generate Trips'; }
   }
 
-  // ===== Reports ============================================================
+  // ===== Reports =====
   function km2(n){ return (n || 0).toFixed(2); }
 
   function printReport(){
     if (!S.results.length) { alert('No trips generated yet.'); return; }
-
     const rowsHtml = S.results.map((r) => {
       const mov = buildMovementsFromDirections(r.route.coords, r.route.steps);
       const lines = mov.map(m => `<tr><td>${m.dir || ''}</td><td>${m.name}</td><td style="text-align:right">${km2(m.km)}</td></tr>`).join('');
@@ -576,7 +595,7 @@
     w.document.close();
   }
 
-  // Debug view
+  // ===== Debug =====
   function printDebugSteps(){
     if (!S.results.length) { alert('No trips generated yet.'); return; }
     const cards = S.results.map((r) => {
@@ -626,7 +645,7 @@
     w.document.close();
   }
 
-  // ===== Controls & Init ====================================================
+  // ===== Controls & Init =====
   const GeneratorControl = L.Control.extend({
     options: { position: 'topleft' },
     onAdd() {
