@@ -1,8 +1,9 @@
-/* routing.js — PD/PZ generation with robust spatial fallback for PZ
+/* routing.js — PD/PZ generation with robust spatial fallback + 2010 nudge
    - ORS v2
    - Highway name fallback (local centerlines), 100m ramp buffer, dominant-dir merge
    - Mode switch: PD or PZ
-   - PZ mode no longer requires a PD id; uses spatial containment
+   - PZ mode does NOT require a PD id; uses spatial containment
+   - NEW: Handles ORS 2010 ("not routable within 350m") by nudging destination to nearby road
 */
 (function (global) {
   // ---------- Tunables ----------
@@ -94,7 +95,7 @@
   function boundFrom(deg){if(deg>=315||deg<45)return'NB';if(deg<135)return'EB';if(deg<225)return'SB';return'WB';}
   function resampleByDistance(cs,every){if(!cs||cs.length<2)return cs||[];const out=[cs[0]];let acc=0;for(let i=1;i<cs.length;i++){const d=haversineMeters(cs[i-1],cs[i]);acc+=d;if(acc>=every){out.push(cs[i]);acc=0;}}if(out[out.length-1]!==cs[cs.length-1])out.push(cs[cs.length-1]);return out;}
 
-  // Naming
+  // ---------- Naming ----------
   function cleanHtml(s){return String(s||'').replace(/<[^>]*>/g,'').trim();}
   function normalizeName(raw){if(!raw)return'';const s=String(raw).trim().replace(/\s+/g,' ');if(!s||/^unnamed\b/i.test(s)||/^[-–]+$/.test(s))return'';return s;}
   function stepNameNatural(step){
@@ -109,7 +110,7 @@
     return normalizeName(t);
   }
 
-  // Highway resolver
+  // ---------- Highway resolver ----------
   const HighwayResolver=(()=>{
     function isHighwayLabel(label){const s=String(label||'').toUpperCase();return /(^|\b)(HWY|HIGHWAY|PARKWAY|EXPRESSWAY|QEW|DVP|DON VALLEY|GARDINER|ALLEN|BLACK CREEK|401|404|427|409|410|403|407)\b/.test(s);}
     function labelFromProps(p){return normalizeName(p?.Name||p?.name||p?.official_name||p?.short||p?.ref);}
@@ -119,15 +120,65 @@
     return { loadFirstAvailable, bestLabelForSegment };
   })();
 
-  // ORS plumbing
+  // ---------- ORS plumbing + 2010 nudging ----------
   function savedKeys(){try{return JSON.parse(localStorage.getItem(LS_KEYS)||'[]');}catch{return[];}}
   function hydrateKeys(){const urlKey=qParam('orsKey');const saved=savedKeys();const inline=[INLINE_DEFAULT_KEY];S.keys=(urlKey?[urlKey]:[]).concat(saved.length?saved:inline);S.keyIndex=Math.min(+localStorage.getItem(LS_ACTIVE_INDEX)||0,Math.max(0,S.keys.length-1));}
   function currentKey(){return S.keys[Math.min(Math.max(S.keyIndex,0),S.keys.length-1)]||'';}
   function rotateKey(){if(S.keys.length<=1)return false;S.keyIndex=(S.keyIndex+1)%S.keys.length;localStorage.setItem(LS_ACTIVE_INDEX,String(S.keyIndex));return true;}
   async function orsFetch(path,{method='GET',body}={},attempt=0){const url=new URL(ORS_BASE+path);const res=await fetch(url.toString(),{method,headers:{Authorization:currentKey(),...(method!=='GET'&&{'Content-Type':'application/json'})},body:method==='GET'?undefined:JSON.stringify(body)});if([401,403,429].includes(res.status)&&rotateKey()){await sleep(150);return orsFetch(path,{method,body},attempt+1);}if(res.status===500&&attempt<1){await sleep(200);return orsFetch(path,{method,body},attempt+1);}if(!res.ok){const txt=await res.text().catch(()=>res.statusText);throw new Error(`ORS ${res.status}: ${txt}`);}return res.json();}
-  async function getRoute(oLonLat,dLonLat){let o=sanitizeLonLat(oLonLat),d=sanitizeLonLat(dLonLat);const body={coordinates:[o,d],preference:PREFERENCE,instructions:true,instructions_format:'html',language:'en',geometry_simplify:false,elevation:false,units:'km'};try{return await orsFetch(`/v2/directions/${PROFILE}/geojson`,{method:'POST',body});}catch(e){const msg=String(e.message||'');const is2099=msg.includes('ORS 500')&&(msg.includes('"code":2099')||msg.includes('code:2099'));if(!is2099)throw e;const dSwap=sanitizeLonLat([d[1],d[0]]);return await orsFetch(`/v2/directions/${PROFILE}/geojson`,{method:'POST',body:{...body,coordinates:[o,dSwap]}});}}
 
-  // Movement helpers
+  // Generate a list of probe points around destination (100, 200, 300 m; 16 bearings)
+  function generateProbePoints(lon, lat){
+    const set=[]; const R=[100,200,300]; const bearings=[...Array(16)].map((_,i)=>i*22.5);
+    for(const r of R){
+      for(const b of bearings){
+        const br=toRad(b);
+        const dy=r/110540;
+        const dx=(r/(111320*Math.cos(toRad(lat))));
+        set.push([lon + dx*Math.sin(br), lat + dy*Math.cos(br)]);
+      }
+    }
+    return set;
+  }
+
+  async function routeOrNudge(originLonLat, destLonLat){
+    try{
+      return await getRouteRaw(originLonLat, destLonLat);
+    }catch(e){
+      const msg=String(e.message||'');
+      const is2010 = msg.includes('code":2010') || /not routable point within a radius/i.test(msg);
+      if(!is2010) throw e;
+      // Probe nearby
+      const [dlon,dlat]=sanitizeLonLat(destLonLat);
+      const probes=generateProbePoints(dlon,dlat);
+      for(const p of probes){
+        try{
+          return await getRouteRaw(originLonLat, p);
+        }catch(err){
+          const m=String(err.message||'');
+          if(m.includes('code":2010')) continue; // try next
+          // For other errors, keep trying next probe as well
+        }
+      }
+      throw e; // none worked
+    }
+  }
+
+  async function getRouteRaw(oLonLat,dLonLat){
+    let o=sanitizeLonLat(oLonLat), d=sanitizeLonLat(dLonLat);
+    const body={coordinates:[o,d],preference:PREFERENCE,instructions:true,instructions_format:'html',language:'en',geometry_simplify:false,elevation:false,units:'km'};
+    try{
+      return await orsFetch(`/v2/directions/${PROFILE}/geojson`,{method:'POST',body});
+    }catch(e){
+      const msg=String(e.message||'');
+      const is2099=msg.includes('ORS 500')&&(msg.includes('"code":2099')||msg.includes('code:2099'));
+      if(!is2099) throw e;
+      const dSwap=sanitizeLonLat([d[1],d[0]]);
+      return await orsFetch(`/v2/directions/${PROFILE}/geojson`,{method:'POST',body:{...body,coordinates:[o,dSwap]}});
+    }
+  }
+
+  // ---------- Movement helpers ----------
   function sliceCoords(full,i0,i1){const s=Math.max(0,Math.min(i0,full.length-1));const e=Math.max(0,Math.min(i1,full.length-1));return e<=s?full.slice(s,s+1):full.slice(s,e+1);}
   function cutAfterDistance(coords,startIdx,endIdx,m){if(m<=0)return startIdx;let acc=0;for(let i=startIdx+1;i<=endIdx;i++){acc+=haversineMeters(coords[i-1],coords[i]);if(acc>=m)return i;}return endIdx;}
   function stableBoundForStep(full,wp,limit=BOUND_LOCK_WINDOW_M){if(!Array.isArray(wp)||wp.length!==2)return'';const[w0,w1]=wp;const s=Math.max(0,Math.min(w0,full.length-1));const e=Math.max(0,Math.min(w1,full.length-1));if(e<=s+1)return'';let acc=0,cut=s+1;for(let i=s+1;i<=e;i++){acc+=haversineMeters(full[i-1],full[i]);if(acc>=limit){cut=i;break;}}const seg=full.slice(s,Math.max(cut,s+1)+1);const samp=resampleByDistance(seg,50);if(samp.length<2)return'';const bearings=[];for(let i=1;i<samp.length;i++)bearings.push(bearingDeg(samp[i-1],samp[i]));return boundFrom(circularMean(bearings));}
@@ -207,12 +258,12 @@
     return mergeConsecutiveSameCorridor(rows).filter(Boolean);
   }
 
-  // Map helpers
+  // ---------- Map helpers ----------
   function clearAll(){S.results=[];if(S.group)S.group.clearLayers();const p=byId('rt-print');if(p)p.disabled=true;const d=byId('rt-debug');if(d)d.disabled=true;}
   function drawRoute(coords,color){if(!coords?.length)return;if(!S.group)S.group=L.layerGroup().addTo(S.map);L.polyline(coords.map(([x,y])=>[y,x]),{color,weight:4,opacity:0.9}).addTo(S.group);}
   function updateCenterlineLayer(){if(S.highwayLayer){try{S.map.removeLayer(S.highwayLayer);}catch{} S.highwayLayer=null;}if(!S.highwaysOn||!S.highwayFeatures.length)return;const grp=L.layerGroup();for(const f of S.highwayFeatures){L.polyline(f.coords.map(([x,y])=>[y,x]),{color:CENTERLINE_COLOR,weight:2,opacity:0.45,dashArray:'6,6'}).addTo(grp);}S.highwayLayer=grp.addTo(S.map);}
 
-  // Geo harvest
+  // ---------- Geo harvest ----------
   function harvestPolygonsFromMap(){
     const polys=[]; if(!S.map||!S.map._layers) return polys;
     const pushFeat=f=>{if(!f||f.type!=='Feature')return;const g=f.geometry;if(!g)return;if(g.type==='Polygon'||g.type==='MultiPolygon')polys.push({type:'Feature',geometry:g,properties:(f.properties||{})});};
@@ -243,7 +294,6 @@
   function looksLikeZoneFeature(f){const p=f.properties||{};const j=Object.keys(p).join('|').toLowerCase();return /zone/.test(j)||'tts'in p||'id'in p||true;}
   function parsePDIdFromLabel(lbl){const m=String(lbl||'').match(/\b(?:PD|Planning\s*District)\s*([0-9]+)\b/i);return m?m[1]:null;}
 
-  // PD polygon lookups
   function findPDPolygonById(pdId){
     const polys=harvestPolygonsFromMap();
     return polys.find(f=>{
@@ -281,7 +331,6 @@
     try{
       if(S.mode==='PZ'){
         let zoneTargets=[];
-        // If UI provides zones directly
         if(typeof global.getSelectedPZTargets==='function'){
           const raw=await Promise.resolve(global.getSelectedPZTargets())||[];
           raw.forEach((t,i)=>{try{
@@ -297,18 +346,15 @@
           const label=Array.isArray(one)?(one[2]||''):(one.label||one.name||'');
           const pdId=parsePDIdFromLabel(label) || one.pdId || one.PD || one.PD_ID;
 
-          // Selected PD point
           const pdPoint=Array.isArray(one)
             ? sanitizeLonLat([one[0],one[1]])
             : sanitizeLonLat([one.lon??one.lng??one.x, one.lat??one.y]);
 
-          // Try property id first (optional), then always spatial fallback
           let pdGeom=null;
-          if(pdId) pdGeom = findPDPolygonById(String(pdId));
-          if(!pdGeom) pdGeom = findPDPolygonByPoint(pdPoint);
+          if(pdId) pdGeom=findPDPolygonById(String(pdId));
+          if(!pdGeom) pdGeom=findPDPolygonByPoint(pdPoint);
           if(!pdGeom){ alert('PZ mode: could not locate the selected PD on the map.'); setBusy(false); return; }
 
-          // Harvest zones inside that PD
           const candidates=harvestPolygonsFromMap().filter(looksLikeZoneFeature);
           for(let i=0;i<candidates.length;i++){
             const f=candidates[i]; const c=centroidWGS84(f.geometry); if(!c) continue;
@@ -324,7 +370,7 @@
 
         for(let i=0;i<zoneTargets.length;i++){
           const z=zoneTargets[i];
-          const json=await getRoute(originLonLat,[z.lon,z.lat]);
+          const json=await routeOrNudge(originLonLat,[z.lon,z.lat]);
           const feat=json.features?.[0]; const coords=feat?.geometry?.coordinates||[]; const steps=feat?.properties?.segments?.[0]?.steps||[];
           S.resultsRouteCoordsRef=coords;
           S.results.push({dest:{lon:z.lon,lat:z.lat,label:z.label},route:{coords,steps}});
@@ -336,7 +382,7 @@
         setBusy(false); return;
       }
 
-      // PD mode (unchanged)
+      // PD mode
       const rawTargets=(global.getSelectedPDTargets&&global.getSelectedPDTargets())||[];
       const targets=[];
       (rawTargets||[]).forEach((t,i)=>{try{
@@ -347,7 +393,7 @@
 
       for(let i=0;i<targets.length;i++){
         const[lon,lat,label]=targets[i];
-        const json=await getRoute(originLonLat,[lon,lat]);
+        const json=await routeOrNudge(originLonLat,[lon,lat]);
         const feat=json.features?.[0]; const coords=feat?.geometry?.coordinates||[]; const steps=feat?.properties?.segments?.[0]?.steps||[];
         S.resultsRouteCoordsRef=coords;
         S.results.push({dest:{lon,lat,label},route:{coords,steps}});
@@ -361,7 +407,7 @@
   }
   function setBusy(b){const g=byId('rt-generate');if(g){g.disabled=b;g.textContent=b?`Generating… (${S.mode})`:'Generate Trips';}}
 
-  // -------- PZ report (unchanged behavior) --------
+  // -------- PZ report --------
   async function pzReport(){
     const pdTargets=(global.getSelectedPDTargets&&global.getSelectedPDTargets())||[];
     if(!pdTargets.length){alert('Please select exactly one PD to run a PZ report.');return;}
@@ -389,7 +435,7 @@
     const results=[];
     for(let i=0;i<zoneTargets.length;i++){
       const z=zoneTargets[i];
-      const json=await getRoute(originLonLat,[z.lon,z.lat]);
+      const json=await routeOrNudge(originLonLat,[z.lon,z.lat]);
       const feat=json.features?.[0]; const coords=feat?.geometry?.coordinates||[]; const steps=feat?.properties?.segments?.[0]?.steps||[];
       S.resultsRouteCoordsRef=coords; results.push({dest:{lon:z.lon,lat:z.lat,label:z.label},route:{coords,steps}});
       await sleep(PER_REQUEST_DELAY);
