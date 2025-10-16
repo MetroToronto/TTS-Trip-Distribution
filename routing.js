@@ -3,7 +3,8 @@
    - Highway name fallback (local centerlines), 100m ramp buffer, dominant-dir merge
    - Mode switch: PD or PZ
    - PZ mode does NOT require a PD id; uses spatial containment
-   - NEW: Handles ORS 2010 ("not routable within 350m") by nudging destination to nearby road
+   - Handles ORS 2010 ("not routable within 350m") by nudging destination to nearby road
+   - PZ report: per-zone try/catch; skip failures and continue; show summary
 */
 (function (global) {
   // ---------- Tunables ----------
@@ -127,7 +128,6 @@
   function rotateKey(){if(S.keys.length<=1)return false;S.keyIndex=(S.keyIndex+1)%S.keys.length;localStorage.setItem(LS_ACTIVE_INDEX,String(S.keyIndex));return true;}
   async function orsFetch(path,{method='GET',body}={},attempt=0){const url=new URL(ORS_BASE+path);const res=await fetch(url.toString(),{method,headers:{Authorization:currentKey(),...(method!=='GET'&&{'Content-Type':'application/json'})},body:method==='GET'?undefined:JSON.stringify(body)});if([401,403,429].includes(res.status)&&rotateKey()){await sleep(150);return orsFetch(path,{method,body},attempt+1);}if(res.status===500&&attempt<1){await sleep(200);return orsFetch(path,{method,body},attempt+1);}if(!res.ok){const txt=await res.text().catch(()=>res.statusText);throw new Error(`ORS ${res.status}: ${txt}`);}return res.json();}
 
-  // Generate a list of probe points around destination (100, 200, 300 m; 16 bearings)
   function generateProbePoints(lon, lat){
     const set=[]; const R=[100,200,300]; const bearings=[...Array(16)].map((_,i)=>i*22.5);
     for(const r of R){
@@ -148,19 +148,16 @@
       const msg=String(e.message||'');
       const is2010 = msg.includes('code":2010') || /not routable point within a radius/i.test(msg);
       if(!is2010) throw e;
-      // Probe nearby
       const [dlon,dlat]=sanitizeLonLat(destLonLat);
       const probes=generateProbePoints(dlon,dlat);
       for(const p of probes){
         try{
           return await getRouteRaw(originLonLat, p);
         }catch(err){
-          const m=String(err.message||'');
-          if(m.includes('code":2010')) continue; // try next
-          // For other errors, keep trying next probe as well
+          const m=String(err.message||''); if(m.includes('code":2010')) continue;
         }
       }
-      throw e; // none worked
+      throw e;
     }
   }
 
@@ -370,11 +367,15 @@
 
         for(let i=0;i<zoneTargets.length;i++){
           const z=zoneTargets[i];
-          const json=await routeOrNudge(originLonLat,[z.lon,z.lat]);
-          const feat=json.features?.[0]; const coords=feat?.geometry?.coordinates||[]; const steps=feat?.properties?.segments?.[0]?.steps||[];
-          S.resultsRouteCoordsRef=coords;
-          S.results.push({dest:{lon:z.lon,lat:z.lat,label:z.label},route:{coords,steps}});
-          drawRoute(coords,i===0?COLOR_FIRST:COLOR_OTHERS);
+          try{
+            const json=await routeOrNudge(originLonLat,[z.lon,z.lat]);
+            const feat=json.features?.[0]; const coords=feat?.geometry?.coordinates||[]; const steps=feat?.properties?.segments?.[0]?.steps||[];
+            S.resultsRouteCoordsRef=coords;
+            S.results.push({dest:{lon:z.lon,lat:z.lat,label:z.label},route:{coords,steps}});
+            drawRoute(coords,i===0?COLOR_FIRST:COLOR_OTHERS);
+          }catch(err){
+            console.warn('PZ trip skipped:', z.label, err);
+          }
           await sleep(PER_REQUEST_DELAY);
         }
         const pr=byId('rt-print'); if(pr) pr.disabled=false;
@@ -393,11 +394,15 @@
 
       for(let i=0;i<targets.length;i++){
         const[lon,lat,label]=targets[i];
-        const json=await routeOrNudge(originLonLat,[lon,lat]);
-        const feat=json.features?.[0]; const coords=feat?.geometry?.coordinates||[]; const steps=feat?.properties?.segments?.[0]?.steps||[];
-        S.resultsRouteCoordsRef=coords;
-        S.results.push({dest:{lon,lat,label},route:{coords,steps}});
-        drawRoute(coords,i===0?COLOR_FIRST:COLOR_OTHERS);
+        try{
+          const json=await routeOrNudge(originLonLat,[lon,lat]);
+          const feat=json.features?.[0]; const coords=feat?.geometry?.coordinates||[]; const steps=feat?.properties?.segments?.[0]?.steps||[];
+          S.resultsRouteCoordsRef=coords;
+          S.results.push({dest:{lon,lat,label},route:{coords,steps}});
+          drawRoute(coords,i===0?COLOR_FIRST:COLOR_OTHERS);
+        }catch(err){
+          console.warn('PD trip skipped:', label, err);
+        }
         await sleep(PER_REQUEST_DELAY);
       }
       const pr=byId('rt-print'); if(pr) pr.disabled=false;
@@ -407,7 +412,7 @@
   }
   function setBusy(b){const g=byId('rt-generate');if(g){g.disabled=b;g.textContent=b?`Generating… (${S.mode})`:'Generate Trips';}}
 
-  // -------- PZ report --------
+  // -------- PZ report (skip failures & continue) --------
   async function pzReport(){
     const pdTargets=(global.getSelectedPDTargets&&global.getSelectedPDTargets())||[];
     if(!pdTargets.length){alert('Please select exactly one PD to run a PZ report.');return;}
@@ -432,13 +437,23 @@
     }
     if(!zoneTargets.length){alert('PZ report error: No zones found inside the selected PD on the map.');return;}
 
-    const results=[];
+    const results=[]; const failures=[];
     for(let i=0;i<zoneTargets.length;i++){
       const z=zoneTargets[i];
-      const json=await routeOrNudge(originLonLat,[z.lon,z.lat]);
-      const feat=json.features?.[0]; const coords=feat?.geometry?.coordinates||[]; const steps=feat?.properties?.segments?.[0]?.steps||[];
-      S.resultsRouteCoordsRef=coords; results.push({dest:{lon:z.lon,lat:z.lat,label:z.label},route:{coords,steps}});
+      try{
+        const json=await routeOrNudge(originLonLat,[z.lon,z.lat]);
+        const feat=json.features?.[0]; const coords=feat?.geometry?.coordinates||[]; const steps=feat?.properties?.segments?.[0]?.steps||[];
+        S.resultsRouteCoordsRef=coords; results.push({dest:{lon:z.lon,lat:z.lat,label:z.label},route:{coords,steps}});
+      }catch(err){
+        failures.push(z.label||`Zone #${i+1}`);
+        console.warn('PZ report skipped zone:', z.label, err);
+      }
       await sleep(PER_REQUEST_DELAY);
+    }
+
+    if(!results.length){
+      alert('PZ report error: all zones failed to fetch routes.');
+      return;
     }
 
     const cards=results.map(r=>{
@@ -448,6 +463,10 @@
     }).join('');
     const css=`<style>body{font:14px/1.45 ui-sans-serif,system-ui;-apple-system: Segoe UI,Roboto,Helvetica,Arial;}h1{font-size:18px;margin:16px 0;}h2{font-size:16px;margin:14px 0 8px;}table{width:100%;border-collapse:collapse;margin-bottom:18px;}th,td{border:1px solid #ddd;padding:6px 8px;}thead th{background:#f7f7f7;}.card{page-break-inside:avoid;margin-bottom:22px;}</style>`;
     const w=window.open('','_blank'); w.document.write(`<!doctype html><meta charset="utf-8"><title>PZ Report</title>${css}<h1>PZ Report</h1>${cards}<script>onload=()=>print();</script>`); w.document.close();
+
+    if(failures.length){
+      setTimeout(()=>alert(`PZ report finished: ${results.length} succeeded, ${failures.length} failed.\nSkipped: ${failures.slice(0,12).join(', ')}${failures.length>12?' …':''}`), 300);
+    }
   }
 
   // -------- Reports / Debug --------
