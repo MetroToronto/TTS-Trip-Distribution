@@ -1,10 +1,10 @@
-/* routing.js — PD/PZ generation with robust spatial fallback + 2010 nudge
-   - ORS v2
-   - Highway name fallback (local centerlines), 100m ramp buffer, dominant-dir merge
-   - Mode switch: PD or PZ
-   - PZ mode does NOT require a PD id; uses spatial containment
-   - Handles ORS 2010 ("not routable within 350m") by nudging destination to nearby road
-   - PZ report: per-zone try/catch; skip failures and continue; show summary
+/* routing.js — PD/PZ generation + robust fallbacks
+   - ORS v2 + 2010 "not routable" nudge
+   - Highway name fallback (local centerlines), 100m ramp buffer, corridor merge w/ dominant dir
+   - PD/PZ mode switch; PZ uses spatial containment (no PD id required)
+   - PZ report skips failures and continues
+   - Print Report fixed
+   - Route style: thick black casing with white centerline
 */
 (function (global) {
   // ---------- Tunables ----------
@@ -22,9 +22,7 @@
   const PREFERENCE = 'fastest';
   const ORS_BASE   = 'https://api.openrouteservice.org';
 
-  const COLOR_FIRST  = '#0b3aa5';
-  const COLOR_OTHERS = '#2166f3';
-  const CENTERLINE_COLOR = '#ff0080';
+  const CENTERLINE_COLOR = '#ff0080'; // overlay (toggle)
 
   const HIGHWAY_URLS = [
     'data/highway_centerlines_wgs84.geojson',
@@ -40,7 +38,9 @@
   const LS_ACTIVE_INDEX = 'ORS_ACTIVE_INDEX';
 
   const S = {
-    map:null, group:null, results:[],
+    map:null,
+    group:null,              // holds rendered routes
+    results:[],              // [{dest, route:{coords, steps}}]
     keys:[], keyIndex:0,
     highwaysOn:true,
     highwayFeatures:[],
@@ -256,9 +256,49 @@
   }
 
   // ---------- Map helpers ----------
-  function clearAll(){S.results=[];if(S.group)S.group.clearLayers();const p=byId('rt-print');if(p)p.disabled=true;const d=byId('rt-debug');if(d)d.disabled=true;}
-  function drawRoute(coords,color){if(!coords?.length)return;if(!S.group)S.group=L.layerGroup().addTo(S.map);L.polyline(coords.map(([x,y])=>[y,x]),{color,weight:4,opacity:0.9}).addTo(S.group);}
-  function updateCenterlineLayer(){if(S.highwayLayer){try{S.map.removeLayer(S.highwayLayer);}catch{} S.highwayLayer=null;}if(!S.highwaysOn||!S.highwayFeatures.length)return;const grp=L.layerGroup();for(const f of S.highwayFeatures){L.polyline(f.coords.map(([x,y])=>[y,x]),{color:CENTERLINE_COLOR,weight:2,opacity:0.45,dashArray:'6,6'}).addTo(grp);}S.highwayLayer=grp.addTo(S.map);}
+  function clearAll(){
+    S.results=[];
+    if(S.group) S.group.clearLayers();
+    const p=byId('rt-print'); if(p) p.disabled=true;
+    const d=byId('rt-debug'); if(d) d.disabled=true;
+  }
+
+  // Draw “cased” route: bottom black, top white
+  function drawRoute(coords){
+    if(!coords?.length) return;
+    if(!S.group) S.group=L.layerGroup().addTo(S.map);
+    const latlngs = coords.map(([x,y])=>[y,x]);
+
+    // Bottom: black casing
+    L.polyline(latlngs, {
+      color:'#000',
+      weight:9,
+      opacity:0.95,
+      lineCap:'round',
+      lineJoin:'round'
+    }).addTo(S.group);
+
+    // Top: white center
+    L.polyline(latlngs, {
+      color:'#fff',
+      weight:5,
+      opacity:1.0,
+      lineCap:'round',
+      lineJoin:'round'
+    }).addTo(S.group);
+  }
+
+  function updateCenterlineLayer(){
+    if(S.highwayLayer){ try{S.map.removeLayer(S.highwayLayer);}catch{} S.highwayLayer=null; }
+    if(!S.highwaysOn||!S.highwayFeatures.length) return;
+    const grp=L.layerGroup();
+    for(const f of S.highwayFeatures){
+      L.polyline(f.coords.map(([x,y])=>[y,x]),{
+        color:CENTERLINE_COLOR, weight:2, opacity:0.45, dashArray:'6,6'
+      }).addTo(grp);
+    }
+    S.highwayLayer=grp.addTo(S.map);
+  }
 
   // ---------- Geo harvest ----------
   function harvestPolygonsFromMap(){
@@ -372,14 +412,13 @@
             const feat=json.features?.[0]; const coords=feat?.geometry?.coordinates||[]; const steps=feat?.properties?.segments?.[0]?.steps||[];
             S.resultsRouteCoordsRef=coords;
             S.results.push({dest:{lon:z.lon,lat:z.lat,label:z.label},route:{coords,steps}});
-            drawRoute(coords,i===0?COLOR_FIRST:COLOR_OTHERS);
+            drawRoute(coords);
           }catch(err){
             console.warn('PZ trip skipped:', z.label, err);
           }
           await sleep(PER_REQUEST_DELAY);
         }
-        const pr=byId('rt-print'); if(pr) pr.disabled=false;
-        const db=byId('rt-debug'); if(db) db.disabled=false;
+        enableOutputs();
         setBusy(false); return;
       }
 
@@ -399,18 +438,26 @@
           const feat=json.features?.[0]; const coords=feat?.geometry?.coordinates||[]; const steps=feat?.properties?.segments?.[0]?.steps||[];
           S.resultsRouteCoordsRef=coords;
           S.results.push({dest:{lon,lat,label},route:{coords,steps}});
-          drawRoute(coords,i===0?COLOR_FIRST:COLOR_OTHERS);
+          drawRoute(coords);
         }catch(err){
           console.warn('PD trip skipped:', label, err);
         }
         await sleep(PER_REQUEST_DELAY);
       }
-      const pr=byId('rt-print'); if(pr) pr.disabled=false;
-      const db=byId('rt-debug'); if(db) db.disabled=false;
+      enableOutputs();
 
     }catch(e){alert('Routing error: '+e.message);}finally{setBusy(false);}
   }
-  function setBusy(b){const g=byId('rt-generate');if(g){g.disabled=b;g.textContent=b?`Generating… (${S.mode})`:'Generate Trips';}}
+
+  function enableOutputs(){
+    const pr=byId('rt-print'); if(pr) pr.disabled=false;
+    const db=byId('rt-debug'); if(db) db.disabled=false;
+  }
+
+  function setBusy(b){
+    const g=byId('rt-generate');
+    if(g){ g.disabled=b; g.textContent=b?`Generating… (${S.mode})`:'Generate Trips'; }
+  }
 
   // -------- PZ report (skip failures & continue) --------
   async function pzReport(){
@@ -470,8 +517,10 @@
   }
 
   // -------- Reports / Debug --------
-  function km2(n){return (n||0).toFixed(2);}
+  const km2=(n)=>(n||0).toFixed(2);
+
   function printReport(){
+    // Fixed: button always wired; works for both PD & PZ results
     if(!S.results.length){alert('No trips generated yet.');return;}
     const rows=S.results.map(r=>{
       const mov=(buildMovementsFromDirections(r.route.coords,r.route.steps)||[]).filter(m=>m&&m.name);
@@ -479,8 +528,12 @@
       return `<div class="card"><h2>Destination: ${r.dest.label||(r.dest.lon+','+r.dest.lat)}</h2><table><thead><tr><th>Dir</th><th>Street</th><th style="text-align:right">km</th></tr></thead><tbody>${lines}</tbody></table></div>`;
     }).join('');
     const css=`<style>body{font:14px/1.45 ui-sans-serif,system-ui;-apple-system: Segoe UI,Roboto,Helvetica,Arial;}h1{font-size:18px;margin:16px 0;}h2{font-size:16px;margin:14px 0 8px;}table{width:100%;border-collapse:collapse;margin-bottom:18px;}th,td{border:1px solid #ddd;padding:6px 8px;}thead th{background:#f7f7f7;}.card{page-break-inside:avoid;margin-bottom:22px;}</style>`;
-    const w=window.open('','_blank'); w.document.write(`<!doctype html><meta charset="utf-8"><title>Trip Report</title>${css}<h1>Trip Report — Street List</h1>${rows}<script>onload=()=>print();</script>`); w.document.close();
+    const w=window.open('','_blank'); 
+    if(!w){ alert('Popup blocked. Please allow popups for this site.'); return; }
+    w.document.write(`<!doctype html><meta charset="utf-8"><title>Trip Report</title>${css}<h1>Trip Report — Street List</h1>${rows}<script>onload=()=>print();</script>`);
+    w.document.close();
   }
+
   function printDebugSteps(){
     if(!S.results.length){alert('No trips generated yet.');return;}
     const cards=S.results.map(r=>{
@@ -489,7 +542,10 @@
       return `<div class="card"><h2>Debug — ${r.dest.label||(r.dest.lon+','+r.dest.lat)}</h2><table><thead><tr><th style="text-align:right">#</th><th style="text-align:right">km</th><th>step.name</th><th>chosen name</th><th>instruction (raw)</th></tr></thead><tbody>${rows}</tbody></table></div>`;
     }).join('');
     const css=`<style>body{font:13px/1.45 ui-sans-serif,system-ui;-apple-system: Segoe UI,Roboto,Helvetica,Arial;}h1{font-size:18px;margin:16px 0;}h2{font-size:15px;margin:12px 0 8px;}table{width:100%;border-collapse:collapse;margin-bottom:18px;}th,td{border:1px solid #ddd;padding:4px 6px;vertical-align:top;}thead th{background:#f7f7f7;}.card{page-break-inside:avoid;margin-bottom:22px;}td:nth-child(3),td:nth-child(4){white-space:nowrap;}</style>`;
-    const w=window.open('','_blank'); w.document.write(`<!doctype html><meta charset="utf-8"><title>Debug Steps</title>${css}<h1>OpenRouteService — Raw Steps</h1>${cards}<script>onload=()=>print();</script>`); w.document.close();
+    const w=window.open('','_blank'); 
+    if(!w){ alert('Popup blocked. Please allow popups for this site.'); return; }
+    w.document.write(`<!doctype html><meta charset="utf-8"><title>Debug Steps</title>${css}<h1>OpenRouteService — Raw Steps</h1>${cards}<script>onload=()=>print();</script>`);
+    w.document.close();
   }
 
   // -------- Controls & Init --------
