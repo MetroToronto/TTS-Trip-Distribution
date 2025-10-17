@@ -1,9 +1,9 @@
-/* routing.js — PD/PZ generation + robust fallbacks
+/* routing.js — PD/PZ generation + robust fallbacks + fixed Print Report (PD-only)
    - ORS v2 + 2010 "not routable" nudge
    - Highway name fallback (local centerlines), 100m ramp buffer, corridor merge w/ dominant dir
    - PD/PZ mode switch; PZ uses spatial containment (no PD id required)
    - PZ report skips failures and continues
-   - Print Report fixed
+   - Print Report: enabled only for PD; disabled for PZ (with tooltip)
    - Route style: thick black casing with white centerline
 */
 (function (global) {
@@ -91,7 +91,7 @@
 
   // Distance / bearing
   function haversineMeters(a,b){const R=6371000;const[lon1,lat1]=a,[lon2,lat2]=b;const dLat=toRad(lat2-lat1),dLon=toRad(lon2-lon1);const s=Math.sin(dLat/2)**2+Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;return 2*R*Math.asin(Math.sqrt(s));}
-  function bearingDeg(a,b){const[lng1,lat1]=[toRad(a[0]),toRad(a[1])],[lng2,lat2]=[toRad(b[0]),toRad(b[1])];const y=Math.sin(lng2-lng1)*Math.cos(lat2);const x=Math.cos(lat1)*Math.sin(lat2)-Math.sin(lat1)*Math.cos(lat2)*Math.cos(lng2-lng1);return (Math.atan2(y,x)*180/Math.PI+360)%360;}
+  function bearingDeg(a,b){const[lng1,lat1]=[toRad(a[0]),toRad(a[1])],[lng2,lat2]=[toRad(b[0]),toRad(b[1])];const y=Math.sin(lng2-lng1)*Math.cos(lat2);const x=Math.cos(lat1)*Math.sin(lat2)-Math.sin(lat1)*Math.cos(lat2)*Math.cos(lng2-lon1);return (Math.atan2(y,x)*180/Math.PI+360)%360;}
   function circularMean(ds){const sx=ds.reduce((a,d)=>a+Math.cos(toRad(d)),0);const sy=ds.reduce((a,d)=>a+Math.sin(toRad(d)),0);return (Math.atan2(sy,sx)*180/Math.PI+360)%360;}
   function boundFrom(deg){if(deg>=315||deg<45)return'NB';if(deg<135)return'EB';if(deg<225)return'SB';return'WB';}
   function resampleByDistance(cs,every){if(!cs||cs.length<2)return cs||[];const out=[cs[0]];let acc=0;for(let i=1;i<cs.length;i++){const d=haversineMeters(cs[i-1],cs[i]);acc+=d;if(acc>=every){out.push(cs[i]);acc=0;}}if(out[out.length-1]!==cs[cs.length-1])out.push(cs[cs.length-1]);return out;}
@@ -176,6 +176,7 @@
   }
 
   // ---------- Movement helpers ----------
+  function haversine(a,b){let m=0;for(let i=1;i<a.length;i++)m+=haversineMeters(a[i-1],a[i]);return m;}
   function sliceCoords(full,i0,i1){const s=Math.max(0,Math.min(i0,full.length-1));const e=Math.max(0,Math.min(i1,full.length-1));return e<=s?full.slice(s,s+1):full.slice(s,e+1);}
   function cutAfterDistance(coords,startIdx,endIdx,m){if(m<=0)return startIdx;let acc=0;for(let i=startIdx+1;i<=endIdx;i++){acc+=haversineMeters(coords[i-1],coords[i]);if(acc>=m)return i;}return endIdx;}
   function stableBoundForStep(full,wp,limit=BOUND_LOCK_WINDOW_M){if(!Array.isArray(wp)||wp.length!==2)return'';const[w0,w1]=wp;const s=Math.max(0,Math.min(w0,full.length-1));const e=Math.max(0,Math.min(w1,full.length-1));if(e<=s+1)return'';let acc=0,cut=s+1;for(let i=s+1;i<=e;i++){acc+=haversineMeters(full[i-1],full[i]);if(acc>=limit){cut=i;break;}}const seg=full.slice(s,Math.max(cut,s+1)+1);const samp=resampleByDistance(seg,50);if(samp.length<2)return'';const bearings=[];for(let i=1;i<samp.length;i++)bearings.push(bearingDeg(samp[i-1],samp[i]));return boundFrom(circularMean(bearings));}
@@ -215,14 +216,14 @@
     return out;
   }
 
+  function cleanName(n){return String(n||'').trim();}
   function buildMovementsFromDirections(coords, steps){
     if(!coords?.length||!steps?.length) return [];
     const rows=[];
     const push=(name,i0,i1,isHwy=false)=>{
       const nm=normalizeName(name); if(!nm) return;
       const seg=sliceCoords(coords,i0,i1); if(seg.length<2) return;
-      let m=0; for(let i=1;i<seg.length;i++) m+=haversineMeters(seg[i-1],seg[i]);
-      if(m<MIN_FRAGMENT_M) return;
+      const m=haversine(seg); if(m<MIN_FRAGMENT_M) return;
       let dir='';
       if(isHwy){
         const cut=cutAfterDistance(coords,i0,i1,RAMP_SKIP_M);
@@ -231,7 +232,7 @@
       } else {
         dir=stableBoundForStep(coords,[i0,i1],BOUND_LOCK_WINDOW_M)||wholeStepBound(seg);
       }
-      rows.push({dir,name:nm,km:+(m/1000).toFixed(2)});
+      rows.push({dir,name:cleanName(nm),km:+(m/1000).toFixed(2)});
     };
 
     for(let i=0;i<steps.length;i++){
@@ -259,7 +260,7 @@
   function clearAll(){
     S.results=[];
     if(S.group) S.group.clearLayers();
-    const p=byId('rt-print'); if(p) p.disabled=true;
+    const p=byId('rt-print'); if(p){ p.disabled=true; p.title='Generate PD trips to enable printing.'; }
     const d=byId('rt-debug'); if(d) d.disabled=true;
   }
 
@@ -418,7 +419,7 @@
           }
           await sleep(PER_REQUEST_DELAY);
         }
-        enableOutputs();
+        enableOutputs({allowPrint:false}); // <— disable printing for PZ on purpose
         setBusy(false); return;
       }
 
@@ -444,13 +445,19 @@
         }
         await sleep(PER_REQUEST_DELAY);
       }
-      enableOutputs();
+      enableOutputs({allowPrint:true}); // <— enable printing for PD
 
     }catch(e){alert('Routing error: '+e.message);}finally{setBusy(false);}
   }
 
-  function enableOutputs(){
-    const pr=byId('rt-print'); if(pr) pr.disabled=false;
+  function enableOutputs({allowPrint}){
+    const pr=byId('rt-print'); 
+    if(pr){
+      pr.disabled=!allowPrint;
+      pr.title = allowPrint
+        ? 'Open printable report for the current PD trips'
+        : 'Print Report is available for PD trips only';
+    }
     const db=byId('rt-debug'); if(db) db.disabled=false;
   }
 
@@ -509,7 +516,10 @@
       return `<div class="card"><h2>Destination: ${r.dest.label}</h2><table><thead><tr><th>Dir</th><th>Street</th><th style="text-align:right">km</th></tr></thead><tbody>${lines}</tbody></table></div>`;
     }).join('');
     const css=`<style>body{font:14px/1.45 ui-sans-serif,system-ui;-apple-system: Segoe UI,Roboto,Helvetica,Arial;}h1{font-size:18px;margin:16px 0;}h2{font-size:16px;margin:14px 0 8px;}table{width:100%;border-collapse:collapse;margin-bottom:18px;}th,td{border:1px solid #ddd;padding:6px 8px;}thead th{background:#f7f7f7;}.card{page-break-inside:avoid;margin-bottom:22px;}</style>`;
-    const w=window.open('','_blank'); w.document.write(`<!doctype html><meta charset="utf-8"><title>PZ Report</title>${css}<h1>PZ Report</h1>${cards}<script>onload=()=>print();</script>`); w.document.close();
+    const w=window.open('','_blank'); 
+    if(!w){ alert('Popup blocked. Please allow popups for this site.'); return; }
+    w.document.write(`<!doctype html><meta charset="utf-8"><title>PZ Report</title>${css}<h1>PZ Report</h1>${cards}<script>onload=()=>print();</script>`);
+    w.document.close();
 
     if(failures.length){
       setTimeout(()=>alert(`PZ report finished: ${results.length} succeeded, ${failures.length} failed.\nSkipped: ${failures.slice(0,12).join(', ')}${failures.length>12?' …':''}`), 300);
@@ -520,18 +530,42 @@
   const km2=(n)=>(n||0).toFixed(2);
 
   function printReport(){
-    // Fixed: button always wired; works for both PD & PZ results
-    if(!S.results.length){alert('No trips generated yet.');return;}
+    if(S.mode!=='PD'){
+      alert('Print Report is currently available for PD trips only. Switch to PD mode and generate trips.');
+      return;
+    }
+    if(!S.results.length){
+      alert('No PD trips generated yet. Generate PD trips first.');
+      return;
+    }
+
+    // Build the printable HTML
     const rows=S.results.map(r=>{
       const mov=(buildMovementsFromDirections(r.route.coords,r.route.steps)||[]).filter(m=>m&&m.name);
       const lines=mov.map(m=>`<tr><td>${m.dir||''}</td><td>${m.name}</td><td style="text-align:right">${km2(m.km)}</td></tr>`).join('');
       return `<div class="card"><h2>Destination: ${r.dest.label||(r.dest.lon+','+r.dest.lat)}</h2><table><thead><tr><th>Dir</th><th>Street</th><th style="text-align:right">km</th></tr></thead><tbody>${lines}</tbody></table></div>`;
     }).join('');
+
     const css=`<style>body{font:14px/1.45 ui-sans-serif,system-ui;-apple-system: Segoe UI,Roboto,Helvetica,Arial;}h1{font-size:18px;margin:16px 0;}h2{font-size:16px;margin:14px 0 8px;}table{width:100%;border-collapse:collapse;margin-bottom:18px;}th,td{border:1px solid #ddd;padding:6px 8px;}thead th{background:#f7f7f7;}.card{page-break-inside:avoid;margin-bottom:22px;}</style>`;
-    const w=window.open('','_blank'); 
-    if(!w){ alert('Popup blocked. Please allow popups for this site.'); return; }
-    w.document.write(`<!doctype html><meta charset="utf-8"><title>Trip Report</title>${css}<h1>Trip Report — Street List</h1>${rows}<script>onload=()=>print();</script>`);
-    w.document.close();
+    const html=`<!doctype html><meta charset="utf-8"><title>Trip Report</title>${css}<h1>Trip Report — Street List</h1>${rows}<script>onload=()=>print();</script>`;
+
+    // Open using a Blob (more reliable than document.write in some setups)
+    try{
+      const blob=new Blob([html],{type:'text/html'});
+      const url=URL.createObjectURL(blob);
+      const w=window.open(url,'_blank');
+      if(!w){ throw new Error('Popup blocked'); }
+      // Clean up the blob URL after the new window loads
+      const tid=setInterval(()=>{
+        try{ if(w.document.readyState==='complete'){ URL.revokeObjectURL(url); clearInterval(tid);} }catch{}
+      },500);
+    }catch(e){
+      // Fallback to document.write
+      const w=window.open('','_blank');
+      if(!w){ alert('Popup blocked. Please allow popups for this site.'); return; }
+      w.document.write(html);
+      w.document.close();
+    }
   }
 
   function printDebugSteps(){
@@ -557,7 +591,7 @@
         <button id="rt-mode" class="ghost">Mode: PD</button>
         <button id="rt-generate">Generate Trips</button>
         <button id="rt-clear" class="ghost">Clear</button>
-        <button id="rt-print" disabled>Print Report</button>
+        <button id="rt-print" disabled title="Generate PD trips to enable printing.">Print Report</button>
         <button id="rt-debug" class="ghost" disabled>Debug Steps</button>
         <button id="rt-toggle-highways" class="ghost">Highways: ON</button>
         <button id="rt-pz" class="ghost">PZ report</button>
