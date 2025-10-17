@@ -1,9 +1,9 @@
-/* routing.js — PD/PZ generation + robust fallbacks + fixed Print Report (PD-only)
+/* routing.js — PD/PZ generation + robust fallbacks + fixed Print Report (PD-only via hidden iframe)
    - ORS v2 + 2010 "not routable" nudge
    - Highway name fallback (local centerlines), 100m ramp buffer, corridor merge w/ dominant dir
    - PD/PZ mode switch; PZ uses spatial containment (no PD id required)
    - PZ report skips failures and continues
-   - Print Report: enabled only for PD; disabled for PZ (with tooltip)
+   - Print Report: enabled only for PD; implemented via hidden iframe (no popups)
    - Route style: thick black casing with white centerline
 */
 (function (global) {
@@ -91,7 +91,13 @@
 
   // Distance / bearing
   function haversineMeters(a,b){const R=6371000;const[lon1,lat1]=a,[lon2,lat2]=b;const dLat=toRad(lat2-lat1),dLon=toRad(lon2-lon1);const s=Math.sin(dLat/2)**2+Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;return 2*R*Math.asin(Math.sqrt(s));}
-  function bearingDeg(a,b){const[lng1,lat1]=[toRad(a[0]),toRad(a[1])],[lng2,lat2]=[toRad(b[0]),toRad(b[1])];const y=Math.sin(lng2-lng1)*Math.cos(lat2);const x=Math.cos(lat1)*Math.sin(lat2)-Math.sin(lat1)*Math.cos(lat2)*Math.cos(lng2-lon1);return (Math.atan2(y,x)*180/Math.PI+360)%360;}
+  function bearingDeg(a,b){
+    const [lng1,lat1]=[toRad(a[0]),toRad(a[1])],
+          [lng2,lat2]=[toRad(b[0]),toRad(b[1])];
+    const y=Math.sin(lng2-lng1)*Math.cos(lat2);
+    const x=Math.cos(lat1)*Math.sin(lat2)-Math.sin(lat1)*Math.cos(lat2)*Math.cos(lng2-lng1);
+    return (Math.atan2(y,x)*180/Math.PI+360)%360;
+  }
   function circularMean(ds){const sx=ds.reduce((a,d)=>a+Math.cos(toRad(d)),0);const sy=ds.reduce((a,d)=>a+Math.sin(toRad(d)),0);return (Math.atan2(sy,sx)*180/Math.PI+360)%360;}
   function boundFrom(deg){if(deg>=315||deg<45)return'NB';if(deg<135)return'EB';if(deg<225)return'SB';return'WB';}
   function resampleByDistance(cs,every){if(!cs||cs.length<2)return cs||[];const out=[cs[0]];let acc=0;for(let i=1;i<cs.length;i++){const d=haversineMeters(cs[i-1],cs[i]);acc+=d;if(acc>=every){out.push(cs[i]);acc=0;}}if(out[out.length-1]!==cs[cs.length-1])out.push(cs[cs.length-1]);return out;}
@@ -419,7 +425,7 @@
           }
           await sleep(PER_REQUEST_DELAY);
         }
-        enableOutputs({allowPrint:false}); // <— disable printing for PZ on purpose
+        enableOutputs({allowPrint:false}); // PZ print disabled (for now)
         setBusy(false); return;
       }
 
@@ -445,7 +451,7 @@
         }
         await sleep(PER_REQUEST_DELAY);
       }
-      enableOutputs({allowPrint:true}); // <— enable printing for PD
+      enableOutputs({allowPrint:true}); // PD print enabled
 
     }catch(e){alert('Routing error: '+e.message);}finally{setBusy(false);}
   }
@@ -516,11 +522,8 @@
       return `<div class="card"><h2>Destination: ${r.dest.label}</h2><table><thead><tr><th>Dir</th><th>Street</th><th style="text-align:right">km</th></tr></thead><tbody>${lines}</tbody></table></div>`;
     }).join('');
     const css=`<style>body{font:14px/1.45 ui-sans-serif,system-ui;-apple-system: Segoe UI,Roboto,Helvetica,Arial;}h1{font-size:18px;margin:16px 0;}h2{font-size:16px;margin:14px 0 8px;}table{width:100%;border-collapse:collapse;margin-bottom:18px;}th,td{border:1px solid #ddd;padding:6px 8px;}thead th{background:#f7f7f7;}.card{page-break-inside:avoid;margin-bottom:22px;}</style>`;
-    const w=window.open('','_blank'); 
-    if(!w){ alert('Popup blocked. Please allow popups for this site.'); return; }
-    w.document.write(`<!doctype html><meta charset="utf-8"><title>PZ Report</title>${css}<h1>PZ Report</h1>${cards}<script>onload=()=>print();</script>`);
-    w.document.close();
-
+    const html=`<!doctype html><meta charset="utf-8"><title>PZ Report</title>${css}<h1>PZ Report</h1>${cards}<script>onload=()=>print();</script>`;
+    printViaIframe(html);
     if(failures.length){
       setTimeout(()=>alert(`PZ report finished: ${results.length} succeeded, ${failures.length} failed.\nSkipped: ${failures.slice(0,12).join(', ')}${failures.length>12?' …':''}`), 300);
     }
@@ -528,6 +531,41 @@
 
   // -------- Reports / Debug --------
   const km2=(n)=>(n||0).toFixed(2);
+
+  // Hidden-iframe printer (reliable, avoids popup blockers)
+  function ensurePrintFrame(){
+    let f=document.getElementById('rt-print-frame');
+    if(!f){
+      f=document.createElement('iframe');
+      f.id='rt-print-frame';
+      f.style.position='fixed';
+      f.style.right='0';
+      f.style.bottom='0';
+      f.style.width='0';
+      f.style.height='0';
+      f.style.border='0';
+      f.style.opacity='0';
+      document.body.appendChild(f);
+    }
+    return f;
+  }
+  function printViaIframe(html){
+    const frame=ensurePrintFrame();
+    // Use srcdoc when available (GH Pages compatible); fallback to document.write
+    if('srcdoc' in frame){
+      frame.onload=()=>{
+        try{ frame.contentWindow.focus(); frame.contentWindow.print(); }catch{}
+        // cleanup the content shortly after
+        setTimeout(()=>{ frame.removeAttribute('srcdoc'); }, 1500);
+      };
+      frame.srcdoc = html;
+    }else{
+      const doc=frame.contentWindow||frame.contentDocument;
+      const w=doc.document || doc;
+      w.open(); w.write(html); w.close();
+      setTimeout(()=>{ try{(doc.window||doc).focus(); (doc.window||doc).print();}catch{} }, 50);
+    }
+  }
 
   function printReport(){
     if(S.mode!=='PD'){
@@ -546,26 +584,18 @@
       return `<div class="card"><h2>Destination: ${r.dest.label||(r.dest.lon+','+r.dest.lat)}</h2><table><thead><tr><th>Dir</th><th>Street</th><th style="text-align:right">km</th></tr></thead><tbody>${lines}</tbody></table></div>`;
     }).join('');
 
-    const css=`<style>body{font:14px/1.45 ui-sans-serif,system-ui;-apple-system: Segoe UI,Roboto,Helvetica,Arial;}h1{font-size:18px;margin:16px 0;}h2{font-size:16px;margin:14px 0 8px;}table{width:100%;border-collapse:collapse;margin-bottom:18px;}th,td{border:1px solid #ddd;padding:6px 8px;}thead th{background:#f7f7f7;}.card{page-break-inside:avoid;margin-bottom:22px;}</style>`;
+    const css=`<style>
+      body{font:14px/1.45 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;}
+      h1{font-size:18px;margin:16px 0;}
+      h2{font-size:16px;margin:14px 0 8px;}
+      table{width:100%;border-collapse:collapse;margin-bottom:18px;}
+      th,td{border:1px solid #ddd;padding:6px 8px;}
+      thead th{background:#f7f7f7;}
+      .card{page-break-inside:avoid;margin-bottom:22px;}
+    </style>`;
     const html=`<!doctype html><meta charset="utf-8"><title>Trip Report</title>${css}<h1>Trip Report — Street List</h1>${rows}<script>onload=()=>print();</script>`;
 
-    // Open using a Blob (more reliable than document.write in some setups)
-    try{
-      const blob=new Blob([html],{type:'text/html'});
-      const url=URL.createObjectURL(blob);
-      const w=window.open(url,'_blank');
-      if(!w){ throw new Error('Popup blocked'); }
-      // Clean up the blob URL after the new window loads
-      const tid=setInterval(()=>{
-        try{ if(w.document.readyState==='complete'){ URL.revokeObjectURL(url); clearInterval(tid);} }catch{}
-      },500);
-    }catch(e){
-      // Fallback to document.write
-      const w=window.open('','_blank');
-      if(!w){ alert('Popup blocked. Please allow popups for this site.'); return; }
-      w.document.write(html);
-      w.document.close();
-    }
+    printViaIframe(html);
   }
 
   function printDebugSteps(){
@@ -575,11 +605,9 @@
       const rows=steps.map((st,i)=>{const nameField=normalizeName(st?.name||st?.road||'');const chosen=stepNameNatural(st)||'(generic)';const instr=cleanHtml(st?.instruction||'');const km=((st?.distance||0)/1000).toFixed(3);return `<tr><td style="text-align:right">${i}</td><td style="text-align:right">${km}</td><td>${nameField}</td><td>${chosen}</td><td>${instr}</td></tr>`;}).join('');
       return `<div class="card"><h2>Debug — ${r.dest.label||(r.dest.lon+','+r.dest.lat)}</h2><table><thead><tr><th style="text-align:right">#</th><th style="text-align:right">km</th><th>step.name</th><th>chosen name</th><th>instruction (raw)</th></tr></thead><tbody>${rows}</tbody></table></div>`;
     }).join('');
-    const css=`<style>body{font:13px/1.45 ui-sans-serif,system-ui;-apple-system: Segoe UI,Roboto,Helvetica,Arial;}h1{font-size:18px;margin:16px 0;}h2{font-size:15px;margin:12px 0 8px;}table{width:100%;border-collapse:collapse;margin-bottom:18px;}th,td{border:1px solid #ddd;padding:4px 6px;vertical-align:top;}thead th{background:#f7f7f7;}.card{page-break-inside:avoid;margin-bottom:22px;}td:nth-child(3),td:nth-child(4){white-space:nowrap;}</style>`;
-    const w=window.open('','_blank'); 
-    if(!w){ alert('Popup blocked. Please allow popups for this site.'); return; }
-    w.document.write(`<!doctype html><meta charset="utf-8"><title>Debug Steps</title>${css}<h1>OpenRouteService — Raw Steps</h1>${cards}<script>onload=()=>print();</script>`);
-    w.document.close();
+    const css=`<style>body{font:13px/1.45 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;}h1{font-size:18px;margin:16px 0;}h2{font-size:15px;margin:12px 0 8px;}table{width:100%;border-collapse:collapse;margin-bottom:18px;}th,td{border:1px solid #ddd;padding:4px 6px;vertical-align:top;}thead th{background:#f7f7f7;}.card{page-break-inside:avoid;margin-bottom:22px;}td:nth-child(3),td:nth-child(4){white-space:nowrap;}</style>`;
+    const html=`<!doctype html><meta charset="utf-8"><title>Debug Steps</title>${css}<h1>OpenRouteService — Raw Steps</h1>${cards}<script>onload=()=>print();</script>`;
+    printViaIframe(html);
   }
 
   // -------- Controls & Init --------
