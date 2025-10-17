@@ -1,13 +1,17 @@
-/* routing.js — PD/PZ generation + robust fallbacks + fixed Print Report (PD-only via hidden iframe)
-   - ORS v2 + 2010 "not routable" nudge
-   - Highway name fallback (local centerlines), 100m ramp buffer, corridor merge w/ dominant dir
-   - PD/PZ mode switch; PZ uses spatial containment (no PD id required)
-   - PZ report skips failures and continues
-   - Print Report: enabled only for PD; implemented via hidden iframe (no popups)
-   - Route style: thick black casing with white centerline
+/* routing.js — reworked controls + rock-solid PD printing (same-page print pane)
+   - ORS v2, 2010 “not routable” nudge
+   - Highway label fallback from local centerlines (optional overlay)
+   - 100 m ramp buffer for highway direction
+   - PD/PZ generation (PZ print disabled for now), PZ report continues on failures
+   - Route styling: thick black casing with white centerline
+   - Print Report (PD): renders an in-page overlay and calls window.print()
 */
 (function (global) {
-  // ---------- Tunables ----------
+  // ========================= Tunables =========================
+  const PROFILE    = 'driving-car';
+  const PREFERENCE = 'fastest';
+  const ORS_BASE   = 'https://api.openrouteservice.org';
+
   const GENERIC_REGEX       = /\b(keep (right|left)|continue|head (east|west|north|south))\b/i;
   const SAMPLE_EVERY_M      = 500;
   const MATCH_BUFFER_M      = 260;
@@ -18,51 +22,49 @@
   const RAMP_SKIP_M         = 100;
   const PER_REQUEST_DELAY   = 80;
 
-  const PROFILE    = 'driving-car';
-  const PREFERENCE = 'fastest';
-  const ORS_BASE   = 'https://api.openrouteservice.org';
-
-  const CENTERLINE_COLOR = '#ff0080'; // overlay (toggle)
-
   const HIGHWAY_URLS = [
     'data/highway_centerlines_wgs84.geojson',
     'data/highway_centrelines.json',
     'data/highway_centerlines.json',
     'data/toronto_highways.geojson'
   ];
+  const CENTERLINE_COLOR = '#ff0080';
 
-  // ---------- State / Keys ----------
+  // ======================== State/Keys ========================
   const INLINE_DEFAULT_KEY =
-    'eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6Ijk5NWI5MTE5OTM2YTRmYjNhNDRiZTZjNDRjODhhNTRhIiwiaCI6Im11cm11cjY0In0=';
+    'eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6Ijk5NWI5MTE5OTM2YTRmYjNhNDRiZTZjNDRjODhhNTRhIiwiaCI6Im11cm11cjY0In0='; // harmless fallback
   const LS_KEYS = 'ORS_KEYS';
   const LS_ACTIVE_INDEX = 'ORS_ACTIVE_INDEX';
 
   const S = {
     map:null,
-    group:null,              // holds rendered routes
-    results:[],              // [{dest, route:{coords, steps}}]
-    keys:[], keyIndex:0,
+    group:null,
+    results:[],  // [{dest:{lon,lat,label}, route:{coords,steps}}]
+    mode:'PD',   // 'PD' | 'PZ'
     highwaysOn:true,
     highwayFeatures:[],
     highwayLayer:null,
     resultsRouteCoordsRef:null,
-    mode:'PD'
+    keys:[],
+    keyIndex:0
   };
 
-  // ---------- Utils ----------
+  // ======================= Small helpers ======================
   const byId = (id)=>document.getElementById(id);
-  const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
+  const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
   const qParam=(k)=>new URLSearchParams(location.search).get(k)||'';
   const toRad=(d)=>d*Math.PI/180;
   const isNum=(n)=>Number.isFinite(n)&&!Number.isNaN(n);
-  const num=(x)=>{const n=typeof x==='string'?parseFloat(x):+x;return Number.isFinite(n)?n:NaN;};
+  const num =(x)=>{const n=typeof x==='string'?parseFloat(x):+x;return Number.isFinite(n)?n:NaN;};
   const clamp=(v,lo,hi)=>Math.max(lo,Math.min(hi,v));
+  const km2  =(n)=>(n||0).toFixed(2);
 
   function sanitizeLonLat(input){
     let a=Array.isArray(input)?input:[undefined,undefined];
     let x=num(a[0]), y=num(a[1]);
+    // swap if lat/lon reversed
     if (isNum(x)&&isNum(y)&&Math.abs(x)<=90&&Math.abs(y)>90){const t=x;x=y;y=t;}
-    if(!isNum(x)||!isNum(y)) throw new Error(`Invalid coordinate (NaN). Raw: ${JSON.stringify(input)}`);
+    if(!isNum(x)||!isNum(y)) throw new Error(`Invalid coordinate: ${JSON.stringify(input)}`);
     x=clamp(x,-180,180); y=clamp(y,-85,85);
     return [x,y];
   }
@@ -86,10 +88,10 @@
       try{return sanitizeLonLat([a,b]);}catch{}
       return sanitizeLonLat([b,a]);
     }
-    throw new Error(`Origin shape unsupported: ${JSON.stringify(o)}`);
+    throw new Error(`Unsupported origin: ${JSON.stringify(o)}`);
   }
 
-  // Distance / bearing
+  // ==================== Distance / Bearings ===================
   function haversineMeters(a,b){const R=6371000;const[lon1,lat1]=a,[lon2,lat2]=b;const dLat=toRad(lat2-lat1),dLon=toRad(lon2-lon1);const s=Math.sin(dLat/2)**2+Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;return 2*R*Math.asin(Math.sqrt(s));}
   function bearingDeg(a,b){
     const [lng1,lat1]=[toRad(a[0]),toRad(a[1])],
@@ -101,70 +103,36 @@
   function circularMean(ds){const sx=ds.reduce((a,d)=>a+Math.cos(toRad(d)),0);const sy=ds.reduce((a,d)=>a+Math.sin(toRad(d)),0);return (Math.atan2(sy,sx)*180/Math.PI+360)%360;}
   function boundFrom(deg){if(deg>=315||deg<45)return'NB';if(deg<135)return'EB';if(deg<225)return'SB';return'WB';}
   function resampleByDistance(cs,every){if(!cs||cs.length<2)return cs||[];const out=[cs[0]];let acc=0;for(let i=1;i<cs.length;i++){const d=haversineMeters(cs[i-1],cs[i]);acc+=d;if(acc>=every){out.push(cs[i]);acc=0;}}if(out[out.length-1]!==cs[cs.length-1])out.push(cs[cs.length-1]);return out;}
+  function haversinePolyline(coords){let m=0;for(let i=1;i<coords.length;i++)m+=haversineMeters(coords[i-1],coords[i]);return m;}
 
-  // ---------- Naming ----------
-  function cleanHtml(s){return String(s||'').replace(/<[^>]*>/g,'').trim();}
-  function normalizeName(raw){if(!raw)return'';const s=String(raw).trim().replace(/\s+/g,' ');if(!s||/^unnamed\b/i.test(s)||/^[-–]+$/.test(s))return'';return s;}
-  function stepNameNatural(step){
-    const field=normalizeName(step?.name||step?.road||''); if(field) return field;
-    const t=cleanHtml(step?.instruction||''); if(!t) return '';
-    const token=t.match(/\b(?:ON[- ]?)?(?:HWY|Hwy|Highway)?[- ]?\d{2,3}\b(?:\s*[ENSW][BW]?)?/i)||
-                t.match(/\b(QEW|DVP|Gardiner(?:\s+Expressway)?|Don Valley Parkway|Allen Road|Black Creek Drive)\b/i);
-    if(token) return normalizeName(token[0]);
-    if(GENERIC_REGEX.test(t)) return '';
-    const m=t.match(/\b(?:onto|on|to|toward|towards)\s+([A-Za-z0-9 .,'\-\/&()]+)$/i);
-    if(m) return normalizeName(m[1]);
-    return normalizeName(t);
-  }
-
-  // ---------- Highway resolver ----------
-  const HighwayResolver=(()=>{
-    function isHighwayLabel(label){const s=String(label||'').toUpperCase();return /(^|\b)(HWY|HIGHWAY|PARKWAY|EXPRESSWAY|QEW|DVP|DON VALLEY|GARDINER|ALLEN|BLACK CREEK|401|404|427|409|410|403|407)\b/.test(s);}
-    function labelFromProps(p){return normalizeName(p?.Name||p?.name||p?.official_name||p?.short||p?.ref);}
-    function pointSegDistM(p,a,b){const kx=111320*Math.cos(toRad((a[1]+b[1])/2)), ky=110540;const ax=a[0]*kx,ay=a[1]*ky,bx=b[0]*kx,by=b[1]*ky,px=p[0]*kx,py=p[1]*ky;const vx=bx-ax,vy=by-ay,wx=px-ax,wy=py-ay;const c1=vx*wx+vy*wy,c2=vx*vx+vy*vy;const t=c2?Math.max(0,Math.min(1,c1/c2)):0;const nx=ax+t*vx,ny=ay+t*vy,dx=px-nx,dy=py-ny;return Math.sqrt(dx*dx+dy*dy);}
-    function bestLabelForSegment(features, seg){if(!features?.length||!seg||seg.length<2)return'';const sampled=resampleByDistance(seg,SAMPLE_EVERY_M);const tallies=new Map();for(const p of sampled){let best={d:1e12,label:''};for(const f of features){const cs=f.coords;for(let i=1;i<cs.length;i++){const d=pointSegDistM(p,cs[i-1],cs[i]);if(d<best.d)best={d,label:f.label};}}if(best.label&&best.d<=MATCH_BUFFER_M){const t=tallies.get(best.label)||{near:0,sum:0};t.near++;t.sum+=best.d;tallies.set(best.label,t);}}let winner='',wNear=0,wMean=1e12;for(const [label,t] of tallies){if(t.near>wNear){winner=label;wNear=t.near;wMean=t.sum/t.near;}}const share=sampled.length?(wNear/sampled.length):0;return (winner&&share>=CONF_REQ_SHARE&&wMean<=CONF_REQ_MEAN_M&&isHighwayLabel(winner))?winner:'';}
-    async function loadFirstAvailable(urls){for(const url of urls){try{const res=await fetch(url,{cache:'no-store'});if(!res.ok)continue;const data=await res.json();const arr=[];if(Array.isArray(data?.features)){for(const f of data.features){const g=f.geometry||{},p=f.properties||{};const label=labelFromProps(p);if(!label||!isHighwayLabel(label))continue;if(g.type==='LineString')arr.push({label,coords:g.coordinates});else if(g.type==='MultiLineString')(g.coordinates||[]).forEach(cs=>arr.push({label,coords:cs}));}}if(arr.length)return arr;}catch{}}return [];}
-    return { loadFirstAvailable, bestLabelForSegment };
-  })();
-
-  // ---------- ORS plumbing + 2010 nudging ----------
+  // ===================== ORS + key rotate =====================
   function savedKeys(){try{return JSON.parse(localStorage.getItem(LS_KEYS)||'[]');}catch{return[];}}
   function hydrateKeys(){const urlKey=qParam('orsKey');const saved=savedKeys();const inline=[INLINE_DEFAULT_KEY];S.keys=(urlKey?[urlKey]:[]).concat(saved.length?saved:inline);S.keyIndex=Math.min(+localStorage.getItem(LS_ACTIVE_INDEX)||0,Math.max(0,S.keys.length-1));}
   function currentKey(){return S.keys[Math.min(Math.max(S.keyIndex,0),S.keys.length-1)]||'';}
   function rotateKey(){if(S.keys.length<=1)return false;S.keyIndex=(S.keyIndex+1)%S.keys.length;localStorage.setItem(LS_ACTIVE_INDEX,String(S.keyIndex));return true;}
-  async function orsFetch(path,{method='GET',body}={},attempt=0){const url=new URL(ORS_BASE+path);const res=await fetch(url.toString(),{method,headers:{Authorization:currentKey(),...(method!=='GET'&&{'Content-Type':'application/json'})},body:method==='GET'?undefined:JSON.stringify(body)});if([401,403,429].includes(res.status)&&rotateKey()){await sleep(150);return orsFetch(path,{method,body},attempt+1);}if(res.status===500&&attempt<1){await sleep(200);return orsFetch(path,{method,body},attempt+1);}if(!res.ok){const txt=await res.text().catch(()=>res.statusText);throw new Error(`ORS ${res.status}: ${txt}`);}return res.json();}
+
+  async function orsFetch(path,{method='GET',body}={},attempt=0){
+    const url=new URL(ORS_BASE+path);
+    const res=await fetch(url.toString(),{
+      method,
+      headers:{Authorization:currentKey(),...(method!=='GET'&&{'Content-Type':'application/json'})},
+      body:method==='GET'?undefined:JSON.stringify(body)
+    });
+    if([401,403,429].includes(res.status)&&rotateKey()){await sleep(150);return orsFetch(path,{method,body},attempt+1);}
+    if(res.status===500&&attempt<1){await sleep(200);return orsFetch(path,{method,body},attempt+1);}
+    if(!res.ok){const txt=await res.text().catch(()=>res.statusText);throw new Error(`ORS ${res.status}: ${txt}`);}
+    return res.json();
+  }
 
   function generateProbePoints(lon, lat){
     const set=[]; const R=[100,200,300]; const bearings=[...Array(16)].map((_,i)=>i*22.5);
-    for(const r of R){
-      for(const b of bearings){
-        const br=toRad(b);
-        const dy=r/110540;
-        const dx=(r/(111320*Math.cos(toRad(lat))));
-        set.push([lon + dx*Math.sin(br), lat + dy*Math.cos(br)]);
-      }
-    }
+    for(const r of R){ for(const b of bearings){
+      const br=toRad(b);
+      const dy=r/110540;
+      const dx=(r/(111320*Math.cos(toRad(lat))));
+      set.push([lon + dx*Math.sin(br), lat + dy*Math.cos(br)]);
+    } }
     return set;
-  }
-
-  async function routeOrNudge(originLonLat, destLonLat){
-    try{
-      return await getRouteRaw(originLonLat, destLonLat);
-    }catch(e){
-      const msg=String(e.message||'');
-      const is2010 = msg.includes('code":2010') || /not routable point within a radius/i.test(msg);
-      if(!is2010) throw e;
-      const [dlon,dlat]=sanitizeLonLat(destLonLat);
-      const probes=generateProbePoints(dlon,dlat);
-      for(const p of probes){
-        try{
-          return await getRouteRaw(originLonLat, p);
-        }catch(err){
-          const m=String(err.message||''); if(m.includes('code":2010')) continue;
-        }
-      }
-      throw e;
-    }
   }
 
   async function getRouteRaw(oLonLat,dLonLat){
@@ -181,34 +149,127 @@
     }
   }
 
-  // ---------- Movement helpers ----------
-  function haversine(a,b){let m=0;for(let i=1;i<a.length;i++)m+=haversineMeters(a[i-1],a[i]);return m;}
+  async function routeOrNudge(originLonLat, destLonLat){
+    try{
+      return await getRouteRaw(originLonLat, destLonLat);
+    }catch(e){
+      const msg=String(e.message||'');
+      const is2010 = msg.includes('code":2010') || /not routable point within a radius/i.test(msg);
+      if(!is2010) throw e;
+      const [dlon,dlat]=sanitizeLonLat(destLonLat);
+      const probes=generateProbePoints(dlon,dlat);
+      for(const p of probes){
+        try{ return await getRouteRaw(originLonLat, p); }
+        catch(err){ if(/2010/.test(String(err.message))) continue; }
+      }
+      throw e;
+    }
+  }
+
+  // =================== Naming / Highway match =================
+  function cleanHtml(s){return String(s||'').replace(/<[^>]*>/g,'').trim();}
+  function normalizeName(raw){if(!raw)return'';const s=String(raw).trim().replace(/\s+/g,' ');if(!s||/^unnamed\b/i.test(s)||/^[-–]+$/.test(s))return'';return s;}
+
+  function stepNameNatural(step){
+    const field=normalizeName(step?.name||step?.road||''); if(field) return field;
+    const t=cleanHtml(step?.instruction||''); if(!t) return '';
+    const token=t.match(/\b(?:ON[- ]?)?(?:HWY|Hwy|Highway)?[- ]?\d{2,3}\b(?:\s*[ENSW][BW]?)?/i)||
+                t.match(/\b(QEW|DVP|Gardiner(?:\s+Expressway)?|Don Valley Parkway|Allen Road|Black Creek Drive)\b/i);
+    if(token) return normalizeName(token[0]);
+    if(GENERIC_REGEX.test(t)) return '';
+    const m=t.match(/\b(?:onto|on|to|toward|towards)\s+([A-Za-z0-9 .,'\-\/&()]+)$/i);
+    if(m) return normalizeName(m[1]);
+    return normalizeName(t);
+  }
+
+  const HighwayResolver=(()=>{
+    function isHighwayLabel(label){const s=String(label||'').toUpperCase();return /(^|\b)(HWY|HIGHWAY|PARKWAY|EXPRESSWAY|QEW|DVP|DON VALLEY|GARDINER|ALLEN|BLACK CREEK|401|404|427|409|410|403|407)\b/.test(s);}
+    function labelFromProps(p){return normalizeName(p?.Name||p?.name||p?.official_name||p?.short||p?.ref);}
+    function pointSegDistM(p,a,b){const kx=111320*Math.cos(toRad((a[1]+b[1])/2)), ky=110540;const ax=a[0]*kx,ay=a[1]*ky,bx=b[0]*kx,by=b[1]*ky,px=p[0]*kx,py=p[1]*ky;const vx=bx-ax,vy=by-ay,wx=px-ax,wy=py-ay;const c1=vx*wx+vy*wy,c2=vx*vx+vy*vy;const t=c2?Math.max(0,Math.min(1,c1/c2)):0;const nx=ax+t*vx,ny=ay+t*vy,dx=px-nx,dy=py-ny;return Math.sqrt(dx*dx+dy*dy);}
+    function bestLabelForSegment(features, seg){
+      if(!features?.length||!seg||seg.length<2)return'';
+      const sampled=resampleByDistance(seg,SAMPLE_EVERY_M);
+      const tallies=new Map();
+      for(const p of sampled){
+        let best={d:1e12,label:''};
+        for(const f of features){
+          const cs=f.coords;
+          for(let i=1;i<cs.length;i++){
+            const d=pointSegDistM(p,cs[i-1],cs[i]);
+            if(d<best.d) best={d,label:f.label};
+          }
+        }
+        if(best.label&&best.d<=MATCH_BUFFER_M){
+          const t=tallies.get(best.label)||{near:0,sum:0};
+          t.near++; t.sum+=best.d; tallies.set(best.label,t);
+        }
+      }
+      let winner='',wNear=0,wMean=1e12;
+      for(const [label,t] of tallies){ if(t.near>wNear){winner=label;wNear=t.near;wMean=t.sum/t.near;} }
+      const share=sampled.length?(wNear/sampled.length):0;
+      return (winner&&share>=CONF_REQ_SHARE&&wMean<=CONF_REQ_MEAN_M&&isHighwayLabel(winner))?winner:'';
+    }
+    async function loadFirstAvailable(urls){
+      for(const url of urls){
+        try{
+          const res=await fetch(url,{cache:'no-store'}); if(!res.ok) continue;
+          const data=await res.json(); const arr=[];
+          if(Array.isArray(data?.features)){
+            for(const f of data.features){
+              const g=f.geometry||{},p=f.properties||{};
+              const label=labelFromProps(p); if(!label||!isHighwayLabel(label)) continue;
+              if(g.type==='LineString') arr.push({label,coords:g.coordinates});
+              else if(g.type==='MultiLineString') (g.coordinates||[]).forEach(cs=>arr.push({label,coords:cs}));
+            }
+          }
+          if(arr.length) return arr;
+        }catch{}
+      }
+      return [];
+    }
+    return { loadFirstAvailable, bestLabelForSegment };
+  })();
+
+  // ==================== Movement building =====================
   function sliceCoords(full,i0,i1){const s=Math.max(0,Math.min(i0,full.length-1));const e=Math.max(0,Math.min(i1,full.length-1));return e<=s?full.slice(s,s+1):full.slice(s,e+1);}
   function cutAfterDistance(coords,startIdx,endIdx,m){if(m<=0)return startIdx;let acc=0;for(let i=startIdx+1;i<=endIdx;i++){acc+=haversineMeters(coords[i-1],coords[i]);if(acc>=m)return i;}return endIdx;}
-  function stableBoundForStep(full,wp,limit=BOUND_LOCK_WINDOW_M){if(!Array.isArray(wp)||wp.length!==2)return'';const[w0,w1]=wp;const s=Math.max(0,Math.min(w0,full.length-1));const e=Math.max(0,Math.min(w1,full.length-1));if(e<=s+1)return'';let acc=0,cut=s+1;for(let i=s+1;i<=e;i++){acc+=haversineMeters(full[i-1],full[i]);if(acc>=limit){cut=i;break;}}const seg=full.slice(s,Math.max(cut,s+1)+1);const samp=resampleByDistance(seg,50);if(samp.length<2)return'';const bearings=[];for(let i=1;i<samp.length;i++)bearings.push(bearingDeg(samp[i-1],samp[i]));return boundFrom(circularMean(bearings));}
-  function wholeStepBound(seg){const s=resampleByDistance(seg,50);if(s.length<2)return'';const b=[];for(let i=1;i<s.length;i++)b.push(bearingDeg(s[i-1],s[i]));return boundFrom(circularMean(b));}
+  function stableBoundForStep(full,wp,limit=BOUND_LOCK_WINDOW_M){
+    if(!Array.isArray(wp)||wp.length!==2)return'';
+    const[w0,w1]=wp; const s=Math.max(0,Math.min(w0,full.length-1)); const e=Math.max(0,Math.min(w1,full.length-1));
+    if(e<=s+1)return'';
+    let acc=0,cut=s+1;
+    for(let i=s+1;i<=e;i++){acc+=haversineMeters(full[i-1],full[i]); if(acc>=limit){cut=i;break;}}
+    const seg=full.slice(s,Math.max(cut,s+1)+1);
+    const samp=resampleByDistance(seg,50); if(samp.length<2)return'';
+    const bearings=[]; for(let i=1;i<samp.length;i++) bearings.push(bearingDeg(samp[i-1],samp[i]));
+    return boundFrom(circularMean(bearings));
+  }
+  function wholeStepBound(seg){
+    const s=resampleByDistance(seg,50); if(s.length<2)return'';
+    const b=[]; for(let i=1;i<s.length;i++) b.push(bearingDeg(s[i-1],s[i]));
+    return boundFrom(circularMean(b));
+  }
 
-  // Merge by highway corridor with dominant dir
   function canonicalHighwayKey(name){
     if(!name) return null;
     const s=String(name).trim();
     const numTok=s.match(/(?:HWY|HIGHWAY|ROUTE|RTE)?\s*([0-9]{2,3})\b/)||s.match(/,\s*([0-9]{2,3})\b/);
     if(numTok) return {key:`RTE-${numTok[1]}`,num:numTok[1]};
-    const up=s.toUpperCase(); const named=up.match(/\b(QEW|DVP|GARDINER|DON VALLEY PARKWAY|ALLEN ROAD|BLACK CREEK DRIVE)\b/);
+    const up=s.toUpperCase();
+    const named=up.match(/\b(QEW|DVP|GARDINER|DON VALLEY PARKWAY|ALLEN ROAD|BLACK CREEK DRIVE)\b/);
     if(named) return {key:`NAMED-${named[1]}`,num:null};
     return null;
   }
+
   function mergeConsecutiveSameCorridor(rows){
     if(!rows.length) return rows;
     const out=[]; let i=0;
     while(i<rows.length){
-      const r=rows[i]; if(!r){i++;continue;}
-      const key=canonicalHighwayKey(r.name);
-      if(!key){out.push(r);i++;continue;}
+      const r=rows[i]; const key=canonicalHighwayKey(r?.name||'');
+      if(!key){ out.push(r); i++; continue; }
       let j=i, kmByDir=new Map(), total=0, bestName=r.name, bestKm=r.km||0;
       while(j<rows.length){
-        const rij=rows[j]; if(!rij){j++;continue;}
-        const kj=canonicalHighwayKey(rij.name);
+        const rij=rows[j], kj=canonicalHighwayKey(rij?.name||'');
         if(!kj||kj.key!==key.key) break;
         total+=(rij.km||0);
         kmByDir.set(rij.dir||'',(kmByDir.get(rij.dir||'')||0)+(rij.km||0));
@@ -222,14 +283,13 @@
     return out;
   }
 
-  function cleanName(n){return String(n||'').trim();}
   function buildMovementsFromDirections(coords, steps){
     if(!coords?.length||!steps?.length) return [];
     const rows=[];
     const push=(name,i0,i1,isHwy=false)=>{
       const nm=normalizeName(name); if(!nm) return;
       const seg=sliceCoords(coords,i0,i1); if(seg.length<2) return;
-      const m=haversine(seg); if(m<MIN_FRAGMENT_M) return;
+      const m=haversinePolyline(seg); if(m<MIN_FRAGMENT_M) return;
       let dir='';
       if(isHwy){
         const cut=cutAfterDistance(coords,i0,i1,RAMP_SKIP_M);
@@ -238,7 +298,7 @@
       } else {
         dir=stableBoundForStep(coords,[i0,i1],BOUND_LOCK_WINDOW_M)||wholeStepBound(seg);
       }
-      rows.push({dir,name:cleanName(nm),km:+(m/1000).toFixed(2)});
+      rows.push({dir,name:nm,km:+(m/1000).toFixed(2)});
     };
 
     for(let i=0;i<steps.length;i++){
@@ -262,21 +322,20 @@
     return mergeConsecutiveSameCorridor(rows).filter(Boolean);
   }
 
-  // ---------- Map helpers ----------
+  // ========================= Map draw =========================
   function clearAll(){
     S.results=[];
     if(S.group) S.group.clearLayers();
-    const p=byId('rt-print'); if(p){ p.disabled=true; p.title='Generate PD trips to enable printing.'; }
+    setPrintEnabled(false,'Generate PD trips to enable printing.');
     const d=byId('rt-debug'); if(d) d.disabled=true;
   }
 
-  // Draw “cased” route: bottom black, top white
   function drawRoute(coords){
     if(!coords?.length) return;
     if(!S.group) S.group=L.layerGroup().addTo(S.map);
     const latlngs = coords.map(([x,y])=>[y,x]);
 
-    // Bottom: black casing
+    // black casing
     L.polyline(latlngs, {
       color:'#000',
       weight:9,
@@ -285,7 +344,7 @@
       lineJoin:'round'
     }).addTo(S.group);
 
-    // Top: white center
+    // white centerline
     L.polyline(latlngs, {
       color:'#fff',
       weight:5,
@@ -307,7 +366,7 @@
     S.highwayLayer=grp.addTo(S.map);
   }
 
-  // ---------- Geo harvest ----------
+  // ==================== Harvest polygons ======================
   function harvestPolygonsFromMap(){
     const polys=[]; if(!S.map||!S.map._layers) return polys;
     const pushFeat=f=>{if(!f||f.type!=='Feature')return;const g=f.geometry;if(!g)return;if(g.type==='Polygon'||g.type==='MultiPolygon')polys.push({type:'Feature',geometry:g,properties:(f.properties||{})});};
@@ -332,12 +391,11 @@
     return false;
   }
 
-  // Feature classification
+  // =================== PD/PZ geo helpers ======================
   function pickProp(obj,keys,fallback){for(const k of keys){if(obj&&obj[k]!=null&&obj[k]!=='')return obj[k];}return fallback;}
   function looksLikePDFeature(f){const p=f.properties||{};const j=Object.keys(p).join('|').toLowerCase();return /pd|district|planning/.test(j);}
   function looksLikeZoneFeature(f){const p=f.properties||{};const j=Object.keys(p).join('|').toLowerCase();return /zone/.test(j)||'tts'in p||'id'in p||true;}
   function parsePDIdFromLabel(lbl){const m=String(lbl||'').match(/\b(?:PD|Planning\s*District)\s*([0-9]+)\b/i);return m?m[1]:null;}
-
   function findPDPolygonById(pdId){
     const polys=harvestPolygonsFromMap();
     return polys.find(f=>{
@@ -367,13 +425,14 @@
     return best;
   }
 
-  // -------- Generate (mode aware) --------
+  // ==================== Generation routines ===================
   async function generate(){
     let originLonLat; try{originLonLat=getOriginLonLat();}catch(e){alert('Origin has invalid coordinates. Please re-select the address.');return;}
     setBusy(true); clearAll();
 
     try{
       if(S.mode==='PZ'){
+        // Collect zone targets
         let zoneTargets=[];
         if(typeof global.getSelectedPZTargets==='function'){
           const raw=await Promise.resolve(global.getSelectedPZTargets())||[];
@@ -382,23 +441,15 @@
             else if(t&&typeof t==='object'){const p=sanitizeLonLat([t.lon??t.lng??t.x,t.lat??t.y]);zoneTargets.push({lon:p[0],lat:p[1],label:t.label??t.name??`Zone ${i+1}`});}
           }catch{}});
         }
-
         if(!zoneTargets.length){
           const pdSel=(global.getSelectedPDTargets&&global.getSelectedPDTargets())||[];
           if(pdSel.length!==1){alert('PZ mode: select exactly one PD (or provide zones via getSelectedPZTargets).');setBusy(false);return;}
           const one=pdSel[0];
           const label=Array.isArray(one)?(one[2]||''):(one.label||one.name||'');
           const pdId=parsePDIdFromLabel(label) || one.pdId || one.PD || one.PD_ID;
-
-          const pdPoint=Array.isArray(one)
-            ? sanitizeLonLat([one[0],one[1]])
-            : sanitizeLonLat([one.lon??one.lng??one.x, one.lat??one.y]);
-
-          let pdGeom=null;
-          if(pdId) pdGeom=findPDPolygonById(String(pdId));
-          if(!pdGeom) pdGeom=findPDPolygonByPoint(pdPoint);
+          const pdPoint=Array.isArray(one)?sanitizeLonLat([one[0],one[1]]):sanitizeLonLat([one.lon??one.lng??one.x, one.lat??one.y]);
+          let pdGeom=null; if(pdId) pdGeom=findPDPolygonById(String(pdId)); if(!pdGeom) pdGeom=findPDPolygonByPoint(pdPoint);
           if(!pdGeom){ alert('PZ mode: could not locate the selected PD on the map.'); setBusy(false); return; }
-
           const candidates=harvestPolygonsFromMap().filter(looksLikeZoneFeature);
           for(let i=0;i<candidates.length;i++){
             const f=candidates[i]; const c=centroidWGS84(f.geometry); if(!c) continue;
@@ -425,11 +476,12 @@
           }
           await sleep(PER_REQUEST_DELAY);
         }
-        enableOutputs({allowPrint:false}); // PZ print disabled (for now)
+        setPrintEnabled(false,'Print Report is available for PD trips only.');
+        const dbg=byId('rt-debug'); if(dbg) dbg.disabled=false;
         setBusy(false); return;
       }
 
-      // PD mode
+      // ---- PD mode
       const rawTargets=(global.getSelectedPDTargets&&global.getSelectedPDTargets())||[];
       const targets=[];
       (rawTargets||[]).forEach((t,i)=>{try{
@@ -451,20 +503,169 @@
         }
         await sleep(PER_REQUEST_DELAY);
       }
-      enableOutputs({allowPrint:true}); // PD print enabled
+      setPrintEnabled(true,'Open printable report for the current PD trips');
+      const dbg=byId('rt-debug'); if(dbg) dbg.disabled=false;
 
     }catch(e){alert('Routing error: '+e.message);}finally{setBusy(false);}
   }
 
-  function enableOutputs({allowPrint}){
-    const pr=byId('rt-print'); 
-    if(pr){
-      pr.disabled=!allowPrint;
-      pr.title = allowPrint
-        ? 'Open printable report for the current PD trips'
-        : 'Print Report is available for PD trips only';
+  // ===================== Print (same-page) ====================
+  function setPrintEnabled(enabled, title){
+    const btn=byId('rt-print');
+    if(!btn) return;
+    btn.disabled=!enabled;
+    if(title) btn.title=title;
+  }
+
+  function buildReportHTML(results){
+    const section = results.map(r=>{
+      const mov=(buildMovementsFromDirections(r.route.coords,r.route.steps)||[]).filter(m=>m&&m.name);
+      const lines=mov.map(m=>`<tr><td>${m.dir||''}</td><td>${m.name}</td><td style="text-align:right">${km2(m.km)}</td></tr>`).join('');
+      return `<section class="rt-card">
+        <h2>Destination: ${r.dest.label||(r.dest.lon+','+r.dest.lat)}</h2>
+        <table>
+          <thead><tr><th>Dir</th><th>Street</th><th style="text-align:right">km</th></tr></thead>
+          <tbody>${lines}</tbody>
+        </table>
+      </section>`;
+    }).join('');
+    return `
+      <div class="rt-print-root">
+        <h1>Trip Report — Street List</h1>
+        ${section}
+      </div>
+    `;
+  }
+
+  function ensurePrintPane(){
+    let pane=document.getElementById('rt-print-pane');
+    if(!pane){
+      pane=document.createElement('div');
+      pane.id='rt-print-pane';
+      pane.setAttribute('aria-hidden','true');
+      pane.innerHTML=`<div class="rt-print-sheet"></div>`;
+      document.body.appendChild(pane);
+      const style=document.createElement('style');
+      style.id='rt-print-style';
+      style.textContent=`
+        #rt-print-pane{position:fixed;inset:0;z-index:2147483000;background:#fff;display:none;overflow:auto;}
+        #rt-print-pane.active{display:block;}
+        #rt-print-pane .rt-print-root{padding:24px 28px; font:14px/1.45 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial;}
+        #rt-print-pane h1{font-size:20px;margin:8px 0 16px;}
+        #rt-print-pane h2{font-size:16px;margin:18px 0 8px;}
+        #rt-print-pane table{width:100%;border-collapse:collapse;margin-bottom:18px;}
+        #rt-print-pane th,#rt-print-pane td{border:1px solid #ddd;padding:6px 8px;}
+        #rt-print-pane thead th{background:#f7f7f7;}
+        #rt-print-pane .rt-card{page-break-inside:avoid;margin-bottom:22px;}
+        @media print {
+          #rt-print-pane{display:block !important;}
+          body > :not(#rt-print-pane){display:none !important;}
+          html, body { background:#fff; }
+        }
+      `;
+      document.head.appendChild(style);
     }
-    const db=byId('rt-debug'); if(db) db.disabled=false;
+    return pane;
+  }
+
+  function printReport(){
+    if(S.mode!=='PD'){ alert('Print Report is available for PD trips only.'); return; }
+    if(!S.results.length){ alert('No PD trips generated yet.'); return; }
+
+    const pane=ensurePrintPane();
+    const sheet=pane.querySelector('.rt-print-sheet');
+    sheet.innerHTML = buildReportHTML(S.results);
+    pane.classList.add('active');
+
+    const cleanup=()=>{
+      pane.classList.remove('active');
+      sheet.innerHTML='';
+      window.removeEventListener('afterprint', cleanup);
+    };
+    window.addEventListener('afterprint', cleanup);
+    // Give the browser a tick to paint the overlay, then print
+    setTimeout(()=>{ try{window.print();}catch(e){cleanup();} }, 60);
+    // Safety cleanup if afterprint doesn’t fire
+    setTimeout(()=>{ if(pane.classList.contains('active')) cleanup(); }, 5000);
+  }
+
+  function printDebugSteps(){
+    if(!S.results.length){alert('No trips generated yet.');return;}
+    const cards=S.results.map(r=>{
+      const steps=r.route.steps||[];
+      const rows=steps.map((st,i)=>{
+        const nameField=normalizeName(st?.name||st?.road||'');
+        const chosen=stepNameNatural(st)||'(generic)';
+        const instr=cleanHtml(st?.instruction||'');
+        const km=((st?.distance||0)/1000).toFixed(3);
+        return `<tr><td style="text-align:right">${i}</td><td style="text-align:right">${km}</td><td>${nameField}</td><td>${chosen}</td><td>${instr}</td></tr>`;
+      }).join('');
+      return `<section class="rt-card">
+        <h2>Debug — ${r.dest.label||(r.dest.lon+','+r.dest.lat)}</h2>
+        <table><thead><tr><th style="text-align:right">#</th><th style="text-align:right">km</th><th>step.name</th><th>chosen name</th><th>instruction (raw)</th></tr></thead><tbody>${rows}</tbody></table>
+      </section>`;
+    }).join('');
+    const pane=ensurePrintPane();
+    pane.querySelector('.rt-print-sheet').innerHTML=`
+      <div class="rt-print-root"><h1>OpenRouteService — Raw Steps</h1>${cards}</div>
+    `;
+    pane.classList.add('active');
+    const cleanup=()=>{
+      pane.classList.remove('active');
+      pane.querySelector('.rt-print-sheet').innerHTML='';
+      window.removeEventListener('afterprint', cleanup);
+    };
+    window.addEventListener('afterprint', cleanup);
+    setTimeout(()=>{ try{window.print();}catch(e){cleanup();} }, 60);
+    setTimeout(()=>{ if(pane.classList.contains('active')) cleanup(); }, 5000);
+  }
+
+  // ====================== UI / Controls =======================
+  const GeneratorControl=L.Control.extend({
+    options:{position:'topleft'},
+    onAdd(){
+      const el=L.DomUtil.create('div','routing-control');
+      el.innerHTML=`
+        <div class="routing-header"><strong>Routing</strong></div>
+        <div class="routing-actions" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
+          <button id="rt-mode" class="ghost">Mode: PD</button>
+          <button id="rt-generate">Generate Trips</button>
+          <button id="rt-clear" class="ghost">Clear</button>
+          <button id="rt-print" disabled title="Generate PD trips to enable printing.">Print Report</button>
+          <button id="rt-debug" class="ghost" disabled>Debug Steps</button>
+          <button id="rt-toggle-highways" class="ghost">Highways: ON</button>
+          <button id="rt-pz" class="ghost">PZ report</button>
+        </div>
+        <details><summary><strong>Keys</strong></summary>
+          <div class="routing-card">
+            <label for="rt-keys" style="font-weight:600;">OpenRouteService key(s)</label>
+            <input id="rt-keys" type="text" placeholder="KEY1,KEY2 (comma-separated)">
+            <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:6px;">
+              <button id="rt-save">Save Keys</button>
+              <button id="rt-url" class="ghost">Use ?orsKey</button>
+            </div>
+            <small class="routing-hint">Priority: ?orsKey → saved → inline fallback. Keys auto-rotate on 401/429.</small>
+          </div>
+        </details>`;
+      L.DomEvent.disableClickPropagation(el);
+      return el;
+    }
+  });
+
+  function wireControls(){
+    const m=byId('rt-mode'), g=byId('rt-generate'), c=byId('rt-clear'), p=byId('rt-print'),
+          d=byId('rt-debug'), t=byId('rt-toggle-highways'), z=byId('rt-pz'),
+          s=byId('rt-save'), u=byId('rt-url'), inp=byId('rt-keys');
+
+    if(m) m.onclick=()=>{ S.mode=(S.mode==='PD')?'PZ':'PD'; m.textContent=`Mode: ${S.mode}`; setPrintEnabled(S.mode==='PD', S.mode==='PD'?'Open printable report for the current PD trips':'Print Report is available for PD trips only.'); };
+    if(g) g.onclick=()=>generate();
+    if(c) c.onclick=()=>clearAll();
+    if(p) p.onclick=()=>printReport();
+    if(d) d.onclick=()=>printDebugSteps();
+    if(t) t.onclick=()=>{S.highwaysOn=!S.highwaysOn; t.textContent=`Highways: ${S.highwaysOn?'ON':'OFF'}`; updateCenterlineLayer();};
+    if(z) z.onclick=()=>pzReport();
+    if(s&&inp) s.onclick=()=>{const arr=inp.value.split(',').map(x=>x.trim()).filter(Boolean);localStorage.setItem(LS_KEYS,JSON.stringify(arr));hydrateKeys();alert(`Saved ${S.keys.length} key(s).`);};
+    if(u) u.onclick=()=>{const k=qParam('orsKey'); if(!k) alert('Add ?orsKey=YOUR_KEY to the URL.'); else {localStorage.setItem(LS_KEYS,JSON.stringify([k]));hydrateKeys();alert('Using orsKey from URL.');}};
   }
 
   function setBusy(b){
@@ -472,7 +673,7 @@
     if(g){ g.disabled=b; g.textContent=b?`Generating… (${S.mode})`:'Generate Trips'; }
   }
 
-  // -------- PZ report (skip failures & continue) --------
+  // ========================= PZ Report ========================
   async function pzReport(){
     const pdTargets=(global.getSelectedPDTargets&&global.getSelectedPDTargets())||[];
     if(!pdTargets.length){alert('Please select exactly one PD to run a PZ report.');return;}
@@ -482,7 +683,7 @@
     const label=Array.isArray(one)?(one[2]||''):(one.label||one.name||'');
     const pdId=parsePDIdFromLabel(label)||one.pdId||one.PD||one.PD_ID;
 
-    let originLonLat; try{originLonLat=getOriginLonLat();}catch(e){alert('Origin has invalid coordinates. Please re-select the address.');return;}
+    let originLonLat; try{originLonLat=getOriginLonLat();}catch(e){alert('Origin has invalid coordinates.');return;}
 
     const pdPoint=Array.isArray(one)?sanitizeLonLat([one[0],one[1]]):sanitizeLonLat([one.lon??one.lng??one.x,one.lat??one.y]);
     let pdGeom=null; if(pdId) pdGeom=findPDPolygonById(String(pdId)); if(!pdGeom) pdGeom=findPDPolygonByPoint(pdPoint);
@@ -511,157 +712,58 @@
       await sleep(PER_REQUEST_DELAY);
     }
 
-    if(!results.length){
-      alert('PZ report error: all zones failed to fetch routes.');
-      return;
-    }
+    if(!results.length){ alert('PZ report error: all zones failed to fetch routes.'); return; }
 
-    const cards=results.map(r=>{
-      const mov=(buildMovementsFromDirections(r.route.coords,r.route.steps)||[]).filter(m=>m&&m.name);
-      const lines=mov.map(m=>`<tr><td>${m.dir||''}</td><td>${m.name}</td><td style="text-align:right">${(m.km||0).toFixed(2)}</td></tr>`).join('');
-      return `<div class="card"><h2>Destination: ${r.dest.label}</h2><table><thead><tr><th>Dir</th><th>Street</th><th style="text-align:right">km</th></tr></thead><tbody>${lines}</tbody></table></div>`;
-    }).join('');
-    const css=`<style>body{font:14px/1.45 ui-sans-serif,system-ui;-apple-system: Segoe UI,Roboto,Helvetica,Arial;}h1{font-size:18px;margin:16px 0;}h2{font-size:16px;margin:14px 0 8px;}table{width:100%;border-collapse:collapse;margin-bottom:18px;}th,td{border:1px solid #ddd;padding:6px 8px;}thead th{background:#f7f7f7;}.card{page-break-inside:avoid;margin-bottom:22px;}</style>`;
-    const html=`<!doctype html><meta charset="utf-8"><title>PZ Report</title>${css}<h1>PZ Report</h1>${cards}<script>onload=()=>print();</script>`;
-    printViaIframe(html);
+    const html = `
+      <div class="rt-print-root">
+        <h1>PZ Report</h1>
+        ${results.map(r=>{
+          const mov=(buildMovementsFromDirections(r.route.coords,r.route.steps)||[]).filter(m=>m&&m.name);
+          const lines=mov.map(m=>`<tr><td>${m.dir||''}</td><td>${m.name}</td><td style="text-align:right">${km2(m.km)}</td></tr>`).join('');
+          return `<section class="rt-card"><h2>Destination: ${r.dest.label}</h2>
+            <table><thead><tr><th>Dir</th><th>Street</th><th style="text-align:right">km</th></tr></thead><tbody>${lines}</tbody></table>
+          </section>`;
+        }).join('')}
+      </div>`;
+    const pane=ensurePrintPane();
+    pane.querySelector('.rt-print-sheet').innerHTML=html;
+    pane.classList.add('active');
+    const cleanup=()=>{
+      pane.classList.remove('active');
+      pane.querySelector('.rt-print-sheet').innerHTML='';
+      window.removeEventListener('afterprint', cleanup);
+    };
+    window.addEventListener('afterprint', cleanup);
+    setTimeout(()=>{ try{window.print();}catch(e){cleanup();} }, 60);
+    setTimeout(()=>{ if(pane.classList.contains('active')) cleanup(); }, 5000);
+
     if(failures.length){
       setTimeout(()=>alert(`PZ report finished: ${results.length} succeeded, ${failures.length} failed.\nSkipped: ${failures.slice(0,12).join(', ')}${failures.length>12?' …':''}`), 300);
     }
   }
 
-  // -------- Reports / Debug --------
-  const km2=(n)=>(n||0).toFixed(2);
-
-  // Hidden-iframe printer (reliable, avoids popup blockers)
-  function ensurePrintFrame(){
-    let f=document.getElementById('rt-print-frame');
-    if(!f){
-      f=document.createElement('iframe');
-      f.id='rt-print-frame';
-      f.style.position='fixed';
-      f.style.right='0';
-      f.style.bottom='0';
-      f.style.width='0';
-      f.style.height='0';
-      f.style.border='0';
-      f.style.opacity='0';
-      document.body.appendChild(f);
-    }
-    return f;
-  }
-  function printViaIframe(html){
-    const frame=ensurePrintFrame();
-    // Use srcdoc when available (GH Pages compatible); fallback to document.write
-    if('srcdoc' in frame){
-      frame.onload=()=>{
-        try{ frame.contentWindow.focus(); frame.contentWindow.print(); }catch{}
-        // cleanup the content shortly after
-        setTimeout(()=>{ frame.removeAttribute('srcdoc'); }, 1500);
-      };
-      frame.srcdoc = html;
-    }else{
-      const doc=frame.contentWindow||frame.contentDocument;
-      const w=doc.document || doc;
-      w.open(); w.write(html); w.close();
-      setTimeout(()=>{ try{(doc.window||doc).focus(); (doc.window||doc).print();}catch{} }, 50);
-    }
-  }
-
-  function printReport(){
-    if(S.mode!=='PD'){
-      alert('Print Report is currently available for PD trips only. Switch to PD mode and generate trips.');
-      return;
-    }
-    if(!S.results.length){
-      alert('No PD trips generated yet. Generate PD trips first.');
-      return;
-    }
-
-    // Build the printable HTML
-    const rows=S.results.map(r=>{
-      const mov=(buildMovementsFromDirections(r.route.coords,r.route.steps)||[]).filter(m=>m&&m.name);
-      const lines=mov.map(m=>`<tr><td>${m.dir||''}</td><td>${m.name}</td><td style="text-align:right">${km2(m.km)}</td></tr>`).join('');
-      return `<div class="card"><h2>Destination: ${r.dest.label||(r.dest.lon+','+r.dest.lat)}</h2><table><thead><tr><th>Dir</th><th>Street</th><th style="text-align:right">km</th></tr></thead><tbody>${lines}</tbody></table></div>`;
-    }).join('');
-
-    const css=`<style>
-      body{font:14px/1.45 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;}
-      h1{font-size:18px;margin:16px 0;}
-      h2{font-size:16px;margin:14px 0 8px;}
-      table{width:100%;border-collapse:collapse;margin-bottom:18px;}
-      th,td{border:1px solid #ddd;padding:6px 8px;}
-      thead th{background:#f7f7f7;}
-      .card{page-break-inside:avoid;margin-bottom:22px;}
-    </style>`;
-    const html=`<!doctype html><meta charset="utf-8"><title>Trip Report</title>${css}<h1>Trip Report — Street List</h1>${rows}<script>onload=()=>print();</script>`;
-
-    printViaIframe(html);
-  }
-
-  function printDebugSteps(){
-    if(!S.results.length){alert('No trips generated yet.');return;}
-    const cards=S.results.map(r=>{
-      const steps=r.route.steps||[];
-      const rows=steps.map((st,i)=>{const nameField=normalizeName(st?.name||st?.road||'');const chosen=stepNameNatural(st)||'(generic)';const instr=cleanHtml(st?.instruction||'');const km=((st?.distance||0)/1000).toFixed(3);return `<tr><td style="text-align:right">${i}</td><td style="text-align:right">${km}</td><td>${nameField}</td><td>${chosen}</td><td>${instr}</td></tr>`;}).join('');
-      return `<div class="card"><h2>Debug — ${r.dest.label||(r.dest.lon+','+r.dest.lat)}</h2><table><thead><tr><th style="text-align:right">#</th><th style="text-align:right">km</th><th>step.name</th><th>chosen name</th><th>instruction (raw)</th></tr></thead><tbody>${rows}</tbody></table></div>`;
-    }).join('');
-    const css=`<style>body{font:13px/1.45 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;}h1{font-size:18px;margin:16px 0;}h2{font-size:15px;margin:12px 0 8px;}table{width:100%;border-collapse:collapse;margin-bottom:18px;}th,td{border:1px solid #ddd;padding:4px 6px;vertical-align:top;}thead th{background:#f7f7f7;}.card{page-break-inside:avoid;margin-bottom:22px;}td:nth-child(3),td:nth-child(4){white-space:nowrap;}</style>`;
-    const html=`<!doctype html><meta charset="utf-8"><title>Debug Steps</title>${css}<h1>OpenRouteService — Raw Steps</h1>${cards}<script>onload=()=>print();</script>`;
-    printViaIframe(html);
-  }
-
-  // -------- Controls & Init --------
-  const GeneratorControl=L.Control.extend({
-    options:{position:'topleft'},
-    onAdd(){const el=L.DomUtil.create('div','routing-control');el.innerHTML=`
-      <div class="routing-header"><strong>Routing</strong></div>
-      <div class="routing-actions" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
-        <button id="rt-mode" class="ghost">Mode: PD</button>
-        <button id="rt-generate">Generate Trips</button>
-        <button id="rt-clear" class="ghost">Clear</button>
-        <button id="rt-print" disabled title="Generate PD trips to enable printing.">Print Report</button>
-        <button id="rt-debug" class="ghost" disabled>Debug Steps</button>
-        <button id="rt-toggle-highways" class="ghost">Highways: ON</button>
-        <button id="rt-pz" class="ghost">PZ report</button>
-      </div>
-      <details><summary><strong>Keys</strong></summary>
-        <div class="routing-card">
-          <label for="rt-keys" style="font-weight:600;">OpenRouteService key(s)</label>
-          <input id="rt-keys" type="text" placeholder="KEY1,KEY2 (comma-separated)">
-          <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:6px;">
-            <button id="rt-save">Save Keys</button>
-            <button id="rt-url" class="ghost">Use ?orsKey</button>
-          </div>
-          <small class="routing-hint">Priority: ?orsKey → saved → inline fallback. Keys auto-rotate on 401/429.</small>
-        </div>
-      </details>`; L.DomEvent.disableClickPropagation(el); return el;}
-  });
-
-  function wireControls(){
-    const m=byId('rt-mode'), g=byId('rt-generate'), c=byId('rt-clear'), p=byId('rt-print'),
-          d=byId('rt-debug'), t=byId('rt-toggle-highways'), z=byId('rt-pz'),
-          s=byId('rt-save'), u=byId('rt-url'), inp=byId('rt-keys');
-    if(m) m.onclick=()=>{S.mode=(S.mode==='PD')?'PZ':'PD'; m.textContent=`Mode: ${S.mode}`;};
-    if(g) g.onclick=()=>generate();
-    if(c) c.onclick=()=>clearAll();
-    if(p) p.onclick=()=>printReport();
-    if(d) d.onclick=()=>printDebugSteps();
-    if(t) t.onclick=()=>{S.highwaysOn=!S.highwaysOn; t.textContent=`Highways: ${S.highwaysOn?'ON':'OFF'}`; updateCenterlineLayer();};
-    if(z) z.onclick=()=>pzReport();
-    if(s&&inp) s.onclick=()=>{const arr=inp.value.split(',').map(x=>x.trim()).filter(Boolean);localStorage.setItem(LS_KEYS,JSON.stringify(arr));hydrateKeys();alert(`Saved ${S.keys.length} key(s).`);};
-    if(u) u.onclick=()=>{const k=qParam('orsKey'); if(!k) alert('Add ?orsKey=YOUR_KEY to the URL query.'); else {localStorage.setItem(LS_KEYS,JSON.stringify([k]));hydrateKeys();alert('Using orsKey from URL.');}};
-  }
-
+  // ========================= Init =============================
   async function innerInit(map){
     S.map=map; hydrateKeys();
     if(!S.group) S.group=L.layerGroup().addTo(map);
-    map.addControl(new GeneratorControl()); setTimeout(wireControls,0);
-    try{S.highwayFeatures=await HighwayResolver.loadFirstAvailable(HIGHWAY_URLS);}catch{S.highwayFeatures=[];}
+    map.addControl(new GeneratorControl());
+    setTimeout(wireControls,0);
+    try{ S.highwayFeatures=await HighwayResolver.loadFirstAvailable(HIGHWAY_URLS); }catch{ S.highwayFeatures=[]; }
     updateCenterlineLayer();
   }
 
-  const Routing={ init(map){ if(!map||!map._loaded){const retry=()=> (map&&map._loaded)?innerInit(map):setTimeout(retry,80); return retry();} innerInit(map);} };
+  const Routing={ init(map){
+    if(!map||!map._loaded){
+      const retry=()=> (map&&map._loaded)?innerInit(map):setTimeout(retry,80);
+      return retry();
+    }
+    innerInit(map);
+  }};
+
   global.Routing=Routing;
 
-  document.addEventListener('DOMContentLoaded',()=>{const tryInit=()=>{if(global.map&&(global.map._loaded||global.map._size))Routing.init(global.map);else setTimeout(tryInit,80);}; tryInit();});
-})(window);
+  document.addEventListener('DOMContentLoaded',()=>{
+    const tryInit=()=>{ if(global.map&&(global.map._loaded||global.map._size)) Routing.init(global.map); else setTimeout(tryInit,80); };
+    tryInit();
+  });
+})();
