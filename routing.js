@@ -1,10 +1,8 @@
-/* routing.js — reworked controls + rock-solid PD printing (same-page print pane)
-   - ORS v2, 2010 “not routable” nudge
-   - Highway label fallback from local centerlines (optional overlay)
-   - 100 m ramp buffer for highway direction
-   - PD/PZ generation (PZ print disabled for now), PZ report continues on failures
-   - Route styling: thick black casing with white centerline
-   - Print Report (PD): renders an in-page overlay and calls window.print()
+/* routing.js — resilient UI mount + same-page PD printing
+   - Robust init: retries until map ready; guarded addControl(); visible fail-safe banner on error
+   - PD/PZ generation as before; PZ print disabled; PD print via in-page print pane
+   - Route style: black casing + white center
+   - Highway label resolver unchanged
 */
 (function (global) {
   // ========================= Tunables =========================
@@ -58,6 +56,21 @@
   const num =(x)=>{const n=typeof x==='string'?parseFloat(x):+x;return Number.isFinite(n)?n:NaN;};
   const clamp=(v,lo,hi)=>Math.max(lo,Math.min(hi,v));
   const km2  =(n)=>(n||0).toFixed(2);
+
+  function banner(msg, withRetry=false){
+    let el=document.getElementById('rt-failsafe');
+    if(!el){
+      el=document.createElement('div');
+      el.id='rt-failsafe';
+      el.style.cssText='position:fixed;left:10px;bottom:10px;z-index:2147483001;background:#b00020;color:#fff;padding:8px 10px;border-radius:8px;font:12px/1.2 system-ui;box-shadow:0 6px 20px rgba(0,0,0,.25)';
+      document.body.appendChild(el);
+    }
+    el.innerHTML = withRetry
+      ? `${msg} <button id="rt-failsafe-retry" style="margin-left:8px;background:#fff;color:#b00020;border:0;border-radius:6px;padding:4px 8px;cursor:pointer">Retry</button>`
+      : msg;
+    const btn=byId('rt-failsafe-retry');
+    if(btn) btn.onclick=()=>{ el.remove(); tryInitControls(); };
+  }
 
   function sanitizeLonLat(input){
     let a=Array.isArray(input)?input:[undefined,undefined];
@@ -529,12 +542,7 @@
         </table>
       </section>`;
     }).join('');
-    return `
-      <div class="rt-print-root">
-        <h1>Trip Report — Street List</h1>
-        ${section}
-      </div>
-    `;
+    return `<div class="rt-print-root"><h1>Trip Report — Street List</h1>${section}</div>`;
   }
 
   function ensurePrintPane(){
@@ -571,7 +579,6 @@
   function printReport(){
     if(S.mode!=='PD'){ alert('Print Report is available for PD trips only.'); return; }
     if(!S.results.length){ alert('No PD trips generated yet.'); return; }
-
     const pane=ensurePrintPane();
     const sheet=pane.querySelector('.rt-print-sheet');
     sheet.innerHTML = buildReportHTML(S.results);
@@ -583,9 +590,7 @@
       window.removeEventListener('afterprint', cleanup);
     };
     window.addEventListener('afterprint', cleanup);
-    // Give the browser a tick to paint the overlay, then print
     setTimeout(()=>{ try{window.print();}catch(e){cleanup();} }, 60);
-    // Safety cleanup if afterprint doesn’t fire
     setTimeout(()=>{ if(pane.classList.contains('active')) cleanup(); }, 5000);
   }
 
@@ -625,8 +630,10 @@
     options:{position:'topleft'},
     onAdd(){
       const el=L.DomUtil.create('div','routing-control');
+      // minimal defensive style so it's visible even if site CSS changes
+      el.style.background='#fff'; el.style.padding='8px'; el.style.borderRadius='10px'; el.style.boxShadow='0 6px 16px rgba(0,0,0,.15)';
       el.innerHTML=`
-        <div class="routing-header"><strong>Routing</strong></div>
+        <div class="routing-header" style="font-weight:700;margin-bottom:6px;">Routing</div>
         <div class="routing-actions" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
           <button id="rt-mode" class="ghost">Mode: PD</button>
           <button id="rt-generate">Generate Trips</button>
@@ -637,9 +644,9 @@
           <button id="rt-pz" class="ghost">PZ report</button>
         </div>
         <details><summary><strong>Keys</strong></summary>
-          <div class="routing-card">
+          <div class="routing-card" style="margin-top:6px;">
             <label for="rt-keys" style="font-weight:600;">OpenRouteService key(s)</label>
-            <input id="rt-keys" type="text" placeholder="KEY1,KEY2 (comma-separated)">
+            <input id="rt-keys" type="text" placeholder="KEY1,KEY2 (comma-separated)" style="width:260px;">
             <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:6px;">
               <button id="rt-save">Save Keys</button>
               <button id="rt-url" class="ghost">Use ?orsKey</button>
@@ -743,27 +750,49 @@
   }
 
   // ========================= Init =============================
+  function wireControlsSafe(){
+    try { wireControls(); }
+    catch(e){ console.error('wireControls error', e); banner('Routing UI wiring failed.', true); }
+  }
+
   async function innerInit(map){
-    S.map=map; hydrateKeys();
-    if(!S.group) S.group=L.layerGroup().addTo(map);
-    map.addControl(new GeneratorControl());
-    setTimeout(wireControls,0);
+    try{
+      S.map=map; hydrateKeys();
+      if(!S.group) S.group=L.layerGroup().addTo(map);
+      map.addControl(new GeneratorControl());
+    }catch(e){
+      console.error('addControl failed', e);
+      banner('Routing box failed to mount. Click Retry.', true);
+      return; // stop here; retry will re-enter
+    }
+    setTimeout(wireControlsSafe,0);
     try{ S.highwayFeatures=await HighwayResolver.loadFirstAvailable(HIGHWAY_URLS); }catch{ S.highwayFeatures=[]; }
     updateCenterlineLayer();
   }
 
-  const Routing={ init(map){
-    if(!map||!map._loaded){
-      const retry=()=> (map&&map._loaded)?innerInit(map):setTimeout(retry,80);
-      return retry();
+  function tryInitControls(attempt=0){
+    const mapRef = global.map || S.map;
+    if(mapRef && (mapRef._loaded || mapRef._size)){
+      innerInit(mapRef);
+      return;
     }
-    innerInit(map);
-  }};
+    if(attempt>200){ // ~16s max
+      banner('Leaflet map did not load in time. Routing UI paused.', true);
+      return;
+    }
+    setTimeout(()=>tryInitControls(attempt+1), 80);
+  }
 
+  const Routing={ init(map){
+    if(map) S.map=map;
+    tryInitControls(0);
+  }};
   global.Routing=Routing;
 
+  // Clean up any stuck print pane from prior runs
   document.addEventListener('DOMContentLoaded',()=>{
-    const tryInit=()=>{ if(global.map&&(global.map._loaded||global.map._size)) Routing.init(global.map); else setTimeout(tryInit,80); };
-    tryInit();
+    const stuck=document.getElementById('rt-print-pane');
+    if(stuck){ stuck.classList.remove('active'); const sheet=stuck.querySelector('.rt-print-sheet'); if(sheet) sheet.innerHTML=''; }
+    tryInitControls(0);
   });
-})();
+})(window);
