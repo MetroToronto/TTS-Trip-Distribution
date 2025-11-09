@@ -1,12 +1,7 @@
 // ===== routing.js =====
-// OpenRouteService Directions v2 routing with alternatives (max 3), reverse toggle,
-// per-PD/PZ route counts validation, a simple request queue, and a small in-page modal.
-// Exposes a global window.Routing.
-
 (function () {
   const DEFAULT_ORS_KEY = "eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6Ijk5NWI5MTE5OTM2YTRmYjNhNDRiZTZjNDRjODhhNTRhIiwiaCI6Im11cm11cjY0In0=";
 
-  // ---- Key management (URL ?orsKey= overrides; else localStorage 'orsKey'; else default) ----
   function readKey() {
     const url = new URL(window.location.href);
     const fromUrl = url.searchParams.get("orsKey");
@@ -16,7 +11,6 @@
     return DEFAULT_ORS_KEY;
   }
 
-  // ---- Simple toast + modal ----
   function ensureToastHost() {
     let host = document.querySelector("#routing-toast-host");
     if (!host) {
@@ -36,13 +30,12 @@
     setTimeout(() => { card.remove(); }, ms);
   }
 
-  function openModal(opts) {
-    const { title = "Notice", html = "", onClose } = opts || {};
-    let mask = document.createElement("div");
+  function openModal({ title = "Notice", html = "", onClose } = {}) {
+    const mask = document.createElement("div");
     mask.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:99998;";
-    let box = document.createElement("div");
+    const box = document.createElement("div");
     box.style.cssText = "position:fixed;inset:0;display:flex;align-items:center;justify-content:center;z-index:99999;";
-    let panel = document.createElement("div");
+    const panel = document.createElement("div");
     panel.style.cssText = "background:#fff;max-width:720px;width:calc(100% - 48px);max-height:80vh;overflow:auto;border-radius:12px;box-shadow:0 12px 40px rgba(0,0,0,.25);";
     panel.innerHTML = `
       <div style="padding:16px 20px;border-bottom:1px solid #eee;font:600 16px system-ui">${title}</div>
@@ -51,19 +44,14 @@
         <button id="routing-modal-close" style="padding:8px 12px;border-radius:8px;border:1px solid #ccc;background:#fafafa;cursor:pointer">Close</button>
       </div>`;
     box.appendChild(panel);
-    function close() {
-      mask.remove();
-      box.remove();
-      onClose && onClose();
-    }
+    function close() { mask.remove(); box.remove(); onClose && onClose(); }
     mask.addEventListener("click", close);
-    box.querySelector("#routing-modal-close").addEventListener("click", close);
+    panel.querySelector("#routing-modal-close").addEventListener("click", close);
     document.body.appendChild(mask);
     document.body.appendChild(box);
     return { close };
   }
 
-  // ---- PD/PZ sources from script.js ----
   let PD_FEATURES = [];
   let PZ_FEATURES = [];
   let centroidFromFeature = null;
@@ -81,7 +69,6 @@
            list.find((_, i) => String(i) === String(idVal));
   }
 
-  // ---- Routing queue (throttle ~1.6s to respect ~40 req/min) ----
   const QUEUE = [];
   let queueRunning = false;
   const SPACING_MS = 1600;
@@ -91,33 +78,21 @@
     queueRunning = true;
     while (QUEUE.length) {
       const job = QUEUE.shift();
-      try {
-        // eslint-disable-next-line no-await-in-loop
-        await job();
-      } catch (e) {
-        console.error(e);
-      }
-      // eslint-disable-next-line no-await-in-loop
+      try { await job(); } catch (e) { console.error(e); }
       await new Promise(r => setTimeout(r, SPACING_MS));
     }
     queueRunning = false;
   }
+  function enqueue(fn) { QUEUE.push(fn); pumpQueue(); }
 
-  function enqueue(fn) {
-    QUEUE.push(fn);
-    pumpQueue();
-  }
-
-  // ---- Draw layers & cache ----
   const routeGroup = L.layerGroup().addTo(window.map);
-  const Results = []; // array of { type:'pd'|'pz', id, name, count, rankMode, reverse, routes:[{distance,duration,coordinates,line}] }
+  const Results = [];
 
   function clearRoutes() {
     routeGroup.clearLayers();
     Results.length = 0;
     showToast("Cleared routes.");
   }
-
   function getAllResults() {
     return Results.map(x => ({
       type: x.type, id: x.id, name: x.name, count: x.count, rankMode: x.rankMode, reverse: x.reverse,
@@ -125,11 +100,9 @@
     }));
   }
 
-  // ---- ORS Directions v2 call with alternatives ----
   async function orsDirections({ originLngLat, destLngLat, count, rankMode }) {
     const key = readKey();
     const preference = (rankMode === "shortest") ? "shortest" : "fastest";
-
     const body = {
       coordinates: [originLngLat, destLngLat],
       preference,
@@ -142,25 +115,14 @@
         weight_factor: 2
       }
     };
-
     const r = await fetch("https://api.openrouteservice.org/v2/directions/driving-car/geojson", {
       method: "POST",
-      headers: {
-        "Authorization": key,
-        "Content-Type": "application/json"
-      },
+      headers: { "Authorization": key, "Content-Type": "application/json" },
       body: JSON.stringify(body)
     });
-
-    if (!r.ok) {
-      const text = await r.text();
-      throw new Error(`ORS error ${r.status}: ${text}`);
-    }
-
+    if (!r.ok) throw new Error(`ORS error ${r.status}: ${await r.text()}`);
     const gj = await r.json();
-    // ORS returns FeatureCollection with 1..N features (alternatives)
     const features = gj.features || [];
-    // Map to {distance,duration,coordinates}
     return features.map(feat => ({
       distance: feat.properties?.summary?.distance ?? 0,
       duration: feat.properties?.summary?.duration ?? 0,
@@ -171,26 +133,22 @@
   function latLngToLngLat(ll) { return [ll[1], ll[0]]; }
 
   function addPolyline(coords, colorIndex) {
-    // coords: [ [lng,lat], ... ]
     const latlngs = coords.map(([lng, lat]) => [lat, lng]);
     const colors = ["#2962ff", "#00b8d4", "#7c4dff"];
     const dashes = [null, "6,6", "2,8"];
-    const line = L.polyline(latlngs, {
+    return L.polyline(latlngs, {
       color: colors[colorIndex % colors.length],
       weight: colorIndex === 0 ? 4 : 3,
       opacity: 0.9,
       dashArray: dashes[colorIndex] || null
     }).addTo(routeGroup);
-    return line;
   }
 
   function validateCounts(selectedIds, countsById, labelById) {
     const bad = [];
     selectedIds.forEach(id => {
       const n = countsById?.[id];
-      if (![0,1,2,3].includes(Number(n))) {
-        bad.push(`${labelById[id] ?? id} (value: ${n})`);
-      }
+      if (![0,1,2,3].includes(Number(n))) bad.push(`${labelById[id] ?? id} (value: ${n})`);
     });
     if (bad.length) {
       openModal({
@@ -204,7 +162,6 @@
     return true;
   }
 
-  // ---- Main entry ----
   async function generateFor(type, { originLatLng, selectedIds, countsById, reverse, rankMode }) {
     if (!window.map) { showToast("Map not ready."); return; }
     if (!originLatLng || !isFinite(originLatLng[0]) || !isFinite(originLatLng[1])) {
@@ -228,41 +185,28 @@
       if (c) centroidById[id] = c;
     });
 
-    // Validate counts
     if (!validateCounts(selectedIds, countsById, labelById)) return;
 
-    // Build jobs
     let jobs = 0;
     selectedIds.forEach(id => {
       const count = Number(countsById?.[id] ?? 1);
-      if (count === 0) return; // skip
+      if (count === 0) return;
       const dest = centroidById[id];
       if (!dest) return;
       jobs += 1;
 
       enqueue(async () => {
-        const originLL = originLatLng;
-        const destLL = dest;
-
-        const a = latLngToLngLat(originLL);
-        const b = latLngToLngLat(destLL);
+        const a = latLngToLngLat(originLatLng);
+        const b = latLngToLngLat(dest);
         const originLngLat = reverse ? b : a;
         const destLngLat = reverse ? a : b;
 
         try {
           const alts = await orsDirections({ originLngLat, destLngLat, count, rankMode });
-          const rec = {
-            type, id, name: labelById[id], count, rankMode, reverse,
-            routes: []
-          };
-          // draw
+          const rec = { type, id, name: labelById[id], count, rankMode, reverse, routes: [] };
           alts.slice(0, count).forEach((r, idx) => {
             const line = addPolyline(r.coordinates, idx);
-            rec.routes.push({
-              distance: r.distance,
-              duration: r.duration,
-              line
-            });
+            rec.routes.push({ distance: r.distance, duration: r.duration, line });
           });
           Results.push(rec);
           showToast(`${labelById[id]}: ${rec.routes.length} route(s) added.`);
@@ -273,14 +217,10 @@
       });
     });
 
-    if (jobs === 0) {
-      showToast("Nothing to route (check selections and counts).");
-    } else {
-      showToast(`Queued ${jobs} routing job(s).`);
-    }
+    if (jobs === 0) showToast("Nothing to route (check selections and counts).");
+    else showToast(`Queued ${jobs} routing job(s).`);
   }
 
-  // ---- Public API ----
   window.Routing = {
     setPDSource,
     setPZSource,
