@@ -1,235 +1,216 @@
-<script>
-/* report.js — one-button report. Uses Routing.getResults(), infers NB/EB/SB/WB, and names highways via local dataset */
+/* report.js — one-button report that lists "NB/EB/SB/WB + road name" comma-separated per destination.
+   Uses Routing.getResults(); names highways by cross-referencing /data/highway_centreline.(geo)json; non-highways => "local road". */
 (function (global) {
   'use strict';
 
-  const HIGHWAYS_URLS = [
+  const HWY_CANDIDATES = [
     '/data/highway_centreline.geojson',
     '/data/highway_centreline.json'
   ];
-  let HIGHWAYS = null;       // GeoJSON FeatureCollection
-  let HW_INDEX = null;       // naive spatial index: [{minX,maxX,minY,maxY,name,coords:[[lon,lat],...]}, ...]
+  let HWY = null;            // FeatureCollection
+  let HWY_INDEX = null;      // [{name, bboxes:[{minX,minY,maxX,maxY}], lines:[[ [lon,lat], ... ]]}]
+  const SNAP_METERS = 60;    // max distance to consider a highway near a route sample
+  const SAMPLE_EVERY_METERS = 120; // sample along route
 
-  // Wire the one report button (re-uses #rt-print from the routing control)
+  // Retitle + wire the existing routing control button
   document.addEventListener('DOMContentLoaded', () => {
     const btn = document.getElementById('rt-print');
-    if (btn) {
-      btn.textContent = 'Generate Report';
-      btn.disabled = false;
-      btn.addEventListener('click', onGenerateReport);
-    }
+    if (!btn) return;
+    btn.textContent = 'Generate Report';
+    btn.addEventListener('click', async () => {
+      try { await ensureHighwaysLoaded(); } catch(_) {}
+      generateReport();
+    });
   });
 
-  async function onGenerateReport() {
+  async function ensureHighwaysLoaded() {
+    if (HWY) return;
+    for (const url of HWY_CANDIDATES) {
+      try {
+        const r = await fetch(url);
+        if (!r.ok) continue;
+        const j = await r.json();
+        if (j && Array.isArray(j.features)) { HWY = j; break; }
+      } catch (_) {}
+    }
+    if (HWY) HWY_INDEX = buildHighwayIndex(HWY.features);
+  }
+
+  function generateReport() {
     if (!global.Routing || typeof global.Routing.getResults !== 'function') {
-      showModal('Report not available', ['Routing module is not ready.']);
-      return;
+      return alert('Routing not ready. Generate trips first.');
     }
     const results = global.Routing.getResults();
-    if (!results.length) {
-      showModal('Report not available', ['Generate trips first.']);
-      return;
-    }
-    if (!HIGHWAYS) {
-      HIGHWAYS = await fetchFirstAvailable(HIGHWAYS_URLS).catch(()=>null);
-      if (HIGHWAYS && HIGHWAYS.features) {
-        HW_INDEX = buildHighwayIndex(HIGHWAYS.features);
-      }
-    }
+    if (!results.length) return alert('No trips generated.');
 
-    const blocks = [];
-    for (const res of results) {
-      // Use only the best route for each target in the concatenated line,
-      // but list alternatives on new lines below (if exist)
-      const best = res.routes?.[0];
-      if (!best) continue;
-
-      const dirString = await summarizeRoute(best, HW_INDEX);
-      let html = `<div class="card"><h2>${escapeHtml(res.target.label)}</h2><p>${dirString}</p>`;
-
-      if (res.routes.length > 1) {
-        html += `<div class="alts"><div style="font-weight:600;margin:8px 0 4px">Alternatives:</div><ol>`;
-        for (let i=1;i<res.routes.length;i++){
-          const s = await summarizeRoute(res.routes[i], HW_INDEX);
-          html += `<li>${s}</li>`;
-        }
-        html += `</ol></div>`;
-      }
-      html += `</div>`;
-      blocks.push(html);
-    }
+    const blocks = results.map(r => {
+      const best = r.routes?.[0];
+      if (!best || !best.geometry || !Array.isArray(best.geometry.coordinates)) return '';
+      const summary = summarizeRoute(best.geometry.coordinates);
+      return `<div class="card"><b>${escapeHtml(r.target.label)}</b>: ${summary}</div>`;
+    }).filter(Boolean);
 
     const css = `
       <style>
-        body{font:14px/1.45 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;}
-        h1{font-size:18px;margin:16px 0;}
-        h2{font-size:16px;margin:6px 0 8px;}
-        .card{page-break-inside:avoid;margin:10px 0 18px 0;border:1px solid #eee;border-radius:10px;padding:10px 12px}
-        .alts ol{margin:6px 0 0 20px}
-      </style>
-    `;
+        body{font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;padding:16px}
+        .card{margin:8px 0}
+      </style>`;
 
     const w = window.open('', '_blank');
-    w.document.write(`<!doctype html><meta charset="utf-8"><title>Trips Report</title>${css}<h1>Trips Report</h1>${blocks.join('')}<script>onload=()=>focus()</script>`);
+    w.document.write(`<!doctype html><meta charset="utf-8"><title>Trips Report</title>${css}${blocks.join('')}`);
     w.document.close();
   }
 
-  // ---- Build a single-line summary for one route: "NB Hwy 401, EB DVP, EB Gerrard St E, ..." ----
-  async function summarizeRoute(route, hwIndex) {
-    // Prefer instructions if present (some builds of routing.js may include steps)
-    let steps = route.steps;
-    if (!steps && route.geometry) {
-      // derive segments & headings from geometry only (no API call)
-      steps = derivePseudoStepsFromGeometry(route.geometry);
-      // attach names for highway segments if available
-      if (hwIndex) attachHighwayNames(steps, hwIndex);
-    }
+  // ---- Build "NB Hwy 401, EB DVP, EB Gerrard St E, ..." from raw geometry ----
+  function summarizeRoute(coordsLonLat) {
+    // 1) Sample the polyline at ~SAMPLE_EVERY_METERS; compute bearing for each step
+    const samples = resampleForBearings(coordsLonLat, SAMPLE_EVERY_METERS);
 
-    // Squash into direction/name chunks
+    // 2) Name each sample: highway name (if near), else "local road"
+    const named = samples.map(s => ({
+      dir: bearingToCardinal(s.bearing),
+      name: (HWY_INDEX ? nearestHighwayName([s.lon, s.lat], SNAP_METERS) : '') || 'local road'
+    }));
+
+    // 3) Collapse consecutive same (dir+name)
     const chunks = [];
-    let prevDir = null, prevName = null, accDist = 0;
-
-    for (const st of steps) {
-      const dir = st.dir || computeCardinal(st.bearing);
-      const name = cleanName(st.name || st.road || '');
-      const dist = Number(st.distance || st.len || 0);
-
-      if (!prevDir) {
-        prevDir = dir; prevName = name; accDist = dist;
-      } else if (dir === prevDir && name === prevName) {
-        accDist += dist;
-      } else {
-        chunks.push({ dir: prevDir, name: prevName, dist: accDist });
-        prevDir = dir; prevName = name; accDist = dist;
-      }
+    for (const s of named) {
+      const last = chunks[chunks.length - 1];
+      if (last && last.dir === s.dir && last.name === s.name) continue;
+      chunks.push(s);
     }
-    if (prevDir) chunks.push({ dir: prevDir, name: prevName, dist: accDist });
 
-    // Compose string
-    const parts = chunks.map(ch => {
-      const label = [ch.dir, ch.name].filter(Boolean).join(' ');
-      return label || ch.dir || '(segment)';
-    });
-    return parts.join(', ');
+    // 4) Compose single line
+    return chunks.map(c => `${c.dir} ${c.name}`).join(', ');
   }
 
-  // ---- Geometry helpers ----
-  function derivePseudoStepsFromGeometry(geometry) {
-    // geometry: GeoJSON LineString with coordinates [lon,lat]
-    const coords = geometry?.coordinates || [];
+  // ---- Geometry utilities ----
+  function resampleForBearings(coords, stepMeters) {
     const out = [];
-    for (let i=1;i<coords.length;i++){
-      const a = coords[i-1], b = coords[i];
-      const bearing = fwdAzimuth(a[1], a[0], b[1], b[0]); // deg
-      const len = haversine(a[1], a[0], b[1], b[0]);      // km
-      out.push({ bearing, len, distance: len, name: '' });
+    if (!coords || coords.length < 2) return out;
+    let acc = 0;
+    let prev = coords[0];
+    for (let i = 1; i < coords.length; i++) {
+      const cur = coords[i];
+      const segLen = haversine(prev[1], prev[0], cur[1], cur[0]) * 1000; // m
+      acc += segLen;
+      if (acc >= stepMeters) {
+        const b = azimuth(prev, cur);
+        out.push({ lat: (prev[1] + cur[1]) / 2, lon: (prev[0] + cur[0]) / 2, bearing: b });
+        acc = 0;
+      }
+      prev = cur;
+    }
+    // ensure at least one sample
+    if (!out.length) {
+      const a = coords[0], b = coords[coords.length - 1];
+      out.push({ lat: (a[1] + b[1]) / 2, lon: (a[0] + b[0]) / 2, bearing: azimuth(a, b) });
     }
     return out;
   }
 
-  function computeCardinal(bearing) {
-    // Map degrees to NB/EB/SB/WB (45° sectors around N/E/S/W)
-    const deg = ((bearing % 360) + 360) % 360;
-    if (deg >= 45 && deg < 135) return 'EB';
-    if (deg >= 135 && deg < 225) return 'SB';
-    if (deg >= 225 && deg < 315) return 'WB';
+  function azimuth(a, b) {
+    const [lon1, lat1] = a, [lon2, lat2] = b;
+    const φ1 = lat1 * Math.PI / 180, φ2 = lat2 * Math.PI / 180, Δλ = (lon2 - lon1) * Math.PI / 180;
+    const y = Math.sin(Δλ) * Math.cos(φ2);
+    const x = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
+    return ((Math.atan2(y, x) * 180 / Math.PI) + 360) % 360;
+  }
+
+  function bearingToCardinal(deg) {
+    const d = ((deg % 360) + 360) % 360;
+    if (d >= 45 && d < 135) return 'EB';
+    if (d >= 135 && d < 225) return 'SB';
+    if (d >= 225 && d < 315) return 'WB';
     return 'NB';
   }
 
-  function fwdAzimuth(lat1, lon1, lat2, lon2){
-    const φ1 = lat1*Math.PI/180, φ2 = lat2*Math.PI/180;
-    const Δλ = (lon2-lon1)*Math.PI/180;
-    const y = Math.sin(Δλ)*Math.cos(φ2);
-    const x = Math.cos(φ1)*Math.sin(φ2) - Math.sin(φ1)*Math.cos(φ2)*Math.cos(Δλ);
-    const θ = Math.atan2(y, x);
-    let deg = θ*180/Math.PI;
-    deg = (deg + 360) % 360;
-    return deg;
-    }
-
-  function haversine(lat1, lon1, lat2, lon2){
+  function haversine(lat1, lon1, lat2, lon2) {
     const R = 6371;
-    const dLat = (lat2-lat1)*Math.PI/180;
-    const dLon = (lon2-lon1)*Math.PI/180;
-    const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)**2;
-    return 2*R*Math.asin(Math.sqrt(a)); // km
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLon = (lon2 - lon1) * Math.PI / 180;
+    const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(a));
   }
 
   // ---- Highway cross-reference ----
-  async function fetchFirstAvailable(urls){
-    for (const u of urls) {
-      try { const r = await fetch(u); if (r.ok) return r.json(); } catch(_) {}
-    }
-    return null;
-  }
-
-  function buildHighwayIndex(features){
-    // Store bbox + name + coordinate arrays for a simple nearest search
-    return features.map(f => {
-      const name = cleanName(f.properties?.name || f.properties?.FULLNAME || f.properties?.HWY_NAME || '');
-      const geom = f.geometry;
+  function buildHighwayIndex(features) {
+    const idx = [];
+    for (const f of features) {
+      const name = cleanHwyName(f.properties?.name || f.properties?.FULLNAME || f.properties?.HWY_NAME || '');
+      const g = f.geometry;
       const lines = [];
-      if (geom?.type === 'LineString') lines.push(geom.coordinates);
-      else if (geom?.type === 'MultiLineString') lines.push(...geom.coordinates);
-      let minX=Infinity, minY=Infinity, maxX=-Infinity, maxY=-Infinity;
-      lines.forEach(coords => coords.forEach(([x,y]) => { minX=Math.min(minX,x); minY=Math.min(minY,y); maxX=Math.max(maxX,x); maxY=Math.max(maxY,y); }));
-      return { name, lines, minX, minY, maxX, maxY };
-    });
-  }
+      if (g?.type === 'LineString') lines.push(g.coordinates);
+      else if (g?.type === 'MultiLineString') lines.push(...g.coordinates);
+      if (!lines.length) continue;
 
-  function attachHighwayNames(steps, index){
-    if (!index) return steps;
-    // For each short segment, if it's close to a highway centerline bbox and nearest point < 40m, adopt the highway name
-    const MAX_METERS = 40;
-    for (const s of steps) {
-      if (s.name) continue;
-      const a = s._a || null, b = s._b || null; // optional
-      // Not available in pseudo steps; just skip to nearest search using a/bearing not stored; approximate by skipping
-      // We'll instead just mark highway names opportunistically from index if any bbox intersects the sample midpoint buffer.
+      // store per-linestring bbox for quick rejects
+      const bboxes = lines.map(ls => {
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const [x, y] of ls) { if (x < minX) minX = x; if (y < minY) minY = y; if (x > maxX) maxX = x; if (y > maxY) maxY = y; }
+        return { minX, minY, maxX, maxY };
+      });
+      idx.push({ name, lines, bboxes });
     }
-    // Better: run a rough nearest search using a moving "midpoint" along the step constructed from bearing-less info.
-    // Since pseudo steps lack explicit coordinates, we’ll leave highway naming to final pass that samples whole geometry if available.
-    return steps;
+    return idx;
   }
 
-  function cleanName(s) {
+  function nearestHighwayName([lon, lat], tolMeters) {
+    if (!HWY_INDEX) return '';
+    let best = { name: '', d: Infinity };
+    for (const h of HWY_INDEX) {
+      for (let i = 0; i < h.lines.length; i++) {
+        const bb = h.bboxes[i];
+        if (!bb) continue;
+        // quick bbox expansion test (~tol)
+        const DX = tolMeters / 111320; // deg per meter approx lon
+        const DY = tolMeters / 110540; // deg per meter approx lat
+        if (lon < bb.minX - DX || lon > bb.maxX + DX || lat < bb.minY - DY || lat > bb.maxY + DY) continue;
+
+        // compute nearest distance to polyline
+        const d = pointToPolylineMeters([lon, lat], h.lines[i]);
+        if (d < best.d) best = { name: h.name, d };
+      }
+    }
+    return (best.d <= tolMeters) ? best.name : '';
+  }
+
+  function pointToPolylineMeters(p, line) {
+    let best = Infinity;
+    for (let i = 1; i < line.length; i++) {
+      const a = line[i - 1], b = line[i];
+      const d = segmentDistanceMeters(p, a, b);
+      if (d < best) best = d;
+    }
+    return best;
+  }
+
+  function segmentDistanceMeters(p, a, b) {
+    // approximate by densifying segment to small pieces and measuring haversine to nearest point
+    const N = 8; // enough for centerlines
+    let best = Infinity;
+    for (let i = 0; i <= N; i++) {
+      const t = i / N;
+      const x = a[0] + t * (b[0] - a[0]);
+      const y = a[1] + t * (b[1] - a[1]);
+      const d = haversine(p[1], p[0], y, x) * 1000;
+      if (d < best) best = d;
+    }
+    return best;
+  }
+
+  function cleanHwyName(s) {
     s = String(s || '').trim();
     if (!s) return '';
-    // Normalize common highway patterns
-    s = s.replace(/\bHighway\b/gi, 'Hwy');
-    s = s.replace(/\bExpressway\b/gi, 'Expy');
-    s = s.replace(/\bParkway\b/gi, 'Pkwy');
-    s = s.replace(/\bStreet\b/gi, 'St');
-    s = s.replace(/\bAvenue\b/gi, 'Ave');
-    s = s.replace(/\bRoad\b/gi, 'Rd');
-    s = s.replace(/\bEast\b/gi, 'E').replace(/\bWest\b/gi, 'W').replace(/\bNorth\b/gi, 'N').replace(/\bSouth\b/gi, 'S');
-    return s;
+    return s
+      .replace(/\bHighway\b/gi, 'Hwy')
+      .replace(/\bExpressway\b/gi, 'Expy')
+      .replace(/\bParkway\b/gi, 'Pkwy')
+      .replace(/\s+/g, ' ');
   }
 
-  // ---- Modal ----
-  function showModal(title, lines) {
-    let modal = document.getElementById('report-modal');
-    if (!modal) {
-      modal = document.createElement('div');
-      modal.id = 'report-modal';
-      modal.innerHTML = `
-        <div style="position:fixed;inset:0;background:rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center;z-index:9999">
-          <div style="background:#fff;max-width:720px;width:92%;border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,.2);overflow:auto;max-height:80vh">
-            <div style="padding:14px 16px;border-bottom:1px solid #eee;font-weight:600" id="report-modal-title"></div>
-            <div style="padding:14px 16px" id="report-modal-body"></div>
-            <div style="padding:12px 16px;border-top:1px solid #eee;display:flex;justify-content:flex-end">
-              <button id="report-modal-close" style="padding:8px 12px;border:1px solid #ccc;border-radius:8px;background:#f7f7f7;cursor:pointer">Close</button>
-            </div>
-          </div>
-        </div>`;
-      document.body.appendChild(modal);
-      modal.querySelector('#report-modal-close').addEventListener('click', () => modal.remove());
-    }
-    modal.querySelector('#report-modal-title').textContent = title || 'Report';
-    modal.querySelector('#report-modal-body').innerHTML = `<ul style="margin:0;padding-left:18px">${(lines||[]).map(li => `<li>${li}</li>`).join('')}</ul>`;
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
   }
-
-  function escapeHtml(s){ return String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
 
 })(window);
-</script>
