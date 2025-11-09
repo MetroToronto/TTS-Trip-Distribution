@@ -1,32 +1,36 @@
-/* script.js — PD/PZ Leaflet controls only.
-   - PD: checkbox list + 0–3 route count beside each name
-   - PZ: Engage/Disengage + inline "Zone #" search
-   - Geocoder sets window.ROUTING_ORIGIN
-   - Exposes App.getPDRequests() / App.getPZRequests() (no routing/report UI here)
+/* script.js — PD/PZ Leaflet controls only (no routing/report UI)
+   - PD list with checkbox + 0–3 route count
+   - PZ Engage/Disengage + Zone # input
+   - Geocoder + draggable origin marker sets window.ROUTING_ORIGIN
+   - App.getPDRequests() / App.getPZRequests() for routing.js
 */
 (function (global) {
   'use strict';
 
-  // ---------------- Map boot (safe) ----------------
+  // ================= MAP =================
   var map = global.map;
   if (!map || typeof map.addLayer !== 'function') {
-    var host = document.getElementById('map') || (function () {
-      var d = document.createElement('div'); d.id = 'map';
-      d.style.cssText = 'position:fixed;inset:0;'; document.body.appendChild(d); return d;
-    })();
+    var host = document.getElementById('map');
+    if (!host) {
+      host = document.createElement('div');
+      host.id = 'map';
+      host.style.cssText = 'position:fixed;inset:0;';
+      document.body.appendChild(host);
+    }
     map = L.map(host, { zoomControl: true });
     global.map = map;
   }
   var START = [43.7000, -79.4000];
   map.setView(START, 11);
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 20, attribution: '© OpenStreetMap'
+    maxZoom: 20,
+    attribution: '© OpenStreetMap'
   }).addTo(map);
 
-  // ---------------- Origin marker + geocoder ----------------
+  // ================= ORIGIN (marker + optional geocoder) =================
   var originMarker = null;
   function setOrigin(lat, lon) {
-    try { if (originMarker) originMarker.remove(); } catch(_) {}
+    try { if (originMarker) originMarker.remove(); } catch {}
     originMarker = L.marker([lat, lon], { draggable: true }).addTo(map);
     originMarker.on('dragend', function () {
       var p = originMarker.getLatLng();
@@ -46,153 +50,203 @@
         })
         .addTo(map);
     }
-  } catch(_) {}
+  } catch (err) {
+    console.warn('Geocoder not available:', err);
+  }
 
-  // ---------------- Data ----------------
-  var PD_URL = '/data/tts_pds.json';
-  var PZ_URL = '/data/tts_zones.json';
+  // ================= DATA PATHS (RELATIVE!) =================
+  // Use relative paths for GitHub Pages (avoid leading slash)
+  var PD_URL = 'data/tts_pds.json';
+  var PZ_URL = 'data/tts_zones.json';
 
-  var PD_FEATURES = [];
-  var PD_REGISTRY = Object.create(null); // key -> {feature, layer}
-  var ZONES_BY_PD = new Map();           // pdKey -> features[]
-  var ZONE_LOOKUP = new Map();           // zoneId(string) -> {feature, pdKey}
+  // ================= STATE / INDEXES =================
+  var PD_REGISTRY = Object.create(null); // key -> {feature, layer, name}
+  var pdGroup = L.layerGroup().addTo(map);
 
-  // ---------------- Helpers ----------------
+  var ZONES_BY_PD = new Map();           // pdKey -> [feature]
+  var ZONE_LOOKUP = new Map();           // zoneId -> {feature, pdKey}
+  var zonesEngaged = false;
+  var zonesGroup = L.layerGroup();
+  var labelsGroup = L.layerGroup();
+
+  // ================= HELPERS =================
+  function esc(s){ return String(s).replace(/[&<>"']/g, m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m])); }
+  function clamp(n, lo, hi){ n = Number(n); if (!Number.isFinite(n)) n = lo; return Math.max(lo, Math.min(hi, Math.trunc(n))); }
+
   function pdKey(p){
     return String(p?.PD_no ?? p?.pd_no ?? p?.PD ?? p?.PD_ID ?? p?.PD_name ?? p?.name ?? '').trim();
   }
   function zoneKey(p){
     return String(p?.TTS2022 ?? p?.ZONE ?? p?.ZONE_ID ?? p?.Zone ?? p?.Z_ID ?? '').trim();
   }
-  function clamp(n, lo, hi){ n = Number(n); if (!Number.isFinite(n)) n = lo; return Math.max(lo, Math.min(hi, Math.trunc(n))); }
-  function esc(s){ return String(s).replace(/[&<>"']/g, m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m])); }
 
-  // ---------------- Planning Districts control ----------------
-  var pdGroup = L.layerGroup().addTo(map);
+  // ================= CONTROLS (render immediately) =================
+  // PD control skeleton (populated after fetch)
+  var PDControl = L.Control.extend({
+    options: { position: 'topright' },
+    onAdd: function () {
+      var c = L.DomUtil.create('div', 'rt-card');
+      c.id = 'pd-card';
+      c.innerHTML = `
+        <div class="rt-title">Planning Districts</div>
+        <div class="rt-row rt-gap">
+          <button id="pd-select-all" class="rt-btn">Select all</button>
+          <button id="pd-clear-all"  class="rt-btn">Clear all</button>
+          <button id="pd-toggle"     class="rt-btn grow">Expand ▾</button>
+        </div>
+        <div id="pd-list" class="rt-scroll"><div class="rt-muted">Loading PDs…</div></div>
+      `;
+      L.DomEvent.disableClickPropagation(c);
+      return c;
+    }
+  });
+  map.addControl(new PDControl());
 
-  fetch(PD_URL).then(r=>r.ok?r.json():Promise.reject(r.status)).then(function(geo){
-    PD_FEATURES = (geo && geo.features) ? geo.features.slice() : [];
+  // PZ control skeleton (independent from data load)
+  var PZControl = L.Control.extend({
+    options: { position: 'topright' },
+    onAdd: function () {
+      var c = L.DomUtil.create('div', 'rt-card');
+      c.id = 'pz-card';
+      c.innerHTML = `
+        <div class="rt-title">Planning Zones</div>
+        <div class="rt-row rt-gap">
+          <button id="pz-engage" class="rt-btn">Engage</button>
+          <button id="pz-disengage" class="rt-btn">Disengage</button>
+        </div>
+        <input id="pz-inline-search" class="rt-input" type="text" placeholder="Zone #">
+      `;
+      L.DomEvent.disableClickPropagation(c);
+      return c;
+    }
+  });
+  map.addControl(new PZControl());
 
-    // draw and index
+  // Wire PZ buttons now (work even before zones load)
+  (function wirePZButtons(){
+    var btnOn = document.getElementById('pz-engage');
+    var btnOff= document.getElementById('pz-disengage');
+    var inp   = document.getElementById('pz-inline-search');
+    if (btnOn) btnOn.addEventListener('click', function(){ zonesEngaged = true; toast('PZ engaged'); });
+    if (btnOff) btnOff.addEventListener('click', function(){ zonesEngaged = false; clearZones(); });
+    if (inp) {
+      inp.addEventListener('keydown', function(e){
+        if (e.key !== 'Enter') return;
+        var m = (inp.value||'').match(/\d+/);
+        var zid = m ? m[0] : null;
+        if (!zid) return;
+        var hit = ZONE_LOOKUP.get(String(zid));
+        if (!hit) { toast('Zone not found'); return; }
+        zonesEngaged = true;
+        drawZonesForPD(hit.pdKey, String(zid));
+      });
+    }
+  })();
+
+  // ================= FETCH PDs =================
+  fetch(PD_URL).then(function(r){
+    if (!r.ok) throw new Error('PD fetch ' + r.status);
+    return r.json();
+  }).then(function(geo){
+    var list = document.getElementById('pd-list');
     var baseStyle = { color:'#ff6600', weight:2, fill:false, opacity:0.6 };
-    PD_FEATURES.forEach(function(f){
-      var key = pdKey(f.properties || {});
+
+    (geo.features||[]).forEach(function(f){
+      var key = pdKey(f.properties||{});
       var name = String(f.properties?.PD_name || f.properties?.name || key || 'PD');
       var gj = L.geoJSON(f, { style: baseStyle }).addTo(pdGroup);
       var layer = gj.getLayers()[0] || gj;
       PD_REGISTRY[key] = { feature:f, layer:layer, name:name };
     });
 
-    addPDControl();
-    try {
-      map.fitBounds(pdGroup.getBounds(), { padding:[20,20] });
-    } catch(_) {}
-  }).catch(function(e){ console.error('PD load failed', e); });
+    // Build PD rows
+    var rows = Object.keys(PD_REGISTRY).map(function(k){
+      return { key:k, name:PD_REGISTRY[k].name };
+    }).sort(function(a,b){ return a.name.toLowerCase().localeCompare(b.name.toLowerCase()); });
 
-  function addPDControl(){
-    var PDControl = L.Control.extend({
-      options:{ position:'topright' },
-      onAdd: function(){
-        var c = L.DomUtil.create('div', 'rt-card');
-        c.innerHTML = [
-          '<div class="rt-title">Planning Districts</div>',
-          '<div class="rt-row rt-gap">',
-          '  <button id="pd-select-all" class="rt-btn">Select all</button>',
-          '  <button id="pd-clear-all"  class="rt-btn">Clear all</button>',
-          '  <button id="pd-toggle"     class="rt-btn grow">Expand ▾</button>',
-          '</div>',
-          '<div id="pd-list" class="rt-scroll"></div>'
-        ].join('');
-        L.DomEvent.disableClickPropagation(c);
+    list.innerHTML = rows.map(function(i){
+      return ''+
+      '<div class="pd-item">'+
+      '  <input type="checkbox" class="pd-cbx" data-key="'+ encodeURIComponent(i.key) +'" checked>'+
+      '  <span class="pd-name" data-key="'+ encodeURIComponent(i.key) +'">'+ esc(i.name) +'</span>'+
+      '  <input type="number" class="pd-count" value="1" min="0" max="3" step="1" title="Routes (0–3)">'+
+      '</div>';
+    }).join('');
 
-        // build rows (sorted by name)
-        var list = c.querySelector('#pd-list');
-        var rows = Object.keys(PD_REGISTRY).map(function(k){
-          return { key:k, name:PD_REGISTRY[k].name };
-        }).sort(function(a,b){ return a.name.toLowerCase().localeCompare(b.name.toLowerCase()); });
-
-        list.innerHTML = rows.map(function(i){
-          return ''+
-          '<div class="pd-item">'+
-          '  <input type="checkbox" class="pd-cbx" data-key="'+ encodeURIComponent(i.key) +'" checked>'+
-          '  <span class="pd-name" data-key="'+ encodeURIComponent(i.key) +'">'+ esc(i.name) +'</span>'+
-          '  <input type="number" class="pd-count" value="1" min="0" max="3" step="1" title="Routes (0–3)">'+
-          '</div>';
-        }).join('');
-
-        // checkbox toggles map + count enabled
-        list.addEventListener('change', function(e){
-          if (!e.target.classList.contains('pd-cbx')) return;
-          var key = decodeURIComponent(e.target.dataset.key || '');
-          var row = e.target.closest('.pd-item');
-          var cnt = row && row.querySelector('.pd-count');
-          var reg = PD_REGISTRY[key];
-          if (e.target.checked) {
-            if (cnt) { cnt.disabled = false; if (cnt.value === '0') cnt.value = '1'; }
-            if (reg && reg.layer && !pdGroup.hasLayer(reg.layer)) reg.layer.addTo(pdGroup);
-          } else {
-            if (cnt) { cnt.value = '0'; cnt.disabled = true; }
-            if (reg && reg.layer && pdGroup.hasLayer(reg.layer)) pdGroup.removeLayer(reg.layer);
-          }
-        });
-
-        // name click just toggles checkbox + keeps same behavior
-        list.addEventListener('click', function(e){
-          var nameEl = e.target.closest('.pd-name'); if (!nameEl) return;
-          var key = decodeURIComponent(nameEl.dataset.key || '');
-          var cbx = list.querySelector('.pd-cbx[data-key="'+ encodeURIComponent(key) +'"]');
-          if (!cbx) return;
-          cbx.checked = !cbx.checked;
-          cbx.dispatchEvent(new Event('change'));
-        });
-
-        // buttons
-        c.querySelector('#pd-select-all').addEventListener('click', function(){
-          list.querySelectorAll('.pd-item').forEach(function(row){
-            var cbx = row.querySelector('.pd-cbx');
-            var cnt = row.querySelector('.pd-count');
-            cbx.checked = true;
-            if (cnt) { cnt.disabled = false; if (cnt.value === '0') cnt.value = '1'; }
-          });
-          Object.keys(PD_REGISTRY).forEach(function(k){
-            var reg = PD_REGISTRY[k]; if (reg && reg.layer && !pdGroup.hasLayer(reg.layer)) reg.layer.addTo(pdGroup);
-          });
-        });
-        c.querySelector('#pd-clear-all').addEventListener('click', function(){
-          list.querySelectorAll('.pd-item').forEach(function(row){
-            var cbx = row.querySelector('.pd-cbx');
-            var cnt = row.querySelector('.pd-count');
-            cbx.checked = false;
-            if (cnt) { cnt.value = '0'; cnt.disabled = true; }
-          });
-          pdGroup.clearLayers();
-        });
-
-        // Expand/Collapse
-        var btnT = c.querySelector('#pd-toggle');
-        var collapsed = true;
-        function setCollapsed(v){
-          collapsed = !!v;
-          c.querySelector('#pd-list').style.display = collapsed ? 'none' : '';
-          btnT.textContent = collapsed ? 'Expand ▾' : 'Collapse ▴';
-        }
-        btnT.addEventListener('click', function(){ setCollapsed(!collapsed); });
-        setCollapsed(true);
-
-        return c;
+    // Checkbox toggles layer + count
+    list.addEventListener('change', function(e){
+      if (!e.target.classList.contains('pd-cbx')) return;
+      var key = decodeURIComponent(e.target.dataset.key || '');
+      var reg = PD_REGISTRY[key];
+      var row = e.target.closest('.pd-item');
+      var cnt = row && row.querySelector('.pd-count');
+      if (e.target.checked) {
+        if (cnt) { cnt.disabled = false; if (cnt.value === '0') cnt.value = '1'; }
+        if (reg && reg.layer && !pdGroup.hasLayer(reg.layer)) reg.layer.addTo(pdGroup);
+      } else {
+        if (cnt) { cnt.value = '0'; cnt.disabled = true; }
+        if (reg && reg.layer && pdGroup.hasLayer(reg.layer)) pdGroup.removeLayer(reg.layer);
       }
     });
-    map.addControl(new PDControl());
-  }
 
-  // ---------------- Planning Zones control ----------------
-  var zonesEngaged = false;
-  var zonesGroup = L.layerGroup();
-  var labelsGroup = L.layerGroup();
-  var ZOOM_LABELS = 14;
+    // Name click toggles the checkbox
+    list.addEventListener('click', function(e){
+      var nameEl = e.target.closest('.pd-name');
+      if (!nameEl) return;
+      var key = decodeURIComponent(nameEl.dataset.key || '');
+      var cbx = list.querySelector('.pd-cbx[data-key="'+ encodeURIComponent(key) +'"]');
+      if (!cbx) return;
+      cbx.checked = !cbx.checked;
+      cbx.dispatchEvent(new Event('change'));
+    });
 
-  fetch(PZ_URL).then(r=>r.ok?r.json():Promise.reject(r.status)).then(function(geo){
-    // index by PD and by Zone id
+    // Buttons
+    var btnAll = document.getElementById('pd-select-all');
+    var btnClr = document.getElementById('pd-clear-all');
+    var btnTgl = document.getElementById('pd-toggle');
+    var collapsed = true;
+    function setCollapsed(v){
+      collapsed = !!v;
+      list.style.display = collapsed ? 'none' : '';
+      btnTgl.textContent = collapsed ? 'Expand ▾' : 'Collapse ▴';
+    }
+    if (btnAll) btnAll.addEventListener('click', function(){
+      list.querySelectorAll('.pd-item').forEach(function(row){
+        var cbx = row.querySelector('.pd-cbx');
+        var cnt = row.querySelector('.pd-count');
+        cbx.checked = true;
+        if (cnt) { cnt.disabled = false; if (cnt.value === '0') cnt.value = '1'; }
+      });
+      Object.keys(PD_REGISTRY).forEach(function(k){
+        var reg=PD_REGISTRY[k]; if (reg.layer && !pdGroup.hasLayer(reg.layer)) reg.layer.addTo(pdGroup);
+      });
+    });
+    if (btnClr) btnClr.addEventListener('click', function(){
+      list.querySelectorAll('.pd-item').forEach(function(row){
+        var cbx = row.querySelector('.pd-cbx');
+        var cnt = row.querySelector('.pd-count');
+        cbx.checked = false;
+        if (cnt) { cnt.value = '0'; cnt.disabled = true; }
+      });
+      pdGroup.clearLayers();
+    });
+    if (btnTgl) {
+      btnTgl.addEventListener('click', function(){ setCollapsed(!collapsed); });
+      setCollapsed(true);
+    }
+
+    try { map.fitBounds(pdGroup.getBounds(), { padding:[20,20] }); } catch {}
+  }).catch(function(err){
+    console.error('PD load failed:', err);
+    var list = document.getElementById('pd-list');
+    if (list) list.innerHTML = '<div class="rt-error">Failed to load Planning Districts.</div>';
+  });
+
+  // ================= FETCH ZONES (indexing only) =================
+  fetch(PZ_URL).then(function(r){
+    if (!r.ok) throw new Error('PZ fetch ' + r.status);
+    return r.json();
+  }).then(function(geo){
     (geo.features||[]).forEach(function(f){
       var p = f.properties || {};
       var pk = pdKey(p);
@@ -201,53 +255,11 @@
       var zid = zoneKey(p);
       if (zid) ZONE_LOOKUP.set(String(zid), { feature:f, pdKey:pk });
     });
-    addPZControl();
-  }).catch(function(e){ console.error('PZ load failed', e); });
+  }).catch(function(err){
+    console.error('PZ load failed:', err);
+  });
 
-  function addPZControl(){
-    var PZControl = L.Control.extend({
-      options:{ position:'topright' },
-      onAdd: function(){
-        var c = L.DomUtil.create('div', 'rt-card');
-        c.innerHTML = [
-          '<div class="rt-title">Planning Zones</div>',
-          '<div class="rt-row rt-gap">',
-          '  <button id="pz-engage" class="rt-btn">Engage</button>',
-          '  <button id="pz-disengage" class="rt-btn">Disengage</button>',
-          '</div>',
-          '<input id="pz-inline-search" class="rt-input" type="text" placeholder="Zone #">'
-        ].join('');
-        L.DomEvent.disableClickPropagation(c);
-        return c;
-      }
-    });
-    map.addControl(new PZControl());
-
-    var btnOn = document.getElementById('pz-engage');
-    var btnOff= document.getElementById('pz-disengage');
-    var inp   = document.getElementById('pz-inline-search');
-
-    btnOn.addEventListener('click', function(){ zonesEngaged = true; toast('PZ engaged'); });
-    btnOff.addEventListener('click', function(){ zonesEngaged = false; clearZones(); });
-
-    inp.addEventListener('keydown', function(e){
-      if (e.key !== 'Enter') return;
-      var m = (inp.value||'').match(/\d+/);
-      var zid = m ? m[0] : null;
-      if (!zid) return;
-      var hit = ZONE_LOOKUP.get(String(zid));
-      if (!hit) return;
-      zonesEngaged = true;
-      drawZonesForPD(hit.pdKey, String(zid));
-    });
-
-    map.on('zoomend', function(){
-      var show = map.getZoom() >= ZOOM_LABELS;
-      if (show) { if (!map.hasLayer(labelsGroup)) labelsGroup.addTo(map); }
-      else { if (map.hasLayer(labelsGroup)) labelsGroup.remove(); }
-    });
-  }
-
+  // ================= ZONE DRAW/HELPERS =================
   function clearZones(){
     zonesGroup.clearLayers();
     labelsGroup.clearLayers();
@@ -258,7 +270,6 @@
   function drawZonesForPD(pdKey, focusZoneId){
     if (!zonesEngaged) return;
     clearZones();
-
     var feats = ZONES_BY_PD.get(String(pdKey)) || [];
     feats.forEach(function(f){
       var poly = L.geoJSON(f, { style:{ color:'#2166f3', weight:2, fillOpacity:0.08 } }).getLayers()[0];
@@ -268,8 +279,7 @@
       var zid = zoneKey(f.properties||{});
       var label = L.marker(c, {
         icon: L.divIcon({ className:'zone-label', html:'<span class="zone-tag">'+ esc(zid) +'</span>', iconSize:null })
-      });
-      label.addTo(labelsGroup);
+      }).addTo(labelsGroup);
 
       if (focusZoneId && String(zid) === String(focusZoneId)) {
         map.fitBounds(poly.getBounds(), { padding:[20,20], maxZoom:16 });
@@ -284,10 +294,10 @@
     });
 
     if (!map.hasLayer(zonesGroup)) zonesGroup.addTo(map);
-    if (map.getZoom() >= ZOOM_LABELS && !map.hasLayer(labelsGroup)) labelsGroup.addTo(map);
+    if (map.getZoom() >= 14 && !map.hasLayer(labelsGroup)) labelsGroup.addTo(map);
   }
 
-  // ---------------- Public getters for routing.js ----------------
+  // ================= PUBLIC GETTERS (for routing.js) =================
   global.App = Object.assign({}, global.App, {
     // [{ id, label, coords:[lon,lat], count }]
     getPDRequests: function(){
@@ -304,12 +314,12 @@
         return { id:key, label:label, coords:[lon,lat], count:count };
       });
     },
-    // 0 or 1 PZ target, depending on Engage + Zone #
+    // 0 or 1 PZ target depending on Engage + Zone #
     getPZRequests: function(){
-      var engaged = zonesEngaged;
+      if (!zonesEngaged) return [];
       var inp = document.getElementById('pz-inline-search');
       var raw = (inp && inp.value || '').trim();
-      if (!engaged || !raw) return [];
+      if (!raw) return [];
       var m = raw.match(/\d+/); var zid = m ? m[0] : null; if (!zid) return [];
       var hit = ZONE_LOOKUP.get(String(zid)); if (!hit) return [];
       var poly = L.geoJSON(hit.feature).getLayers()[0]; var c = poly.getBounds().getCenter();
@@ -317,11 +327,10 @@
     }
   });
 
-  // legacy helper (if anything still calls it)
+  // legacy helper if other code still calls it
   global.getSelectedPDTargets = function(){
     var out = [];
-    var rows = Array.from(document.querySelectorAll('#pd-list .pd-item .pd-cbx:checked'));
-    rows.forEach(function(cbx){
+    document.querySelectorAll('#pd-list .pd-item .pd-cbx:checked').forEach(function(cbx){
       var key = decodeURIComponent(cbx.dataset.key || '');
       var reg = PD_REGISTRY[key];
       if (reg && reg.layer) {
@@ -332,7 +341,7 @@
     return out;
   };
 
-  // ---------------- Tiny styles ----------------
+  // ================= Styles & toast =================
   (function injectCSS(){
     var css =
       '.rt-card{background:#fff;border-radius:14px;padding:12px;box-shadow:0 2px 12px rgba(0,0,0,.08);min-width:260px;margin:8px 6px}' +
@@ -341,15 +350,23 @@
       '.rt-gap{gap:8px;margin-bottom:8px}' +
       '.rt-btn{padding:6px 10px;border:1px solid #ddd;border-radius:8px;background:#fff;cursor:pointer}' +
       '.rt-input{width:100%;padding:8px 10px;border:1px solid #ddd;border-radius:10px}' +
-      '#pd-list.rt-scroll{max-height:260px;overflow:auto;border-top:1px solid #eee;padding-top:6px}' +
+      '.rt-scroll{max-height:260px;overflow:auto;border-top:1px solid #eee;padding-top:6px}' +
+      '.rt-muted{color:#666;font-size:12px;padding:6px 2px}' +
+      '.rt-error{color:#b00020;font-size:12px;padding:6px 2px}' +
       '.pd-item{display:flex;align-items:center;gap:8px;padding:4px 2px}' +
       '.pd-item .pd-name{flex:1}' +
       '.pd-item .pd-count{width:48px;text-align:right}' +
-      '.zone-label .zone-tag{background:#fff;border:1px solid #ccc;border-radius:8px;padding:2px 6px;font:12px/1.2 system-ui}' ;
+      '.zone-label .zone-tag{background:#fff;border:1px solid #ccc;border-radius:8px;padding:2px 6px;font:12px/1.2 system-ui}';
     var tag = document.createElement('style'); tag.textContent = css; document.head.appendChild(tag);
   })();
 
-  // simple toast
-  function toast(msg){ var t=document.getElementById('rt-toast'); if(!t){t=document.createElement('div');t.id='rt-toast';t.style.cssText='position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:#222;color:#fff;padding:8px 12px;border-radius:10px;z-index:9999;opacity:0;transition:.25s';document.body.appendChild(t);} t.textContent=msg; t.style.opacity='1'; setTimeout(function(){t.style.opacity='0';},1600); }
+  function toast(msg){
+    var t = document.getElementById('rt-toast');
+    if (!t) { t = document.createElement('div'); t.id = 'rt-toast';
+      t.style.cssText='position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:#222;color:#fff;padding:8px 12px;border-radius:10px;z-index:9999;opacity:0;transition:.25s';
+      document.body.appendChild(t);
+    }
+    t.textContent = msg; t.style.opacity='1'; setTimeout(function(){ t.style.opacity='0'; }, 1600);
+  }
 
 })(window);
