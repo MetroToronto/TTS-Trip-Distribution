@@ -1,231 +1,292 @@
-/* routing.js — ORS Directions v2 (Oct-13 style) with built-in fallback key, key rotation,
-   and printable report. Works with your original PD/PZ UI: it reads PDs via
-   getSelectedPDTargets() and the origin via window.ROUTING_ORIGIN. */
-(function (global) {
-  // ---------- Config ----------
-  const ORS_BASE = 'https://api.openrouteservice.org';
-  const PROFILE  = 'driving-car';
-  const PREFERENCE = 'fastest';
-  const COLOR_MAIN = '#0b3aa5', COLOR_ALT = '#2166f3';
+// ===== routing.js =====
+// OpenRouteService Directions v2 routing with alternatives (max 3), reverse toggle,
+// per-PD/PZ route counts validation, a simple request queue, and a small in-page modal.
+// Exposes a global window.Routing.
 
-  // Your fallback key so the “Missing key” modal never appears
-  const INLINE_DEFAULT_KEY =
-    'eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6Ijk5NWI5MTE5OTM2YTRmYjNhNDRiZTZjNDRjODhhNTRhIiwiaCI6Im11cm11cjY0In0=';
+(function () {
+  const DEFAULT_ORS_KEY = "eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6Ijk5NWI5MTE5OTM2YTRmYjNhNDRiZTZjNDRjODhhNTRhIiwiaCI6Im11cm11cjY0In0=";
 
-  // ---------- State ----------
-  const S = { map:null, group:null, keys:[], keyIdx:0, results:[] };
-  const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
-
-  // ---------- Key mgmt (URL → saved → inline fallback) ----------
-  function urlKeys(){
-    const raw = new URLSearchParams(location.search).get('orsKey');
-    return raw ? raw.split(',').map(s=>s.trim()).filter(Boolean) : [];
+  // ---- Key management (URL ?orsKey= overrides; else localStorage 'orsKey'; else default) ----
+  function readKey() {
+    const url = new URL(window.location.href);
+    const fromUrl = url.searchParams.get("orsKey");
+    if (fromUrl) return fromUrl;
+    const fromLS = localStorage.getItem("orsKey");
+    if (fromLS) return fromLS;
+    return DEFAULT_ORS_KEY;
   }
-  function loadKeys(){
-    const fromUrl = urlKeys(); if (fromUrl.length) return fromUrl;
-    try {
-      const saved = JSON.parse(localStorage.getItem('ORS_KEYS')||'[]');
-      if (Array.isArray(saved) && saved.length) return saved;
-    } catch {}
-    // fallback to your embedded key
-    return [INLINE_DEFAULT_KEY];
+
+  // ---- Simple toast + modal ----
+  function ensureToastHost() {
+    let host = document.querySelector("#routing-toast-host");
+    if (!host) {
+      host = document.createElement("div");
+      host.id = "routing-toast-host";
+      host.style.cssText = "position:fixed;right:16px;bottom:16px;z-index:99999;display:flex;flex-direction:column;gap:8px;";
+      document.body.appendChild(host);
+    }
+    return host;
   }
-  function saveKeys(arr){ localStorage.setItem('ORS_KEYS', JSON.stringify(arr)); }
-  function currentKey(){ return S.keys[S.keyIdx] || INLINE_DEFAULT_KEY; }
-  function rotateKey(){
-    if (S.keys.length < 2) return false;
-    S.keyIdx = (S.keyIdx + 1) % S.keys.length;
+  function showToast(msg, ms = 3000) {
+    const host = ensureToastHost();
+    const card = document.createElement("div");
+    card.textContent = msg;
+    card.style.cssText = "background:#323232;color:#fff;padding:8px 12px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.25);font:14px/1.4 system-ui;";
+    host.appendChild(card);
+    setTimeout(() => { card.remove(); }, ms);
+  }
+
+  function openModal(opts) {
+    const { title = "Notice", html = "", onClose } = opts || {};
+    let mask = document.createElement("div");
+    mask.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:99998;";
+    let box = document.createElement("div");
+    box.style.cssText = "position:fixed;inset:0;display:flex;align-items:center;justify-content:center;z-index:99999;";
+    let panel = document.createElement("div");
+    panel.style.cssText = "background:#fff;max-width:720px;width:calc(100% - 48px);max-height:80vh;overflow:auto;border-radius:12px;box-shadow:0 12px 40px rgba(0,0,0,.25);";
+    panel.innerHTML = `
+      <div style="padding:16px 20px;border-bottom:1px solid #eee;font:600 16px system-ui">${title}</div>
+      <div style="padding:16px 20px;font:14px/1.5 system-ui">${html}</div>
+      <div style="padding:12px 20px;border-top:1px solid #eee;display:flex;justify-content:flex-end;gap:8px">
+        <button id="routing-modal-close" style="padding:8px 12px;border-radius:8px;border:1px solid #ccc;background:#fafafa;cursor:pointer">Close</button>
+      </div>`;
+    box.appendChild(panel);
+    function close() {
+      mask.remove();
+      box.remove();
+      onClose && onClose();
+    }
+    mask.addEventListener("click", close);
+    box.querySelector("#routing-modal-close").addEventListener("click", close);
+    document.body.appendChild(mask);
+    document.body.appendChild(box);
+    return { close };
+  }
+
+  // ---- PD/PZ sources from script.js ----
+  let PD_FEATURES = [];
+  let PZ_FEATURES = [];
+  let centroidFromFeature = null;
+
+  function setPDSource(features, centroidFn) {
+    PD_FEATURES = features || [];
+    centroidFromFeature = centroidFn;
+  }
+  function setPZSource(features, centroidFn) {
+    PZ_FEATURES = features || [];
+    centroidFromFeature = centroidFn;
+  }
+  function findFeatureById(list, idKey, idVal) {
+    return list.find(f => String(f.properties?.[idKey]) === String(idVal)) ||
+           list.find((_, i) => String(i) === String(idVal));
+  }
+
+  // ---- Routing queue (throttle ~1.6s to respect ~40 req/min) ----
+  const QUEUE = [];
+  let queueRunning = false;
+  const SPACING_MS = 1600;
+
+  async function pumpQueue() {
+    if (queueRunning) return;
+    queueRunning = true;
+    while (QUEUE.length) {
+      const job = QUEUE.shift();
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        await job();
+      } catch (e) {
+        console.error(e);
+      }
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise(r => setTimeout(r, SPACING_MS));
+    }
+    queueRunning = false;
+  }
+
+  function enqueue(fn) {
+    QUEUE.push(fn);
+    pumpQueue();
+  }
+
+  // ---- Draw layers & cache ----
+  const routeGroup = L.layerGroup().addTo(window.map);
+  const Results = []; // array of { type:'pd'|'pz', id, name, count, rankMode, reverse, routes:[{distance,duration,coordinates,line}] }
+
+  function clearRoutes() {
+    routeGroup.clearLayers();
+    Results.length = 0;
+    showToast("Cleared routes.");
+  }
+
+  function getAllResults() {
+    return Results.map(x => ({
+      type: x.type, id: x.id, name: x.name, count: x.count, rankMode: x.rankMode, reverse: x.reverse,
+      routes: x.routes.map(r => ({ distance: r.distance, duration: r.duration }))
+    }));
+  }
+
+  // ---- ORS Directions v2 call with alternatives ----
+  async function orsDirections({ originLngLat, destLngLat, count, rankMode }) {
+    const key = readKey();
+    const preference = (rankMode === "shortest") ? "shortest" : "fastest";
+
+    const body = {
+      coordinates: [originLngLat, destLngLat],
+      preference,
+      instructions: false,
+      geometry: true,
+      elevation: false,
+      alternative_routes: {
+        target_count: Math.max(1, Math.min(3, count || 1)),
+        share_factor: 0.6,
+        weight_factor: 2
+      }
+    };
+
+    const r = await fetch("https://api.openrouteservice.org/v2/directions/driving-car/geojson", {
+      method: "POST",
+      headers: {
+        "Authorization": key,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(body)
+    });
+
+    if (!r.ok) {
+      const text = await r.text();
+      throw new Error(`ORS error ${r.status}: ${text}`);
+    }
+
+    const gj = await r.json();
+    // ORS returns FeatureCollection with 1..N features (alternatives)
+    const features = gj.features || [];
+    // Map to {distance,duration,coordinates}
+    return features.map(feat => ({
+      distance: feat.properties?.summary?.distance ?? 0,
+      duration: feat.properties?.summary?.duration ?? 0,
+      coordinates: feat.geometry?.coordinates ?? []
+    }));
+  }
+
+  function latLngToLngLat(ll) { return [ll[1], ll[0]]; }
+
+  function addPolyline(coords, colorIndex) {
+    // coords: [ [lng,lat], ... ]
+    const latlngs = coords.map(([lng, lat]) => [lat, lng]);
+    const colors = ["#2962ff", "#00b8d4", "#7c4dff"];
+    const dashes = [null, "6,6", "2,8"];
+    const line = L.polyline(latlngs, {
+      color: colors[colorIndex % colors.length],
+      weight: colorIndex === 0 ? 4 : 3,
+      opacity: 0.9,
+      dashArray: dashes[colorIndex] || null
+    }).addTo(routeGroup);
+    return line;
+  }
+
+  function validateCounts(selectedIds, countsById, labelById) {
+    const bad = [];
+    selectedIds.forEach(id => {
+      const n = countsById?.[id];
+      if (![0,1,2,3].includes(Number(n))) {
+        bad.push(`${labelById[id] ?? id} (value: ${n})`);
+      }
+    });
+    if (bad.length) {
+      openModal({
+        title: "Trip generation not possible",
+        html: `<p>Please use only <strong>0, 1, 2, or 3</strong> in the route-count boxes.</p>
+               <p>Invalid entries:</p>
+               <ul>${bad.map(x => `<li>${x}</li>`).join("")}</ul>`
+      });
+      return false;
+    }
     return true;
   }
 
-  // ---------- UI bits ----------
-  function ensureGroup(){ if (!S.group) S.group = L.layerGroup().addTo(S.map); }
-  function clearAll(){ if (S.group) S.group.clearLayers(); S.results.length = 0; setReportEnabled(false); }
-  function popup(html){
-    if (S.map) L.popup().setLatLng(S.map.getCenter()).setContent(html).openOn(S.map);
-    else alert(html.replace(/<[^>]+>/g,''));
-  }
-
-  // Trip + Report controls (same look/flow as Oct-13)
-  const TripCtl = L.Control.extend({
-    options:{ position:'topleft' },
-    onAdd(){
-      const el = L.DomUtil.create('div','routing-control');
-      el.innerHTML = `
-        <div class="routing-header"><strong>Trip Generator</strong></div>
-        <div class="routing-actions" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
-          <button id="rt-gen">Generate Trips</button>
-          <button id="rt-clr" class="ghost">Clear</button>
-        </div>
-        <details class="routing-section">
-          <summary>API keys & options</summary>
-          <div style="margin-top:8px;display:grid;gap:8px;">
-            <input id="rt-keys" type="text" placeholder="KEY1,KEY2 (comma-separated)">
-            <div style="display:flex;gap:10px;flex-wrap:wrap;">
-              <button id="rt-save">Save Keys</button>
-              <button id="rt-url" class="ghost">Use ?orsKey</button>
-            </div>
-            <small>Priority: ?orsKey → saved → built-in fallback (yours). Keys auto-rotate on 401/429.</small>
-          </div>
-        </details>`;
-      L.DomEvent.disableClickPropagation(el);
-      return el;
+  // ---- Main entry ----
+  async function generateFor(type, { originLatLng, selectedIds, countsById, reverse, rankMode }) {
+    if (!window.map) { showToast("Map not ready."); return; }
+    if (!originLatLng || !isFinite(originLatLng[0]) || !isFinite(originLatLng[1])) {
+      showToast("Set an origin address first.");
+      return;
     }
-  });
-  const ReportCtl = L.Control.extend({
-    options:{ position:'topleft' },
-    onAdd(){
-      const el = L.DomUtil.create('div','routing-control');
-      el.innerHTML = `
-        <div class="routing-header"><strong>Report</strong></div>
-        <div class="routing-actions" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
-          <button id="rt-print" disabled>Print Report</button>
-        </div>
-        <small>Prints what’s already generated. No new API calls.</small>`;
-      L.DomEvent.disableClickPropagation(el);
-      return el;
-    }
-  });
-  function setReportEnabled(on){ const b=document.getElementById('rt-print'); if (b) b.disabled=!on; }
 
-  // ---------- ORS helpers ----------
-  async function ors(path, { method='GET', body } = {}){
-    const res = await fetch(`${ORS_BASE}${path}`, {
-      method,
-      headers: { Authorization: currentKey(), ...(method!=='GET' && {'Content-Type':'application/json'}) },
-      body: method==='GET' ? undefined : JSON.stringify(body)
+    const isPD = type === "pd";
+    const list = isPD ? PD_FEATURES : PZ_FEATURES;
+    const idKey = isPD ? "PD_ID" : "ZONE_ID";
+    const nameKey = isPD ? "PD_NAME" : "ZONE_NAME";
+
+    const labelById = {};
+    const centroidById = {};
+
+    selectedIds.forEach(id => {
+      const feat = findFeatureById(list, idKey, id);
+      if (!feat) return;
+      labelById[id] = feat.properties?.[nameKey] ?? `${isPD ? "PD" : "Zone"} ${id}`;
+      const c = centroidFromFeature?.(feat);
+      if (c) centroidById[id] = c;
     });
-    if ([401,403,429].includes(res.status) && rotateKey()) return ors(path, { method, body });
-    if (!res.ok) throw new Error(`ORS ${res.status}: ${await res.text().catch(()=>res.statusText)}`);
-    return res.json();
-  }
-  async function getRoute(originLonLat, destLonLat){
-    return ors(`/v2/directions/${PROFILE}/geojson`, {
-      method:'POST',
-      body:{
-        coordinates:[originLonLat, destLonLat],
-        preference:PREFERENCE,
-        instructions:true,
-        instructions_format:'html',
-        language:'en',
-        units:'km'
-      }
+
+    // Validate counts
+    if (!validateCounts(selectedIds, countsById, labelById)) return;
+
+    // Build jobs
+    let jobs = 0;
+    selectedIds.forEach(id => {
+      const count = Number(countsById?.[id] ?? 1);
+      if (count === 0) return; // skip
+      const dest = centroidById[id];
+      if (!dest) return;
+      jobs += 1;
+
+      enqueue(async () => {
+        const originLL = originLatLng;
+        const destLL = dest;
+
+        const a = latLngToLngLat(originLL);
+        const b = latLngToLngLat(destLL);
+        const originLngLat = reverse ? b : a;
+        const destLngLat = reverse ? a : b;
+
+        try {
+          const alts = await orsDirections({ originLngLat, destLngLat, count, rankMode });
+          const rec = {
+            type, id, name: labelById[id], count, rankMode, reverse,
+            routes: []
+          };
+          // draw
+          alts.slice(0, count).forEach((r, idx) => {
+            const line = addPolyline(r.coordinates, idx);
+            rec.routes.push({
+              distance: r.distance,
+              duration: r.duration,
+              line
+            });
+          });
+          Results.push(rec);
+          showToast(`${labelById[id]}: ${rec.routes.length} route(s) added.`);
+        } catch (e) {
+          console.error(e);
+          showToast(`${labelById[id]}: routing failed.`);
+        }
+      });
     });
-  }
 
-  // ---------- Simple street summary from ORS steps ----------
-  function summarize(feat){
-    const seg = feat?.properties?.segments?.[0];
-    const steps = seg?.steps || [];
-    const distKm = (seg?.distance||0)/1000;
-    const durMin = Math.round((seg?.duration||0)/60);
-    const parts = steps.map(s => {
-      const t = String(s.instruction||'').replace(/<[^>]*>/g,'');
-      return t.replace(/\s+/g,' ').trim();
-    });
-    return { distKm, durMin, text: parts.join(', ') };
-  }
-
-  // ---------- Init ----------
-  function init(map){
-    S.map = map;
-    S.keys = loadKeys();
-
-    map.addControl(new TripCtl());
-    map.addControl(new ReportCtl());
-
-    const els = {
-      gen:   document.getElementById('rt-gen'),
-      clr:   document.getElementById('rt-clr'),
-      print: document.getElementById('rt-print'),
-      keys:  document.getElementById('rt-keys'),
-      save:  document.getElementById('rt-save'),
-      url:   document.getElementById('rt-url')
-    };
-    if (els.keys) els.keys.value = S.keys.join(',');
-
-    if (els.gen)   els.gen.onclick   = generateTrips;
-    if (els.clr)   els.clr.onclick   = () => clearAll();
-    if (els.print) els.print.onclick = () => printReport();
-    if (els.save)  els.save.onclick  = () => { const arr=(els.keys.value||'').split(',').map(s=>s.trim()).filter(Boolean); if(arr.length){ S.keys=arr; saveKeys(arr); S.keyIdx=0; popup('<b>Routing</b><br>Keys saved.'); } };
-    if (els.url)   els.url.onclick   = () => { const arr=urlKeys(); if(arr.length){ S.keys=arr; S.keyIdx=0; popup('<b>Routing</b><br>Using keys from URL.'); } };
-  }
-
-  // ---------- Generate ----------
-  async function generateTrips(){
-    const origin = global.ROUTING_ORIGIN;
-    if (!origin) return popup('<b>Routing</b><br>Pick an address from the top geocoder first.');
-
-    // Use your existing PD UI selection (unchanged)
-    if (typeof global.getSelectedPDTargets !== 'function') {
-      return popup('<b>Routing</b><br>PD selection UI is not ready.');
+    if (jobs === 0) {
+      showToast("Nothing to route (check selections and counts).");
+    } else {
+      showToast(`Queued ${jobs} routing job(s).`);
     }
-    const targets = global.getSelectedPDTargets();
-    if (!targets || !targets.length) return popup('<b>Routing</b><br>No PDs selected.');
-
-    clearAll();
-    ensureGroup();
-
-    // Origin marker
-    L.circleMarker([origin.lat, origin.lon], { radius:6 }).addTo(S.group)
-      .bindPopup(`<b>Origin</b><br>${origin.label || (origin.lat.toFixed(5)+', '+origin.lon.toFixed(5))}`);
-
-    // Zoom roughly to first target
-    try {
-      const f = targets[0];
-      S.map.fitBounds(L.latLngBounds([[origin.lat,origin.lon],[f[1],f[0]]]), { padding:[24,24] });
-    } catch {}
-
-    // Rate-limit to ~40/min
-    for (let i=0;i<targets.length;i++){
-      const [dlon,dlat,label] = targets[i];
-      try{
-        const gj   = await getRoute([origin.lon, origin.lat], [dlon, dlat]);
-        const feat = gj?.features?.[0];
-        const coords = feat?.geometry?.coordinates || [];
-        const latlngs = coords.map(([x,y]) => [y,x]);
-
-        // Draw
-        L.polyline(latlngs, { color: i===0 ? COLOR_MAIN : COLOR_ALT, weight:5, opacity:0.9 }).addTo(S.group);
-        L.circleMarker([dlat, dlon], { radius:5 }).addTo(S.group);
-
-        // Summary
-        const sum = summarize(feat);
-        S.results.push({ label, km: sum.distKm.toFixed(1), min: sum.durMin, text: sum.text });
-
-      } catch (e) {
-        console.error('Route failed for', label, e);
-        popup(`<b>Routing</b><br>Route failed for ${label}<br><small>${e.message}</small>`);
-      }
-      if (i < targets.length-1) await sleep(1200); // ~40/minute
-    }
-
-    setReportEnabled(S.results.length > 0);
-    popup('<b>Routing</b><br>All routes processed. Popups added at each destination.');
   }
 
-  // ---------- Report (comma-separated narrative) ----------
-  function printReport(){
-    if (!S.results.length) return popup('<b>Report</b><br>Generate trips first.');
-    const w = window.open('', '_blank');
-    const css = `<style>
-      body{font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:16px}
-      h1{margin:0 0 8px;font-size:20px}
-      .card{border:1px solid #ddd;border-radius:12px;padding:12px;margin:12px 0}
-      .sub{color:#555;margin-bottom:8px}
-    </style>`;
-    const cards = S.results.map((r,i)=>`
-      <div class="card">
-        <h2>${i+1}. ${r.label}</h2>
-        <div class="sub">Distance: ${r.km} km • ${r.min} min</div>
-        <div>${r.text || '<em>No step text available</em>'}</div>
-      </div>`).join('');
-    w.document.write(`<!doctype html><meta charset="utf-8"><title>Trip Report</title>${css}<h1>Trip Report</h1>${cards}<script>window.onload=()=>window.print();</script>`);
-    w.document.close();
-  }
-
-  // ---------- Boot ----------
-  const Routing = { init(map){ init(map); } };
-  global.Routing = Routing;
-  document.addEventListener('DOMContentLoaded', ()=>{ if (global.map) Routing.init(global.map); });
-})(window);
+  // ---- Public API ----
+  window.Routing = {
+    setPDSource,
+    setPZSource,
+    generateFor,
+    clearRoutes,
+    getAllResults,
+    showToast
+  };
+})();
