@@ -1,372 +1,234 @@
-/* script.js — PD/PZ Leaflet controls only (no routing/report UI)
-   - PD list with checkbox + 0–3 route count
-   - PZ Engage/Disengage + Zone # input
-   - Geocoder + draggable origin marker sets window.ROUTING_ORIGIN
-   - App.getPDRequests() / App.getPZRequests() for routing.js
-*/
-(function (global) {
-  'use strict';
+// ===== script.js =====
+// Map init + PD/PZ controls + origin search.
+// Routing & reporting are delegated to window.Routing and window.Report (see routing.js/report.js).
 
-  // ================= MAP =================
-  var map = global.map;
-  if (!map || typeof map.addLayer !== 'function') {
-    var host = document.getElementById('map');
-    if (!host) {
-      host = document.createElement('div');
-      host.id = 'map';
-      host.style.cssText = 'position:fixed;inset:0;';
-      document.body.appendChild(host);
-    }
-    map = L.map(host, { zoomControl: true });
-    global.map = map;
-  }
-  var START = [43.7000, -79.4000];
-  map.setView(START, 11);
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 20,
-    attribution: '© OpenStreetMap'
+(() => {
+  // ---- Map ----
+  const map = L.map("map", { zoomControl: true }).setView([43.6532, -79.3832], 10);
+  window.map = map; // expose for other modules
+
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19,
+    attribution: "&copy; OpenStreetMap"
   }).addTo(map);
 
-  // ================= ORIGIN (marker + optional geocoder) =================
-  var originMarker = null;
-  function setOrigin(lat, lon) {
-    try { if (originMarker) originMarker.remove(); } catch {}
-    originMarker = L.marker([lat, lon], { draggable: true }).addTo(map);
-    originMarker.on('dragend', function () {
-      var p = originMarker.getLatLng();
-      global.ROUTING_ORIGIN = { lat: p.lat, lon: p.lng };
-    });
-    global.ROUTING_ORIGIN = { lat: lat, lon: lon };
-  }
-  setOrigin(START[0], START[1]);
+  // ---- Geocoder / Origin ----
+  let originLatLng = null;
+  const originMarker = L.marker([0,0], { draggable: true, opacity: 0 }).addTo(map);
 
-  try {
-    if (L.Control && L.Control.Geocoder && L.Control.Geocoder.nominatim) {
-      L.Control.geocoder({ defaultMarkGeocode: false })
-        .on('markgeocode', function (e) {
-          var c = e.geocode.center;
-          map.setView(c, 12);
-          setOrigin(c.lat, c.lng);
-        })
-        .addTo(map);
-    }
-  } catch (err) {
-    console.warn('Geocoder not available:', err);
+  function setOrigin(latlng) {
+    originLatLng = latlng;
+    originMarker.setLatLng(latlng).setOpacity(1);
   }
 
-  // ================= DATA PATHS (RELATIVE!) =================
-  // Use relative paths for GitHub Pages (avoid leading slash)
-  var PD_URL = 'data/tts_pds.json';
-  var PZ_URL = 'data/tts_zones.json';
-
-  // ================= STATE / INDEXES =================
-  var PD_REGISTRY = Object.create(null); // key -> {feature, layer, name}
-  var pdGroup = L.layerGroup().addTo(map);
-
-  var ZONES_BY_PD = new Map();           // pdKey -> [feature]
-  var ZONE_LOOKUP = new Map();           // zoneId -> {feature, pdKey}
-  var zonesEngaged = false;
-  var zonesGroup = L.layerGroup();
-  var labelsGroup = L.layerGroup();
-
-  // ================= HELPERS =================
-  function esc(s){ return String(s).replace(/[&<>"']/g, m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m])); }
-  function clamp(n, lo, hi){ n = Number(n); if (!Number.isFinite(n)) n = lo; return Math.max(lo, Math.min(hi, Math.trunc(n))); }
-
-  function pdKey(p){
-    return String(p?.PD_no ?? p?.pd_no ?? p?.PD ?? p?.PD_ID ?? p?.PD_name ?? p?.name ?? '').trim();
-  }
-  function zoneKey(p){
-    return String(p?.TTS2022 ?? p?.ZONE ?? p?.ZONE_ID ?? p?.Zone ?? p?.Z_ID ?? '').trim();
-  }
-
-  // ================= CONTROLS (render immediately) =================
-  // PD control skeleton (populated after fetch)
-  var PDControl = L.Control.extend({
-    options: { position: 'topright' },
-    onAdd: function () {
-      var c = L.DomUtil.create('div', 'rt-card');
-      c.id = 'pd-card';
-      c.innerHTML = `
-        <div class="rt-title">Planning Districts</div>
-        <div class="rt-row rt-gap">
-          <button id="pd-select-all" class="rt-btn">Select all</button>
-          <button id="pd-clear-all"  class="rt-btn">Clear all</button>
-          <button id="pd-toggle"     class="rt-btn grow">Expand ▾</button>
-        </div>
-        <div id="pd-list" class="rt-scroll"><div class="rt-muted">Loading PDs…</div></div>
-      `;
-      L.DomEvent.disableClickPropagation(c);
-      return c;
-    }
-  });
-  map.addControl(new PDControl());
-
-  // PZ control skeleton (independent from data load)
-  var PZControl = L.Control.extend({
-    options: { position: 'topright' },
-    onAdd: function () {
-      var c = L.DomUtil.create('div', 'rt-card');
-      c.id = 'pz-card';
-      c.innerHTML = `
-        <div class="rt-title">Planning Zones</div>
-        <div class="rt-row rt-gap">
-          <button id="pz-engage" class="rt-btn">Engage</button>
-          <button id="pz-disengage" class="rt-btn">Disengage</button>
-        </div>
-        <input id="pz-inline-search" class="rt-input" type="text" placeholder="Zone #">
-      `;
-      L.DomEvent.disableClickPropagation(c);
-      return c;
-    }
-  });
-  map.addControl(new PZControl());
-
-  // Wire PZ buttons now (work even before zones load)
-  (function wirePZButtons(){
-    var btnOn = document.getElementById('pz-engage');
-    var btnOff= document.getElementById('pz-disengage');
-    var inp   = document.getElementById('pz-inline-search');
-    if (btnOn) btnOn.addEventListener('click', function(){ zonesEngaged = true; toast('PZ engaged'); });
-    if (btnOff) btnOff.addEventListener('click', function(){ zonesEngaged = false; clearZones(); });
-    if (inp) {
-      inp.addEventListener('keydown', function(e){
-        if (e.key !== 'Enter') return;
-        var m = (inp.value||'').match(/\d+/);
-        var zid = m ? m[0] : null;
-        if (!zid) return;
-        var hit = ZONE_LOOKUP.get(String(zid));
-        if (!hit) { toast('Zone not found'); return; }
-        zonesEngaged = true;
-        drawZonesForPD(hit.pdKey, String(zid));
-      });
-    }
-  })();
-
-  // ================= FETCH PDs =================
-  fetch(PD_URL).then(function(r){
-    if (!r.ok) throw new Error('PD fetch ' + r.status);
-    return r.json();
-  }).then(function(geo){
-    var list = document.getElementById('pd-list');
-    var baseStyle = { color:'#ff6600', weight:2, fill:false, opacity:0.6 };
-
-    (geo.features||[]).forEach(function(f){
-      var key = pdKey(f.properties||{});
-      var name = String(f.properties?.PD_name || f.properties?.name || key || 'PD');
-      var gj = L.geoJSON(f, { style: baseStyle }).addTo(pdGroup);
-      var layer = gj.getLayers()[0] || gj;
-      PD_REGISTRY[key] = { feature:f, layer:layer, name:name };
-    });
-
-    // Build PD rows
-    var rows = Object.keys(PD_REGISTRY).map(function(k){
-      return { key:k, name:PD_REGISTRY[k].name };
-    }).sort(function(a,b){ return a.name.toLowerCase().localeCompare(b.name.toLowerCase()); });
-
-    list.innerHTML = rows.map(function(i){
-      return ''+
-      '<div class="pd-item">'+
-      '  <input type="checkbox" class="pd-cbx" data-key="'+ encodeURIComponent(i.key) +'" checked>'+
-      '  <span class="pd-name" data-key="'+ encodeURIComponent(i.key) +'">'+ esc(i.name) +'</span>'+
-      '  <input type="number" class="pd-count" value="1" min="0" max="3" step="1" title="Routes (0–3)">'+
-      '</div>';
-    }).join('');
-
-    // Checkbox toggles layer + count
-    list.addEventListener('change', function(e){
-      if (!e.target.classList.contains('pd-cbx')) return;
-      var key = decodeURIComponent(e.target.dataset.key || '');
-      var reg = PD_REGISTRY[key];
-      var row = e.target.closest('.pd-item');
-      var cnt = row && row.querySelector('.pd-count');
-      if (e.target.checked) {
-        if (cnt) { cnt.disabled = false; if (cnt.value === '0') cnt.value = '1'; }
-        if (reg && reg.layer && !pdGroup.hasLayer(reg.layer)) reg.layer.addTo(pdGroup);
+  // Simple input search (use your existing geocoder if you have it)
+  const searchInput = document.querySelector("#origin-input");
+  const searchBtn = document.querySelector("#origin-search-btn");
+  searchBtn?.addEventListener("click", async () => {
+    const q = (searchInput?.value || "").trim();
+    if (!q) return;
+    try {
+      const r = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(q)}`);
+      const rows = await r.json();
+      if (rows?.length) {
+        const { lat, lon } = rows[0];
+        const ll = [parseFloat(lat), parseFloat(lon)];
+        setOrigin(ll);
+        map.setView(ll, 12);
       } else {
-        if (cnt) { cnt.value = '0'; cnt.disabled = true; }
-        if (reg && reg.layer && pdGroup.hasLayer(reg.layer)) pdGroup.removeLayer(reg.layer);
+        Routing.showToast("Address not found.");
       }
-    });
-
-    // Name click toggles the checkbox
-    list.addEventListener('click', function(e){
-      var nameEl = e.target.closest('.pd-name');
-      if (!nameEl) return;
-      var key = decodeURIComponent(nameEl.dataset.key || '');
-      var cbx = list.querySelector('.pd-cbx[data-key="'+ encodeURIComponent(key) +'"]');
-      if (!cbx) return;
-      cbx.checked = !cbx.checked;
-      cbx.dispatchEvent(new Event('change'));
-    });
-
-    // Buttons
-    var btnAll = document.getElementById('pd-select-all');
-    var btnClr = document.getElementById('pd-clear-all');
-    var btnTgl = document.getElementById('pd-toggle');
-    var collapsed = true;
-    function setCollapsed(v){
-      collapsed = !!v;
-      list.style.display = collapsed ? 'none' : '';
-      btnTgl.textContent = collapsed ? 'Expand ▾' : 'Collapse ▴';
-    }
-    if (btnAll) btnAll.addEventListener('click', function(){
-      list.querySelectorAll('.pd-item').forEach(function(row){
-        var cbx = row.querySelector('.pd-cbx');
-        var cnt = row.querySelector('.pd-count');
-        cbx.checked = true;
-        if (cnt) { cnt.disabled = false; if (cnt.value === '0') cnt.value = '1'; }
-      });
-      Object.keys(PD_REGISTRY).forEach(function(k){
-        var reg=PD_REGISTRY[k]; if (reg.layer && !pdGroup.hasLayer(reg.layer)) reg.layer.addTo(pdGroup);
-      });
-    });
-    if (btnClr) btnClr.addEventListener('click', function(){
-      list.querySelectorAll('.pd-item').forEach(function(row){
-        var cbx = row.querySelector('.pd-cbx');
-        var cnt = row.querySelector('.pd-count');
-        cbx.checked = false;
-        if (cnt) { cnt.value = '0'; cnt.disabled = true; }
-      });
-      pdGroup.clearLayers();
-    });
-    if (btnTgl) {
-      btnTgl.addEventListener('click', function(){ setCollapsed(!collapsed); });
-      setCollapsed(true);
-    }
-
-    try { map.fitBounds(pdGroup.getBounds(), { padding:[20,20] }); } catch {}
-  }).catch(function(err){
-    console.error('PD load failed:', err);
-    var list = document.getElementById('pd-list');
-    if (list) list.innerHTML = '<div class="rt-error">Failed to load Planning Districts.</div>';
-  });
-
-  // ================= FETCH ZONES (indexing only) =================
-  fetch(PZ_URL).then(function(r){
-    if (!r.ok) throw new Error('PZ fetch ' + r.status);
-    return r.json();
-  }).then(function(geo){
-    (geo.features||[]).forEach(function(f){
-      var p = f.properties || {};
-      var pk = pdKey(p);
-      if (!ZONES_BY_PD.has(pk)) ZONES_BY_PD.set(pk, []);
-      ZONES_BY_PD.get(pk).push(f);
-      var zid = zoneKey(p);
-      if (zid) ZONE_LOOKUP.set(String(zid), { feature:f, pdKey:pk });
-    });
-  }).catch(function(err){
-    console.error('PZ load failed:', err);
-  });
-
-  // ================= ZONE DRAW/HELPERS =================
-  function clearZones(){
-    zonesGroup.clearLayers();
-    labelsGroup.clearLayers();
-    if (map.hasLayer(zonesGroup)) map.removeLayer(zonesGroup);
-    if (map.hasLayer(labelsGroup)) map.removeLayer(labelsGroup);
-  }
-
-  function drawZonesForPD(pdKey, focusZoneId){
-    if (!zonesEngaged) return;
-    clearZones();
-    var feats = ZONES_BY_PD.get(String(pdKey)) || [];
-    feats.forEach(function(f){
-      var poly = L.geoJSON(f, { style:{ color:'#2166f3', weight:2, fillOpacity:0.08 } }).getLayers()[0];
-      poly.addTo(zonesGroup);
-
-      var c = poly.getBounds().getCenter();
-      var zid = zoneKey(f.properties||{});
-      var label = L.marker(c, {
-        icon: L.divIcon({ className:'zone-label', html:'<span class="zone-tag">'+ esc(zid) +'</span>', iconSize:null })
-      }).addTo(labelsGroup);
-
-      if (focusZoneId && String(zid) === String(focusZoneId)) {
-        map.fitBounds(poly.getBounds(), { padding:[20,20], maxZoom:16 });
-        setTimeout(function(){ label.fire('click'); }, 0);
-      }
-
-      label.on('click', function(){
-        var props = f.properties||{};
-        var html = '<div><b>Planning Zone '+ esc(zid) +'</b><br/>PD: '+ esc(String(props.PD_no ?? props.pd_no ?? '')) +'</div>';
-        label.bindPopup(html, { offset: L.point(0,-10) }).openPopup();
-      });
-    });
-
-    if (!map.hasLayer(zonesGroup)) zonesGroup.addTo(map);
-    if (map.getZoom() >= 14 && !map.hasLayer(labelsGroup)) labelsGroup.addTo(map);
-  }
-
-  // ================= PUBLIC GETTERS (for routing.js) =================
-  global.App = Object.assign({}, global.App, {
-    // [{ id, label, coords:[lon,lat], count }]
-    getPDRequests: function(){
-      var rows = Array.from(document.querySelectorAll('#pd-list .pd-item'));
-      return rows.map(function(row){
-        var key = decodeURIComponent(row.querySelector('.pd-cbx')?.dataset?.key || '');
-        var label = (row.querySelector('.pd-name')?.textContent || key).trim();
-        var checked = !!row.querySelector('.pd-cbx')?.checked;
-        var raw = parseInt(row.querySelector('.pd-count')?.value || '0', 10);
-        var count = checked ? clamp(raw, 0, 3) : 0;
-        var reg = PD_REGISTRY[key];
-        var lon = NaN, lat = NaN;
-        if (reg && reg.layer) { var c = reg.layer.getBounds().getCenter(); lon = c.lng; lat = c.lat; }
-        return { id:key, label:label, coords:[lon,lat], count:count };
-      });
-    },
-    // 0 or 1 PZ target depending on Engage + Zone #
-    getPZRequests: function(){
-      if (!zonesEngaged) return [];
-      var inp = document.getElementById('pz-inline-search');
-      var raw = (inp && inp.value || '').trim();
-      if (!raw) return [];
-      var m = raw.match(/\d+/); var zid = m ? m[0] : null; if (!zid) return [];
-      var hit = ZONE_LOOKUP.get(String(zid)); if (!hit) return [];
-      var poly = L.geoJSON(hit.feature).getLayers()[0]; var c = poly.getBounds().getCenter();
-      return [{ id:String(zid), label:'PZ ' + String(zid), coords:[c.lng, c.lat], count:1 }];
+    } catch (e) {
+      Routing.showToast("Geocoding failed.");
     }
   });
 
-  // legacy helper if other code still calls it
-  global.getSelectedPDTargets = function(){
-    var out = [];
-    document.querySelectorAll('#pd-list .pd-item .pd-cbx:checked').forEach(function(cbx){
-      var key = decodeURIComponent(cbx.dataset.key || '');
-      var reg = PD_REGISTRY[key];
-      if (reg && reg.layer) {
-        var c = reg.layer.getBounds().getCenter();
-        out.push([c.lng, c.lat, reg.name || key]);
-      }
-    });
-    return out;
-  };
+  // ---- Load PDs & PZs (GeoJSON) ----
+  let pdLayer, pzLayer;
+  let pdFeatures = [];
+  let pzFeatures = [];
 
-  // ================= Styles & toast =================
-  (function injectCSS(){
-    var css =
-      '.rt-card{background:#fff;border-radius:14px;padding:12px;box-shadow:0 2px 12px rgba(0,0,0,.08);min-width:260px;margin:8px 6px}' +
-      '.rt-title{font-weight:700;margin-bottom:8px}' +
-      '.rt-row{display:flex;align-items:center}' +
-      '.rt-gap{gap:8px;margin-bottom:8px}' +
-      '.rt-btn{padding:6px 10px;border:1px solid #ddd;border-radius:8px;background:#fff;cursor:pointer}' +
-      '.rt-input{width:100%;padding:8px 10px;border:1px solid #ddd;border-radius:10px}' +
-      '.rt-scroll{max-height:260px;overflow:auto;border-top:1px solid #eee;padding-top:6px}' +
-      '.rt-muted{color:#666;font-size:12px;padding:6px 2px}' +
-      '.rt-error{color:#b00020;font-size:12px;padding:6px 2px}' +
-      '.pd-item{display:flex;align-items:center;gap:8px;padding:4px 2px}' +
-      '.pd-item .pd-name{flex:1}' +
-      '.pd-item .pd-count{width:48px;text-align:right}' +
-      '.zone-label .zone-tag{background:#fff;border:1px solid #ccc;border-radius:8px;padding:2px 6px;font:12px/1.2 system-ui}';
-    var tag = document.createElement('style'); tag.textContent = css; document.head.appendChild(tag);
-  })();
+  function featureToCentroidCoords(feature) {
+    // fallback centroid (simple average) for polygons/multipolygons
+    const type = feature.geometry?.type;
+    const coords = feature.geometry?.coordinates;
+    const collect = [];
 
-  function toast(msg){
-    var t = document.getElementById('rt-toast');
-    if (!t) { t = document.createElement('div'); t.id = 'rt-toast';
-      t.style.cssText='position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:#222;color:#fff;padding:8px 12px;border-radius:10px;z-index:9999;opacity:0;transition:.25s';
-      document.body.appendChild(t);
+    if (type === "Polygon") {
+      coords[0].forEach(([x, y]) => collect.push([x, y]));
+    } else if (type === "MultiPolygon") {
+      coords.forEach(poly => poly[0].forEach(([x, y]) => collect.push([x, y])));
+    } else if (type === "Point") {
+      const [x, y] = coords;
+      return [y, x]; // Leaflet lat,lng
     }
-    t.textContent = msg; t.style.opacity='1'; setTimeout(function(){ t.style.opacity='0'; }, 1600);
+
+    if (!collect.length) return null;
+    let sx = 0, sy = 0;
+    for (const [x, y] of collect) { sx += x; sy += y; }
+    const cx = sx / collect.length;
+    const cy = sy / collect.length;
+    return [cy, cx]; // Leaflet lat,lng
   }
 
-})(window);
+  function loadPDs() {
+    return fetch("data/tts_pds.json")
+      .then(r => r.json())
+      .then(gj => {
+        pdFeatures = gj.features || [];
+        pdLayer = L.geoJSON(gj, {
+          style: { color: "#1e88e5", weight: 1, fillOpacity: 0.05 }
+        }).addTo(map);
+        Routing.setPDSource(pdFeatures, featureToCentroidCoords);
+        buildPDList(pdFeatures);
+      });
+  }
+
+  function loadPZs() {
+    return fetch("data/tts_zones.json")
+      .then(r => r.json())
+      .then(gj => {
+        pzFeatures = gj.features || [];
+        pzLayer = L.geoJSON(gj, {
+          style: { color: "#43a047", weight: 1, fillOpacity: 0.05 }
+        }).addTo(map);
+        Routing.setPZSource(pzFeatures, featureToCentroidCoords);
+        buildPZList(pzFeatures);
+      });
+  }
+
+  // ---- PD & PZ selection UIs ----
+  const pdListEl = document.querySelector("#pd-list");
+  const pzListEl = document.querySelector("#pz-list");
+
+  function buildPDList(features) {
+    if (!pdListEl) return;
+    pdListEl.innerHTML = "";
+    features.forEach((f, idx) => {
+      const id = f.properties?.PD_ID ?? idx;
+      const name = f.properties?.PD_NAME ?? `PD ${id}`;
+      const row = document.createElement("div");
+      row.className = "pd-row";
+
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.className = "pd-select";
+      box.dataset.id = String(id);
+
+      const label = document.createElement("label");
+      label.textContent = name;
+
+      const count = document.createElement("input");
+      count.type = "number";
+      count.min = "0"; count.max = "3"; count.step = "1";
+      count.value = "1";
+      count.className = "pd-route-count";
+      count.title = "0–3 alternative routes to request for this PD";
+
+      row.appendChild(box);
+      row.appendChild(label);
+      row.appendChild(count);
+      pdListEl.appendChild(row);
+    });
+  }
+
+  function buildPZList(features) {
+    if (!pzListEl) return;
+    pzListEl.innerHTML = "";
+    features.forEach((f, idx) => {
+      const id = f.properties?.ZONE_ID ?? idx;
+      const name = f.properties?.ZONE_NAME ?? `Zone ${id}`;
+      const row = document.createElement("div");
+      row.className = "pz-row";
+
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.className = "pz-select";
+      box.dataset.id = String(id);
+
+      const label = document.createElement("label");
+      label.textContent = name;
+
+      const count = document.createElement("input");
+      count.type = "number";
+      count.min = "0"; count.max = "3"; count.step = "1";
+      count.value = "1";
+      count.className = "pz-route-count";
+      count.title = "0–3 alternative routes to request for this Zone";
+
+      row.appendChild(box);
+      row.appendChild(label);
+      row.appendChild(count);
+      pzListEl.appendChild(row);
+    });
+  }
+
+  function getSelectedPDIds() {
+    return [...document.querySelectorAll(".pd-select:checked")].map(el => el.dataset.id);
+  }
+  function getSelectedPZIds() {
+    return [...document.querySelectorAll(".pz-select:checked")].map(el => el.dataset.id);
+  }
+
+  function getPDRouteCounts() {
+    const mapCounts = {};
+    document.querySelectorAll(".pd-row").forEach(row => {
+      const id = row.querySelector(".pd-select")?.dataset.id;
+      const num = parseInt(row.querySelector(".pd-route-count")?.value || "1", 10);
+      if (id != null) mapCounts[id] = num;
+    });
+    return mapCounts;
+  }
+
+  function getPZRouteCounts() {
+    const mapCounts = {};
+    document.querySelectorAll(".pz-row").forEach(row => {
+      const id = row.querySelector(".pz-select")?.dataset.id;
+      const num = parseInt(row.querySelector(".pz-route-count")?.value || "1", 10);
+      if (id != null) mapCounts[id] = num;
+    });
+    return mapCounts;
+  }
+
+  // ---- Routing controls (buttons + reverse + ranking) ----
+  const btnPD = document.querySelector("#btn-generate-pd");
+  const btnPZ = document.querySelector("#btn-generate-pz");
+  const reverseToggle = document.querySelector("#toggle-reverse");
+  const rankSelect = document.querySelector("#rank-mode"); // "fastest" | "shortest"
+  const btnClearRoutes = document.querySelector("#btn-clear-routes");
+  const btnPrint = document.querySelector("#btn-print-report");
+
+  btnPD?.addEventListener("click", () => {
+    Routing.generateFor("pd", {
+      originLatLng,
+      selectedIds: getSelectedPDIds(),
+      countsById: getPDRouteCounts(),
+      reverse: !!reverseToggle?.checked,
+      rankMode: rankSelect?.value === "shortest" ? "shortest" : "fastest",
+    });
+  });
+
+  btnPZ?.addEventListener("click", () => {
+    Routing.generateFor("pz", {
+      originLatLng,
+      selectedIds: getSelectedPZIds(),
+      countsById: getPZRouteCounts(),
+      reverse: !!reverseToggle?.checked,
+      rankMode: rankSelect?.value === "shortest" ? "shortest" : "fastest",
+    });
+  });
+
+  btnClearRoutes?.addEventListener("click", () => {
+    Routing.clearRoutes();
+  });
+
+  btnPrint?.addEventListener("click", () => {
+    Report.openPrintableModal(Routing.getAllResults());
+  });
+
+  // ---- Bootstrap ----
+  Promise.all([loadPDs(), loadPZs()]).then(() => {
+    // ready
+  });
+
+})();
