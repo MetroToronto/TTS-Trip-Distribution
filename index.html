@@ -14,19 +14,18 @@
   <script src="https://unpkg.com/leaflet-control-geocoder/dist/Control.Geocoder.js"></script>
 
   <!-- Your CSS -->
-  <link rel="stylesheet" href="style.css?v=8">
-  </head>
-  <body>
+  <link rel="stylesheet" href="style.css?v=9">
+</head>
+<body>
   <div id="map"></div>
 
-  <!-- Main map logic -->
+  <!-- Main map logic (PD/PZ + geocoder + controls) -->
   <script src="script.js"></script>
 
-  <!-- Routing logic -->
+  <!-- Routing logic (OpenRouteService integration) -->
   <script src="routing.js"></script>
 
-  <!-- NEW: Print/report logic (uses Routing APIs) -->
+  <!-- Printable report (reads cached routes from Routing) -->
   <script src="report.js"></script>
-
 </body>
 </html>
