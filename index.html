@@ -15,15 +15,18 @@
 
   <!-- Your CSS -->
   <link rel="stylesheet" href="style.css?v=8">
-</head>
-<body>
+  </head>
+  <body>
   <div id="map"></div>
 
   <!-- Main map logic -->
   <script src="script.js"></script>
 
-  <!-- Routing logic (OpenRouteService integration) -->
-  <!-- Note: The routing UI (Generate Trips button, key manager) will be injected by JS as a Leaflet control. -->
+  <!-- Routing logic -->
   <script src="routing.js"></script>
+
+  <!-- NEW: Print/report logic (uses Routing APIs) -->
+  <script src="report.js"></script>
+
 </body>
 </html>
