@@ -402,4 +402,252 @@
         const d = reverse ? origin : dest;
 
         const json = await getRoutes(o, d, req.count);
-        const feats = Array.isArray(json.featur
+        const feats = Array.isArray(json.features) ? json.features.slice(0, req.count) : [];
+        if (!feats.length) continue;
+
+        // Sort by fastest (duration), then shortest (distance)
+        feats.sort((a, b) => {
+          const pa = a.properties || {};
+          const pb = b.properties || {};
+          const sa = pa.summary || (pa.segments && pa.segments[0]) || {};
+          const sb = pb.summary || (pb.segments && pb.segments[0]) || {};
+          const da = num(sa.duration);
+          const db = num(sb.duration);
+          if (Number.isFinite(da) && Number.isFinite(db) && da !== db) return da - db;
+          const la = num(sa.distance);
+          const lb = num(sb.distance);
+          if (Number.isFinite(la) && Number.isFinite(lb) && la !== lb) return la - lb;
+          return 0;
+        });
+
+        feats.forEach((feat, idx) => {
+          const coords = feat.geometry?.coordinates || [];
+          drawRoute(coords, idx === 0 ? COLOR_FIRST : COLOR_OTHERS);
+        });
+
+        const defaultOriginLabel =
+          (global.ROUTING_ORIGIN && (global.ROUTING_ORIGIN.label || global.ROUTING_ORIGIN.name)) || 'Origin';
+        const originLabel = reverse ? req.name : defaultOriginLabel;
+        const destLabel   = reverse ? defaultOriginLabel : req.name;
+
+        S.lastTrips.push({
+          type: 'PD',
+          key: req.key,
+          name: req.name,
+          reverse,
+          origin: {
+            lon: o[0],
+            lat: o[1],
+            label: originLabel
+          },
+          destination: {
+            lon: d[0],
+            lat: d[1],
+            label: destLabel
+          },
+          features: feats.map(f => ({ geometry: f.geometry, properties: f.properties }))
+        });
+
+        await sleep(PER_REQUEST_DELAY);
+      }
+
+      // Expose a simple cache for report.js to consume later
+      global.ROUTING_CACHE = {
+        mode: 'PD',
+        reverse,
+        trips: S.lastTrips
+      };
+    } catch (e) {
+      console.error(e);
+      if (e.type === 'validation') {
+        showValidationPopup(e.invalid);
+      } else if (e.code === 'NO_ORIGIN') {
+        alert('Please pick an origin using the address search bar before generating trips.');
+      } else {
+        alert('Routing error: ' + (e.message || e));
+      }
+    } finally {
+      setBusy('PD', false);
+    }
+  }
+
+  // ----- Generate for PZs (1 best route per zone) -----
+  async function generateForPZs() {
+    try {
+      const origin = getOriginLonLat();
+      const reverse = !!byId('rt-reverse')?.checked;
+
+      const targets = collectZoneTargets();
+      if (!targets.length) {
+        alert('No Planning Zones selected. Engage zones and/or provide a getSelectedZoneTargets() helper.');
+        return;
+      }
+
+      setBusy('PZ', true);
+      clearRoutes();
+
+      S.lastMode = 'PZ';
+      S.lastTrips = [];
+
+      const PER_REQUEST_DELAY = 250;
+
+      for (const t of targets) {
+        const dest = sanitizeLonLat([t.lon, t.lat]);
+        const o = reverse ? dest : origin;
+        const d = reverse ? origin : dest;
+
+        const json = await getRoutes(o, d, 1);
+        const feat = Array.isArray(json.features) ? json.features[0] : null;
+        if (!feat) continue;
+
+        const coords = feat.geometry?.coordinates || [];
+        drawRoute(coords, COLOR_FIRST);
+
+        const defaultOriginLabel =
+          (global.ROUTING_ORIGIN && (global.ROUTING_ORIGIN.label || global.ROUTING_ORIGIN.name)) || 'Origin';
+        const originLabel = reverse ? (t.label || 'Zone') : defaultOriginLabel;
+        const destLabel   = reverse ? defaultOriginLabel : (t.label || 'Zone');
+
+        S.lastTrips.push({
+          type: 'PZ',
+          label: t.label || 'Zone',
+          reverse,
+          origin: {
+            lon: o[0],
+            lat: o[1],
+            label: originLabel
+          },
+          destination: {
+            lon: d[0],
+            lat: d[1],
+            label: destLabel
+          },
+          features: [ { geometry: feat.geometry, properties: feat.properties } ]
+        });
+
+        await sleep(PER_REQUEST_DELAY);
+      }
+
+      global.ROUTING_CACHE = {
+        mode: 'PZ',
+        reverse,
+        trips: S.lastTrips
+      };
+    } catch (e) {
+      console.error(e);
+      if (e.type === 'noZonesHelper') {
+        alert('Zone trip generation requires script.js to define window.getSelectedZoneTargets().');
+      } else if (e.code === 'NO_ORIGIN') {
+        alert('Please pick an origin using the address search bar before generating trips.');
+      } else {
+        alert('Routing error: ' + (e.message || e));
+      }
+    } finally {
+      setBusy('PZ', false);
+    }
+  }
+
+  // Wire up buttons / key UI
+  function wireControls() {
+    const btnPD      = byId('rt-gen-pd');
+    const btnPZ      = byId('rt-gen-pz');
+    const btnClear   = byId('rt-clear');
+    const btnSaveKey = byId('rt-save');
+    const btnUseUrl  = byId('rt-url');
+    const inpKeys    = byId('rt-keys');
+
+    if (btnPD)    btnPD.onclick    = () => generateForPDs();
+    if (btnPZ)    btnPZ.onclick    = () => generateForPZs();
+    if (btnClear) btnClear.onclick = () => clearRoutes();
+
+    if (btnSaveKey && inpKeys) {
+      btnSaveKey.onclick = () => {
+        const arr = inpKeys.value.split(',').map(x => x.trim()).filter(Boolean);
+        localStorage.setItem(LS_KEYS, JSON.stringify(arr));
+        hydrateKeys();
+        alert(`Saved ${S.keys.length} key(s).`);
+      };
+    }
+
+    if (btnUseUrl) {
+      btnUseUrl.onclick = () => {
+        const k = qParam('orsKey');
+        if (!k) alert('Add ?orsKey=YOUR_KEY to the URL query.');
+        else {
+          localStorage.setItem(LS_KEYS, JSON.stringify([k]));
+          hydrateKeys();
+          alert('Using orsKey from URL.');
+        }
+      };
+    }
+  }
+
+  // Leaflet control for Trip Generator
+  const GeneratorControl = L.Control.extend({
+    options: { position: 'topleft' },
+    onAdd: function () {
+      const el = L.DomUtil.create('div', 'routing-control');
+      el.innerHTML = `
+        <div class="routing-header"><strong>Trip Generator</strong></div>
+        <div class="routing-actions" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px;">
+          <button id="rt-gen-pd">Generate PD Trips</button>
+          <button id="rt-gen-pz">Generate PZ Trips</button>
+          <button id="rt-clear" class="ghost">Clear</button>
+        </div>
+        <div style="margin-bottom:8px;">
+          <label style="font-size:0.9em;display:flex;align-items:center;gap:6px;cursor:pointer;">
+            <input type="checkbox" id="rt-reverse">
+            Reverse direction (PD/PZ → origin)
+          </label>
+        </div>
+        <details>
+          <summary><strong>Keys</strong></summary>
+          <div class="routing-card">
+            <label for="rt-keys" style="font-weight:600;">OpenRouteService key(s)</label>
+            <input id="rt-keys" type="text" placeholder="KEY1,KEY2 (comma-separated)">
+            <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:6px;">
+              <button id="rt-save">Save Keys</button>
+              <button id="rt-url" class="ghost">Use ?orsKey</button>
+            </div>
+            <small class="routing-hint">
+              Priority: ?orsKey → saved → inline fallback. Keys auto-rotate on 401/429.
+            </small>
+          </div>
+        </details>
+      `;
+      const geocoderEl = document.querySelector('.leaflet-control-geocoder');
+      if (geocoderEl) el.style.width = geocoderEl.offsetWidth + 'px';
+      L.DomEvent.disableClickPropagation(el);
+      return el;
+    }
+  });
+
+  async function innerInit(map) {
+    S.map = map;
+    hydrateKeys();
+    S.group = L.layerGroup().addTo(map);
+    map.addControl(new GeneratorControl());
+    setTimeout(wireControls, 0);
+  }
+
+  const Routing = {
+    init(map) {
+      if (!map || !map._loaded) {
+        const retry = () =>
+          (map && map._loaded) ? innerInit(map) : setTimeout(retry, 80);
+        return retry();
+      }
+      innerInit(map);
+    }
+  };
+
+  global.Routing = Routing;
+
+  document.addEventListener('DOMContentLoaded', () => {
+    const tryInit = () => {
+      if (global.map && (global.map._loaded || global.map._size)) Routing.init(global.map);
+      else setTimeout(tryInit, 80);
+    };
+    tryInit();
+  });
+})(window);
