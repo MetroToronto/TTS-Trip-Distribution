@@ -1,287 +1,405 @@
-// ===== routing.js =====
-(function () {
-  var DEFAULT_ORS_KEY = "eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6Ijk5NWI5MTE5OTM2YTRmYjNhNDRiZTZjNDRjODhhNTRhIiwiaCI6Im11cm11cjY0In0=";
+(function (global) {
+  // ===== Config =====
+  const PROFILE    = 'driving-car';
+  const PREFERENCE = 'fastest';
+  const ORS_BASE   = 'https://api.openrouteservice.org';
 
-  function readKey() {
-    var url = new URL(window.location.href);
-    var fromUrl = url.searchParams.get("orsKey");
-    if (fromUrl) return fromUrl;
-    var fromLS = localStorage.getItem("orsKey");
-    if (fromLS) return fromLS;
-    return DEFAULT_ORS_KEY;
-  }
+  const COLOR_FIRST  = '#0b3aa5';
+  const COLOR_OTHERS = '#2166f3';
 
-  function ensureToastHost() {
-    var host = document.getElementById("routing-toast-host");
-    if (!host) {
-      host = document.createElement("div");
-      host.id = "routing-toast-host";
-      host.style.cssText = "position:fixed;right:16px;bottom:16px;z-index:99999;display:flex;flex-direction:column;gap:8px;";
-      document.body.appendChild(host);
+  // Inline default ORS key (backup)
+  const INLINE_DEFAULT_KEY =
+    'eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6Ijk5NWI5MTE5OTM2YTRmYjNhNDRiZTZjNDRjODhhNTRhIiwiaCI6Im11cm11cjY0In0=';
+  const LS_KEYS         = 'ORS_KEYS';
+  const LS_ACTIVE_INDEX = 'ORS_ACTIVE_INDEX';
+
+  const S = {
+    map: null,
+    group: null,
+    keys: [],
+    keyIndex: 0,
+    lastMode: null,  // 'PD' or 'PZ'
+    lastTrips: []    // cached ORS features per destination
+  };
+
+  // ===== Small helpers =====
+  const byId = (id) => document.getElementById(id);
+
+  const escapeHtml = (str) => String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const qParam = (k) => new URLSearchParams(location.search).get(k) || '';
+  const toRad  = (d) => d * Math.PI / 180;
+  const isFiniteNum = (n) => Number.isFinite(n) && !Number.isNaN(n);
+  const num = (x) => {
+    const n = typeof x === 'string' ? parseFloat(x) : +x;
+    return Number.isFinite(n) ? n : NaN;
+  };
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+  function sanitizeLonLat(input) {
+    let arr = Array.isArray(input) ? input : [undefined, undefined];
+    let x = num(arr[0]), y = num(arr[1]);
+    // Heuristic: if swapped, un-swap.
+    if (isFiniteNum(x) && isFiniteNum(y) && Math.abs(x) <= 90 && Math.abs(y) > 90) {
+      const t = x; x = y; y = t;
     }
-    return host;
-  }
-  function showToast(msg, ms) {
-    if (ms == null) ms = 3000;
-    var host = ensureToastHost();
-    var card = document.createElement("div");
-    card.textContent = msg;
-    card.style.cssText = "background:#323232;color:#fff;padding:8px 12px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.25);font:14px/1.4 system-ui;";
-    host.appendChild(card);
-    setTimeout(function () { if (card && card.parentNode) card.parentNode.removeChild(card); }, ms);
-  }
-
-  function openModal(opts) {
-    opts = opts || {};
-    var title = opts.title || "Notice";
-    var html = opts.html || "";
-    var onClose = opts.onClose;
-
-    var mask = document.createElement("div");
-    mask.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:99998;";
-    var box = document.createElement("div");
-    box.style.cssText = "position:fixed;inset:0;display:flex;align-items:center;justify-content:center;z-index:99999;";
-    var panel = document.createElement("div");
-    panel.style.cssText = "background:#fff;max-width:720px;width:calc(100% - 48px);max-height:80vh;overflow:auto;border-radius:12px;box-shadow:0 12px 40px rgba(0,0,0,.25);";
-    panel.innerHTML = '' +
-      '<div style="padding:16px 20px;border-bottom:1px solid #eee;font:600 16px system-ui">' + title + '</div>' +
-      '<div style="padding:16px 20px;font:14px/1.5 system-ui">' + html + '</div>' +
-      '<div style="padding:12px 20px;border-top:1px solid #eee;display:flex;justify-content:flex-end;gap:8px">' +
-      '  <button id="routing-modal-close" style="padding:8px 12px;border-radius:8px;border:1px solid #ccc;background:#fafafa;cursor:pointer">Close</button>' +
-      '</div>';
-    box.appendChild(panel);
-    function close() {
-      if (mask && mask.parentNode) mask.parentNode.removeChild(mask);
-      if (box && box.parentNode) box.parentNode.removeChild(box);
-      if (onClose) onClose();
+    if (!isFiniteNum(x) || !isFiniteNum(y)) {
+      throw new Error(`Invalid coordinate (NaN). Raw: ${JSON.stringify(input)}`);
     }
-    mask.addEventListener("click", close);
-    panel.querySelector("#routing-modal-close").addEventListener("click", close);
-    document.body.appendChild(mask);
-    document.body.appendChild(box);
-    return { close: close };
+    x = clamp(x, -180, 180);
+    y = clamp(y, -85, 85);
+    return [x, y];
   }
 
-  // Guard: don’t proceed until the map exists
-  if (!window.map) {
-    // Defer registration very slightly to let script.js run first
-    return setTimeout(function () { if (!window.Routing) (function(){})(); }, 50);
-  }
-
-  // Sources provided by script.js
-  var PD_FEATURES = [];
-  var PZ_FEATURES = [];
-  var centroidFromFeature = null;
-
-  function setPDSource(features, centroidFn) {
-    PD_FEATURES = features || [];
-    centroidFromFeature = centroidFn;
-  }
-  function setPZSource(features, centroidFn) {
-    PZ_FEATURES = features || [];
-    centroidFromFeature = centroidFn;
-  }
-  function findFeatureById(list, idKey, idVal) {
-    for (var i=0;i<list.length;i++) {
-      var f = list[i];
-      if (String(f.properties && f.properties[idKey]) === String(idVal)) return f;
+  function getOriginLonLat() {
+    const o = global.ROUTING_ORIGIN;
+    if (!o) {
+      const err = new Error('Origin not set');
+      err.code = 'NO_ORIGIN';
+      throw err;
     }
-    for (var j=0;j<list.length;j++) {
-      if (String(j) === String(idVal)) return list[j];
+    if (Array.isArray(o) && o.length >= 2) return sanitizeLonLat([o[0], o[1]]);
+    if (typeof o.getLatLng === 'function') {
+      const ll = o.getLatLng();
+      return sanitizeLonLat([ll.lng, ll.lat]);
     }
-    return null;
-  }
-
-  // Request queue
-  var QUEUE = [];
-  var queueRunning = false;
-  var SPACING_MS = 1600;
-
-  function pumpQueue() {
-    if (queueRunning) return;
-    queueRunning = true;
-    (function next() {
-      if (!QUEUE.length) { queueRunning = false; return; }
-      var job = QUEUE.shift();
-      Promise.resolve()
-        .then(job)
-        .catch(function(e){ console.error(e); })
-        .then(function(){ setTimeout(next, SPACING_MS); });
-    })();
-  }
-  function enqueue(fn) { QUEUE.push(fn); pumpQueue(); }
-
-  // Layers + cache
-  var routeGroup = L.layerGroup().addTo(window.map);
-  var Results = [];
-
-  function clearRoutes() {
-    routeGroup.clearLayers();
-    Results.length = 0;
-    showToast("Cleared routes.");
-  }
-  function getAllResults() {
-    var out = [];
-    for (var i=0;i<Results.length;i++) {
-      var x = Results[i];
-      var rr = [];
-      for (var j=0;j<x.routes.length;j++) {
-        rr.push({ distance: x.routes[j].distance, duration: x.routes[j].duration });
+    if (isFiniteNum(num(o.lng)) && isFiniteNum(num(o.lat))) {
+      return sanitizeLonLat([o.lng, o.lat]);
+    }
+    if (o.latlng && isFiniteNum(num(o.latlng.lng)) && isFiniteNum(num(o.latlng.lat))) {
+      return sanitizeLonLat([o.latlng.lng, o.latlng.lat]);
+    }
+    if (o.center) {
+      if (Array.isArray(o.center) && o.center.length >= 2) {
+        return sanitizeLonLat([o.center[0], o.center[1]]);
       }
-      out.push({ type: x.type, id: x.id, name: x.name, count: x.count, rankMode: x.rankMode, reverse: x.reverse, routes: rr });
+      if (isFiniteNum(num(o.center.lng)) && isFiniteNum(num(o.center.lat))) {
+        return sanitizeLonLat([o.center.lng, o.center.lat]);
+      }
+    }
+    if (o.geometry?.coordinates?.length >= 2) {
+      return sanitizeLonLat([o.geometry.coordinates[0], o.geometry.coordinates[1]]);
+    }
+    const x = o.lon ?? o.x, y = o.lat ?? o.y;
+    if (isFiniteNum(num(x)) && isFiniteNum(num(y))) {
+      return sanitizeLonLat([x, y]);
+    }
+    if (typeof o === 'string' && o.includes(',')) {
+      const [a, b] = o.split(',').map(s => s.trim());
+      try { return sanitizeLonLat([a, b]); } catch {}
+      return sanitizeLonLat([b, a]);
+    }
+    throw new Error(`Origin shape unsupported: ${JSON.stringify(o)}`);
+  }
+
+  // ===== ORS key management =====
+  function savedKeys() {
+    try {
+      return JSON.parse(localStorage.getItem(LS_KEYS) || '[]');
+    } catch {
+      return [];
+    }
+  }
+
+  function hydrateKeys() {
+    const urlKey = qParam('orsKey');
+    const saved = savedKeys();
+    const inline = [INLINE_DEFAULT_KEY];
+    S.keys = (urlKey ? [urlKey] : []).concat(saved.length ? saved : inline);
+    S.keyIndex = Math.min(+localStorage.getItem(LS_ACTIVE_INDEX) || 0, Math.max(0, S.keys.length - 1));
+  }
+
+  function currentKey() {
+    return S.keys[Math.min(Math.max(S.keyIndex, 0), S.keys.length - 1)] || '';
+  }
+
+  function rotateKey() {
+    if (S.keys.length <= 1) return false;
+    S.keyIndex = (S.keyIndex + 1) % S.keys.length;
+    localStorage.setItem(LS_ACTIVE_INDEX, String(S.keyIndex));
+    return true;
+  }
+
+  async function orsFetch(path, { method = 'GET', body } = {}, attempt = 0) {
+    const url = new URL(ORS_BASE + path);
+    const res = await fetch(url.toString(), {
+      method,
+      headers: {
+        Authorization: currentKey(),
+        ...(method !== 'GET' && { 'Content-Type': 'application/json' })
+      },
+      body: method === 'GET' ? undefined : JSON.stringify(body)
+    });
+
+    if ([401, 403, 429].includes(res.status) && rotateKey()) {
+      await sleep(150);
+      return orsFetch(path, { method, body }, attempt + 1);
+    }
+    if (res.status === 500 && attempt < 1) {
+      await sleep(200);
+      return orsFetch(path, { method, body }, attempt + 1);
+    }
+    if (!res.ok) {
+      const txt = await res.text().catch(() => res.statusText);
+      throw new Error(`ORS ${res.status}: ${txt}`);
+    }
+    return res.json();
+  }
+
+  // Get 1–3 routes (alternative_routes) from ORS Directions v2 (geojson)
+  async function getRoutes(originLonLat, destLonLat, maxCount) {
+    const o = sanitizeLonLat(originLonLat);
+    const d = sanitizeLonLat(destLonLat);
+    const baseBody = {
+      coordinates: [o, d],
+      preference: PREFERENCE,
+      instructions: true,
+      instructions_format: 'html',
+      language: 'en',
+      geometry_simplify: false,
+      elevation: false,
+      units: 'km'
+    };
+    if (maxCount > 1) {
+      baseBody.alternative_routes = {
+        target_count: Math.min(Math.max(1, maxCount), 3),
+        share_factor: 0.6
+      };
+    }
+    try {
+      return await orsFetch(`/v2/directions/${PROFILE}/geojson`, { method: 'POST', body: baseBody });
+    } catch (e) {
+      // Handle ORS weird 2099 errors by trying swapped dest coords
+      const msg = String(e.message || '');
+      const is2099 = msg.includes('ORS 500') && (msg.includes('"code":2099') || msg.includes('code:2099'));
+      if (!is2099) throw e;
+      const dSwap = sanitizeLonLat([d[1], d[0]]);
+      const bodySwap = { ...baseBody, coordinates: [o, dSwap] };
+      return await orsFetch(`/v2/directions/${PROFILE}/geojson`, { method: 'POST', body: bodySwap });
+    }
+  }
+
+  // ===== Drawing =====
+  function clearRoutes() {
+    if (S.group) {
+      try { S.map.removeLayer(S.group); } catch {}
+      S.group = null;
+    }
+    S.lastTrips = [];
+    S.lastMode = null;
+    global.ROUTING_CACHE = undefined;
+  }
+
+  function drawRoute(coords, color) {
+    if (!coords?.length) return;
+    if (!S.group) S.group = L.layerGroup().addTo(S.map);
+    const latlngs = coords.map(([lng, lat]) => [lat, lng]);
+    L.polyline(latlngs, { color, weight: 4, opacity: 0.9 }).addTo(S.group);
+  }
+
+  // ===== PD route-count + targets =====
+  // Expects script.js to have populated window.PD_REGISTRY[key] = { layer, name }.
+  // If an <input class="pd-route-count"> exists in a .pd-item, it must be 0–3.
+  function collectPDRequests() {
+    const registry = global.PD_REGISTRY || {};
+    const items = Array.from(document.querySelectorAll('.pd-item'));
+    const invalid = [];
+    const requests = [];
+
+    // First pass: validate all route-count inputs (0–3, integer).
+    for (const item of items) {
+      const cbx = item.querySelector('.pd-cbx');
+      const input = item.querySelector('.pd-route-count');
+      const keyEnc = cbx?.dataset.key || item.dataset.key || '';
+      const key = decodeURIComponent(keyEnc || '');
+      const reg = registry[key];
+      const name = reg?.name || key || 'Unknown PD';
+
+      if (!input) continue; // no route-count UI wired yet
+
+      let raw = input.value.trim();
+      if (raw === '') {
+        raw = cbx && cbx.checked ? '1' : '0';
+        input.value = raw;
+      }
+      const n = Number(raw);
+      if (!Number.isFinite(n) || Math.floor(n) !== n || n < 0 || n > 3) {
+        invalid.push({ key, name, value: raw });
+      }
+    }
+
+    if (invalid.length) {
+      const err = new Error('Invalid PD route counts');
+      err.type = 'validation';
+      err.invalid = invalid;
+      throw err;
+    }
+
+    // Second pass: build PD requests from selected PDs.
+    for (const item of items) {
+      const cbx = item.querySelector('.pd-cbx');
+      if (!cbx || !cbx.checked) continue;
+
+      const keyEnc = cbx.dataset.key || item.dataset.key || '';
+      const key = decodeURIComponent(keyEnc || '');
+      const reg = registry[key];
+      if (!reg || !reg.layer) continue;
+
+      const center = reg.layer.getBounds().getCenter();
+      const name = reg.name || key || 'PD';
+
+      let count = 1;
+      const input = item.querySelector('.pd-route-count');
+      if (input) {
+        const raw = input.value.trim() || '1';
+        const n = Number(raw);
+        if (!Number.isFinite(n) || n <= 0) continue;
+        count = Math.min(Math.max(1, Math.floor(n)), 3);
+      }
+
+      requests.push({
+        key,
+        name,
+        lon: center.lng,
+        lat: center.lat,
+        count
+      });
+    }
+
+    return requests;
+  }
+
+  // ===== Zone targets (script.js is expected to provide helper) =====
+  // Expected: window.getSelectedZoneTargets() → array of:
+  //   [lon, lat, label?]  OR  { lon, lat, label }.
+  function collectZoneTargets() {
+    if (typeof global.getSelectedZoneTargets !== 'function') {
+      const err = new Error('Zone helper missing');
+      err.type = 'noZonesHelper';
+      throw err;
+    }
+    const raw = global.getSelectedZoneTargets() || [];
+    const out = [];
+
+    for (const t of raw) {
+      if (!t) continue;
+      if (Array.isArray(t) && t.length >= 2) {
+        out.push({
+          lon: t[0],
+          lat: t[1],
+          label: t[2] || 'Zone'
+        });
+      } else if (typeof t === 'object') {
+        const lon = t.lon ?? t.lng ?? t.x ?? (t.center && t.center[0]);
+        const lat = t.lat ?? t.y ?? (t.center && t.center[1]);
+        if (!isFiniteNum(num(lon)) || !isFiniteNum(num(lat))) continue;
+        out.push({
+          lon: num(lon),
+          lat: num(lat),
+          label: t.label || t.name || 'Zone'
+        });
+      }
     }
     return out;
   }
 
-  // ORS
-  function orsDirections(opts) {
-    var key = readKey();
-    var count = Math.max(1, Math.min(3, (opts.count || 1)));
-    var preference = (opts.rankMode === "shortest") ? "shortest" : "fastest";
-    var body = {
-      coordinates: [opts.originLngLat, opts.destLngLat],
-      preference: preference,
-      instructions: false,
-      geometry: true,
-      elevation: false,
-      alternative_routes: { target_count: count, share_factor: 0.6, weight_factor: 2 }
-    };
-    return fetch("https://api.openrouteservice.org/v2/directions/driving-car/geojson", {
-      method: "POST",
-      headers: { "Authorization": key, "Content-Type": "application/json" },
-      body: JSON.stringify(body)
-    })
-    .then(function (r) {
-      if (!r.ok) return r.text().then(function(t){ throw new Error("ORS error " + r.status + ": " + t); });
-      return r.json();
-    })
-    .then(function (gj) {
-      var features = (gj && gj.features) ? gj.features : [];
-      var out = [];
-      for (var i=0;i<features.length;i++) {
-        var f = features[i];
-        out.push({
-          distance: f.properties && f.properties.summary ? f.properties.summary.distance : 0,
-          duration: f.properties && f.properties.summary ? f.properties.summary.duration : 0,
-          coordinates: f.geometry && f.geometry.coordinates ? f.geometry.coordinates : []
-        });
-      }
-      return out;
+  // ===== Popup for validation errors =====
+  function showValidationPopup(invalid) {
+    if (!invalid || !invalid.length) return;
+    const existing = document.getElementById('routing-validation-overlay');
+    if (existing) existing.remove();
+
+    const backdrop = document.createElement('div');
+    backdrop.id = 'routing-validation-overlay';
+    backdrop.style.position = 'fixed';
+    backdrop.style.inset = '0';
+    backdrop.style.zIndex = '9999';
+    backdrop.style.background = 'rgba(0,0,0,0.35)';
+    backdrop.style.display = 'flex';
+    backdrop.style.alignItems = 'center';
+    backdrop.style.justifyContent = 'center';
+
+    const box = document.createElement('div');
+    box.style.background = '#fff';
+    box.style.padding = '16px 20px';
+    box.style.borderRadius = '8px';
+    box.style.maxWidth = '420px';
+    box.style.width = '90%';
+    box.style.boxShadow = '0 8px 20px rgba(0,0,0,0.25)';
+    box.style.fontFamily = 'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+    box.innerHTML = `
+      <h3 style="margin:0 0 8px 0;">Trip generation blocked</h3>
+      <p style="margin:0 0 8px 0;font-size:0.95em;">
+        Trip generation is not possible because the following Planning District(s)
+        have an invalid route count. Please use only <strong>0, 1, 2, or 3</strong>.
+      </p>
+      <ul style="margin:0 0 12px 20px;padding:0;font-size:0.95em;">
+        ${invalid.map(i => `<li>${escapeHtml(i.name || i.key || 'PD')} — value: "${escapeHtml(i.value)}"</li>`).join('')}
+      </ul>
+      <div style="text-align:right;">
+        <button id="routing-validation-close">Close</button>
+      </div>
+    `;
+
+    backdrop.appendChild(box);
+    document.body.appendChild(backdrop);
+
+    const closeBtn = box.querySelector('#routing-validation-close');
+    if (closeBtn) {
+      closeBtn.addEventListener('click', () => backdrop.remove());
+    }
+    backdrop.addEventListener('click', (e) => {
+      if (e.target === backdrop) backdrop.remove();
     });
   }
 
-  function latLngToLngLat(ll) { return [ll[1], ll[0]]; }
+  // ===== UI / control wiring =====
+  function setBusy(mode, busy) {
+    const btnPD = byId('rt-gen-pd');
+    const btnPZ = byId('rt-gen-pz');
+    const btnClear = byId('rt-clear');
 
-  function addPolyline(coords, colorIndex) {
-    var latlngs = [];
-    for (var i=0;i<coords.length;i++) latlngs.push([coords[i][1], coords[i][0]]);
-    var colors = ["#2962ff", "#00b8d4", "#7c4dff"];
-    var dashes = [null, "6,6", "2,8"];
-    return L.polyline(latlngs, {
-      color: colors[colorIndex % colors.length],
-      weight: colorIndex === 0 ? 4 : 3,
-      opacity: 0.9,
-      dashArray: dashes[colorIndex] || null
-    }).addTo(routeGroup);
+    if (mode === 'PD' && btnPD) {
+      btnPD.disabled = busy;
+      btnPD.textContent = busy ? 'Generating…' : 'Generate PD Trips';
+    }
+    if (mode === 'PZ' && btnPZ) {
+      btnPZ.disabled = busy;
+      btnPZ.textContent = busy ? 'Generating…' : 'Generate PZ Trips';
+    }
+    if (btnClear) btnClear.disabled = busy;
   }
 
-  function validateCounts(selectedIds, countsById, labelById) {
-    var bad = [];
-    for (var i=0;i<selectedIds.length;i++) {
-      var id = selectedIds[i];
-      var n = countsById && countsById[id];
-      if ([0,1,2,3].indexOf(Number(n)) === -1) {
-        bad.push((labelById[id] || id) + " (value: " + n + ")");
+  // ----- Generate for PDs (with 1–3 alternatives per PD) -----
+  async function generateForPDs() {
+    try {
+      const origin = getOriginLonLat();
+      const reverse = !!byId('rt-reverse')?.checked;
+
+      const requests = collectPDRequests();
+      if (!requests.length) {
+        alert('Select at least one Planning District.');
+        return;
       }
-    }
-    if (bad.length) {
-      openModal({
-        title: "Trip generation not possible",
-        html: '<p>Please use only <strong>0, 1, 2, or 3</strong> in the route-count boxes.</p>' +
-              '<p>Invalid entries:</p><ul><li>' + bad.join("</li><li>") + "</li></ul>"
-      });
-      return false;
-    }
-    return true;
-  }
 
-  function generateFor(type, cfg) {
-    if (!window.map) { showToast("Map not ready."); return; }
-    if (!cfg || !cfg.originLatLng || !isFinite(cfg.originLatLng[0]) || !isFinite(cfg.originLatLng[1])) {
-      showToast("Set an origin address first.");
-      return;
-    }
-    var originLatLng = cfg.originLatLng;
-    var selectedIds = cfg.selectedIds || [];
-    var countsById = cfg.countsById || {};
-    var reverse = !!cfg.reverse;
-    var rankMode = (cfg.rankMode === "shortest") ? "shortest" : "fastest";
+      setBusy('PD', true);
+      clearRoutes();
 
-    var isPD = (type === "pd");
-    var list = isPD ? PD_FEATURES : PZ_FEATURES;
-    var idKey = isPD ? "PD_ID" : "ZONE_ID";
-    var nameKey = isPD ? "PD_NAME" : "ZONE_NAME";
+      S.lastMode = 'PD';
+      S.lastTrips = [];
 
-    var labelById = {};
-    var centroidById = {};
+      const PER_REQUEST_DELAY = 250;
 
-    for (var i=0;i<selectedIds.length;i++) {
-      var id = selectedIds[i];
-      var feat = findFeatureById(list, idKey, id);
-      if (!feat) continue;
-      labelById[id] = (feat.properties && feat.properties[nameKey]) ? feat.properties[nameKey] : ((isPD ? "PD " : "Zone ") + id);
-      var c = centroidFromFeature ? centroidFromFeature(feat) : null;
-      if (c) centroidById[id] = c;
-    }
+      for (const req of requests) {
+        const dest = sanitizeLonLat([req.lon, req.lat]);
+        const o = reverse ? dest : origin;
+        const d = reverse ? origin : dest;
 
-    if (!validateCounts(selectedIds, countsById, labelById)) return;
-
-    var jobs = 0;
-    for (var j=0;j<selectedIds.length;j++) {
-      (function () {
-        var id = selectedIds[j];
-        var count = Number(countsById[id] != null ? countsById[id] : 1);
-        if (count === 0) return;
-        var dest = centroidById[id];
-        if (!dest) return;
-        jobs++;
-
-        enqueue(function () {
-          var a = latLngToLngLat(originLatLng);
-          var b = latLngToLngLat(dest);
-          var originLngLat = reverse ? b : a;
-          var destLngLat = reverse ? a : b;
-
-          return orsDirections({ originLngLat: originLngLat, destLngLat: destLngLat, count: count, rankMode: rankMode })
-            .then(function (alts) {
-              var rec = { type: type, id: id, name: labelById[id], count: count, rankMode: rankMode, reverse: reverse, routes: [] };
-              for (var k=0;k<Math.min(count, alts.length);k++) {
-                var r = alts[k];
-                var line = addPolyline(r.coordinates, k);
-                rec.routes.push({ distance: r.distance, duration: r.duration, line: line });
-              }
-              Results.push(rec);
-              showToast(labelById[id] + ": " + rec.routes.length + " route(s) added.");
-            })
-            .catch(function (e) {
-              console.error(e);
-              showToast(labelById[id] + ": routing failed.");
-            });
-        });
-      })();
-    }
-
-    if (jobs === 0) showToast("Nothing to route (check selections and counts).");
-    else showToast("Queued " + jobs + " routing job(s).");
-  }
-
-  // Public API
-  window.Routing = {
-    setPDSource: setPDSource,
-    setPZSource: setPZSource,
-    generateFor: generateFor,
-    clearRoutes: clearRoutes,
-    getAllResults: getAllResults,
-    showToast: showToast
-  };
-})();
+        const json = await getRoutes(o, d, req.count);
+        const feats = Array.isArray(json.featur
